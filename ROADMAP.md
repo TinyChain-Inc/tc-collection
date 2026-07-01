@@ -1,0 +1,79 @@
+# tc-collection roadmap
+
+## Active deliverables
+
+1. **Shard manifest schema.**
+   - Specify shard descriptors (hash ranges, replica sets, capability masks, telemetry hooks) and how they anchor to control-plane records in `tc-chain`.
+   - Define how manifests encode custody tags and attestation requirements so validators can gate shard admission.
+   - Document migration pointers back to v1 collection behaviors for batching, auth headers, and error envelopes.
+
+2. **Placement and routing plan.**
+   - Outline how runtimes publish deterministic health snapshots (CPU/memory/IO windows) that clients and validators can consume before routing or scheduling work.
+   - Describe the routing table structure (client-side and host-side) and how it reuses `txn_lock` coordination for cross-shard operations, keeping cross-host dispatch logic in the client library rather than the Rust host binary.
+   - Include failure-handling rules (stale snapshots, shard eviction, resharding) and how they surface through MetricsChain.
+
+3. **Local execution graph ergonomics.**
+   - Capture how handler DAGs execute inside a shard once the ingress request is deserialized, avoiding repeated HTTP-style dispatch.
+   - Define telemetry hooks that tag resource usage with manifest IDs and shard identifiers so billing and analytics stay aligned with placement.
+   - Add examples that keep v1 batching semantics visible while documenting intentional v2 behavior changes.
+
+4. **Transactional BTree/Table orchestration over `b-tree` and `b-table` (v1-parity first).**
+    - Treat `b-tree` and `b-table` as managed non-transactional storage/index primitives, analogous to the `fensor` boundary: storage engines own persistence/index mechanics while `tc-collection` owns transaction lifecycle semantics.
+    - Implement canonical+delta lifecycle in `tc-collection` for both BTree and Table: `pending`, `committed`, finalize-merge, and deterministic replay ordering.
+    - Keep transaction visibility, isolation, recovery behavior, and finalize policy exclusively in `tc-collection`; do not move transaction ownership into `b-tree`/`b-table`.
+    - Require v1-parity as an implementation goal, not only functional equivalence:
+       - preserve v1 batching semantics, auth-header behavior, and error-envelope behavior where contractually required.
+       - preserve deterministic range/query planning behavior and index-selection semantics.
+       - preserve operational behavior for delete/merge/count/scan paths where supported.
+    - Require reliability parity gates:
+       - restart recovery for prepared and unresolved-finalize paths.
+       - fail-closed behavior on corruption or malformed persisted state with structured errors.
+    - Require performance parity gates:
+       - benchmark against v1 baselines for representative read/write/range/scan workloads.
+       - define explicit regression budgets and block promotion if budgets are exceeded.
+    - Cross-link dependencies and sequencing:
+       - replay and chain-construction contract from `tc-state/ROADMAP.md`.
+       - transaction/finalize invariants from `tc-server/ROADMAP.md`.
+    - Exit criteria:
+       - commit/rollback/finalize visibility tests pass for BTree and Table.
+       - restart and unresolved-finalize recovery tests pass.
+       - parity matrix is documented and green for required v1 behaviors.
+       - performance and reliability regression gates pass against v1 baselines.
+
+5. **fensor extraction and integration plan.**
+   - Treat `fensor` as a managed dependency under `deps/fensor` and keep `tc-collection` as a thin facade/re-export during migration.
+   - Own transaction lifecycle orchestration in `tc-collection` (pending/committed deltas plus commit/rollback/finalize) while treating `fensor` as a non-transactional storage primitive.
+   - Track storage/index maturation in `deps/fensor/ROADMAP.md` and wire completion milestones back into collection delivery gates.
+   - Define the cutover plan from transitional in-memory tensors to `freqfs`-backed `fensor` tensors across `tc-state` and host lifecycle paths.
+   - Enforce `fensor` fail-closed integrity semantics: corruption in metadata/data must be surfaced as errors, with no auto-recovery in `fensor`; operational recovery is handled above the storage layer.
+
+6. **Transactional tensor orchestration over `fensor`.**
+   - Implement canonical+delta tensor lifecycle in `tc-collection`: `pending`, `committed`, and finalize-merge.
+   - Store both block mutations and sparse-index mutations as deltas with deterministic merge ordering.
+   - Keep transaction visibility, isolation, and recovery policy exclusively in `tc-collection`; `fensor` remains non-transactional.
+    - This tensor track is parallel to the BTree/Table v1-parity track and uses the same transaction-orchestration boundary (engine non-transactional, lifecycle in `tc-collection`).
+   - Exit criteria: commit/rollback/finalize visibility tests and restart recovery tests pass.
+
+7. **Canonical Tensor API and routing ownership (v1 alignment).**
+    - Define `tc-collection` as the sole owner of transactional Tensor API
+       semantics and route-facing operation behavior.
+    - Provide one canonical Tensor interface consumed by `tc-server` resolver
+       paths for metadata/view ops (`dtype`, `shape`, `size`, `reshape`,
+       `broadcast`, `expand_dims`, `transpose`, `slice`) and math/reduction ops.
+    - Treat `tc-state` Tensor methods as transitional compatibility only during
+       migration; do not add new canonical Tensor route semantics there.
+    - Add parity tests proving `tc-server` Tensor routing behavior is driven by
+       `tc-collection` APIs, not duplicated host logic.
+    - Exit criteria:
+         - `tc-server` depends on `tc-collection` for authoritative Tensor routing
+            behavior.
+         - transactional Tensor type + route semantics are co-located in
+            `tc-collection`.
+         - redundant Tensor route logic in `tc-state` is removed or reduced to
+            compatibility scaffolding.
+
+
+## Deferred explorations
+
+- **Hot resharding cookbook.** Draft a worked example for moving hash ranges between shards without violating ordering guarantees, including the ledger entries and validator attestations required.
+- **Edge/overlay routing.** Evaluate whether peer-provided `tc://` hints from the control plane can accelerate shard discovery in disconnected environments.
