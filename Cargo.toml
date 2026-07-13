@@ -4,4 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+b-tree = { path = "../deps/b-tree", features = ["stream"] }
+collate = { path = "../deps/collate", features = ["stream"] }
+destream = { path = "../deps/destream", version = "0.10.1" }
+freqfs = { path = "../deps/freqfs", version = "0.13", features = ["stream"] }
 fensor = { path = "../deps/fensor" }
+futures = "0.3"
+number-general = { path = "../deps/number-general" }
+safecast = "0.2"
+tc-ir = { path = "../tc-ir" }
+tc-error = { path = "../tc-error" }
+tc-value = { path = "../tc-value" }
+pathlink = { path = "../deps/pathlink" }
+tokio = { version = "1.51", features = ["fs", "rt", "sync", "time", "macros", "rt-multi-thread"] }
+txn_lock = { path = "../deps/txn_lock" }

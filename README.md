@@ -12,6 +12,7 @@
 ## Layout
 
 - `ROADMAP.md` — active design and implementation checklist for sharded collections, placement, and telemetry.
+- `TRANSACTIONAL_COLLECTION_CONTRACT.md` — required lifecycle, replay, recovery, lock-order, and parity contract shared by BTree/Table/Tensor.
 - `examples/` (planned) — focused walkthroughs of shard manifests, routing tables, and deterministic health snapshots once prototypes stabilize.
 
 ## Relationships
@@ -19,6 +20,22 @@
 - **Runtime host (`tc-server`).** Hosts execute handlers resident in the collection shards and expose shard-aware health snapshots to applications and validators; cross-host routing is orchestrated by client libraries.
 - **Control-plane ledger (`tc-chain`).** Records shard manifests, placement decisions, and custody/attestation proofs so clients and validators can trust routing hints.
 - **IR traits (`tc-ir`).** Collection handlers should consume and emit the same IR envelopes as other adapters to preserve batching ergonomics and transaction semantics for clients.
+
+## v1 Port Discipline
+
+Transactional collection migration in this crate is a strict v1 parity port, not
+an invention track.
+
+- Keep one canonical behavior path per feature; do not add fallback or parallel semantics.
+- Preserve v1-visible behavior first (transaction visibility, finalize ordering,
+  range/count/scan semantics, error envelopes), then optimize after parity gates are green.
+- Keep transaction identity immutable and globally scoped; never remap or alias
+  `txn_id` values locally.
+- Keep Chain variants (`SyncChain`, `BlockChain`) as the authoritative source of
+  transaction history/replay policy. Collection structures deterministically apply
+  ordered events and fail closed on ambiguity/conflict.
+- Treat local snapshots/materializations as optional performance caches only,
+  never as WAL authority.
 
 ## Canonical namespaces
 

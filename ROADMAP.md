@@ -18,7 +18,9 @@
    - Add examples that keep v1 batching semantics visible while documenting intentional v2 behavior changes.
 
 4. **Transactional BTree/Table orchestration over `b-tree` and `b-table` (v1-parity first).**
+   - Port discipline: treat this track as a straightforward, behavior-preserving v1 translation. Avoid introducing new transactional semantics, fallback pathways, or local reconciliation heuristics before parity gates pass.
     - Treat `b-tree` and `b-table` as managed non-transactional storage/index primitives, analogous to the `fensor` boundary: storage engines own persistence/index mechanics while `tc-collection` owns transaction lifecycle semantics.
+   - Treat Chain variants as the authoritative transaction-history source. `tc-collection` applies ordered chain events deterministically and does not own WAL/reconciliation policy.
     - Implement canonical+delta lifecycle in `tc-collection` for both BTree and Table: `pending`, `committed`, finalize-merge, and deterministic replay ordering.
     - Keep transaction visibility, isolation, recovery behavior, and finalize policy exclusively in `tc-collection`; do not move transaction ownership into `b-tree`/`b-table`.
     - Require v1-parity as an implementation goal, not only functional equivalence:
@@ -34,9 +36,12 @@
     - Cross-link dependencies and sequencing:
        - replay and chain-construction contract from `tc-state/ROADMAP.md`.
        - transaction/finalize invariants from `tc-server/ROADMAP.md`.
+       - shared lifecycle/replay/reliability checklist in `TRANSACTIONAL_COLLECTION_CONTRACT.md`.
     - Exit criteria:
        - commit/rollback/finalize visibility tests pass for BTree and Table.
        - restart and unresolved-finalize recovery tests pass.
+       - transactional contract checklist in `TRANSACTIONAL_COLLECTION_CONTRACT.md` is green with evidence links.
+       - v1 parity port rules in `TRANSACTIONAL_COLLECTION_CONTRACT.md` are satisfied and any intentional divergence is documented.
        - parity matrix is documented and green for required v1 behaviors.
        - performance and reliability regression gates pass against v1 baselines.
 
@@ -52,7 +57,9 @@
    - Store both block mutations and sparse-index mutations as deltas with deterministic merge ordering.
    - Keep transaction visibility, isolation, and recovery policy exclusively in `tc-collection`; `fensor` remains non-transactional.
     - This tensor track is parallel to the BTree/Table v1-parity track and uses the same transaction-orchestration boundary (engine non-transactional, lifecycle in `tc-collection`).
+   - Chain variants remain authoritative for replay-log durability and canonical ordering; Tensor structures apply chain events and fail closed on ambiguity.
    - Exit criteria: commit/rollback/finalize visibility tests and restart recovery tests pass.
+   - Exit criteria: transactional contract checklist in `TRANSACTIONAL_COLLECTION_CONTRACT.md` is green for Tensor.
 
 7. **Canonical Tensor API and routing ownership (v1 alignment).**
     - Define `tc-collection` as the sole owner of transactional Tensor API
