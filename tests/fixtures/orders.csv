@@ -1,0 +1,9 @@
+order_id,user_id,total,status
+101,1,19.99,pending
+102,1,45.50,shipped
+103,2,12.00,pending
+104,3,88.25,delivered
+105,3,7.99,shipped
+106,4,210.00,pending
+107,5,33.10,delivered
+108,2,59.40,shipped

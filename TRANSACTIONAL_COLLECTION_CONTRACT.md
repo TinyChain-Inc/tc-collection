@@ -129,6 +129,22 @@ BTree port. Each row must map to executable tests.
 5. Lifecycle no-op/error branches should explicitly assert semaphore-reservation
    release (no blocked later reads after stale/no-op operations).
 
+## Table v1 parity port
+
+The transactional `Table` variant has a dedicated parity/port spec that is the
+required gate for every Table implementation slice:
+
+- **[`TABLE_PARITY_PORT.md`](TABLE_PARITY_PORT.md)** — v1 inventory (pinned to
+  tinychain commit `17ef342e8f7026e4c4a60d2044de9aeb1b145b91`), the
+  `b-table`/`tc-collection` authority boundary, no-materialization rules, the
+  canonical-plus-delta merge model, the file/module migration map, the
+  route/API matrix, the test matrix, fixture datasets, and explicit blockers.
+
+Table implementation work must land the [§7 test
+matrix](TABLE_PARITY_PORT.md#7-test-matrix) cases and satisfy the §9 acceptance
+criteria before the Table variant is promotable. No production `Table`
+implementation exists yet (`Collection` currently has only the `BTree` variant).
+
 ## Migration policy
 
 1. BTree, Table, and Tensor must adopt this contract before declaring migration complete.
