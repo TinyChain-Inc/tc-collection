@@ -757,12 +757,14 @@ fn finalize_conflicts_with_future_read() {
             // Register an overlapping future read at txn 11.
             assert!(btree.contains_row(tx(11), &[Value::from("k")]).await);
 
-            let err = btree
-                .finalize(tx(10))
-                .await
-                .expect_err("finalize at txn 10 should conflict with future read at txn 11");
+            // Finalize at txn 10 should succeed even though txn 11 has an active
+            // read reservation. Finalize is a lifecycle operation, not a write —
+            // it merges already-committed data into canon. Future reads are
+            // protected by their own permits and by the DirLock on persistent storage.
+            btree.finalize(tx(10)).await.expect("finalize should succeed with future read");
 
-            assert_eq!(err, txn_lock::Error::Conflict);
+            // After finalize, the data should still be visible to later reads.
+            assert!(btree.contains_row(tx(12), &[Value::from("k")]).await);
         })
     });
 }

@@ -459,18 +459,20 @@ impl BTree {
     /// Finalize all committed deltas up to `txn_id` into persistent state.
     ///
     /// Finalize is monotonic. A stale finalize is a no-op.
+    ///
+    /// Unlike commit/rollback, finalize does **not** acquire a semaphore write
+    /// permit. Finalize is a lifecycle operation that merges already-committed
+    /// data into canon — it does not introduce new pending writes. Acquiring a
+    /// write permit via `try_write` would conflict with future read reservations
+    /// (e.g. readers at txn N+1), which is incorrect: finalize at txn N should
+    /// proceed even when later transactions hold read permits. Synchronization
+    /// is provided by the state write lock, and `semaphore.finalize(drop_past=true)`
+    /// cleans up semaphore versions ≤ `txn_id`.
     pub async fn finalize(&self, txn_id: TxnId) -> Result<(), txn_lock::Error> {
-        // Finalize advances the global visibility frontier; reserve full range.
-        let _permit = self
-            .semaphore
-            .try_write(txn_id, txn_lock::set::Range::All)?;
-
         let (persistent, committed_to_apply) = {
             let state = self.state.write().expect("state write lock");
 
             if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
-                drop(state);
-                self.release_txn_reservation(txn_id);
                 return Ok(());
             }
 

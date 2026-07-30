@@ -241,6 +241,18 @@ dependencies = [
 
 [[package]]
 name = "ds-ext"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0648394625648af164c3183c2c01ffd88301178c70496046b43171fa0ebedaa"
+dependencies = [
+ "derive_more 1.0.0",
+ "get-size",
+ "get-size-derive",
+ "safecast",
+]
+
+[[package]]
+name = "ds-ext"
 version = "0.4.0"
 dependencies = [
  "derive_more 2.1.1",
@@ -296,7 +308,7 @@ dependencies = [
  "async-recursion",
  "bytes",
  "destream",
- "ds-ext",
+ "ds-ext 0.3.0",
  "futures",
  "safecast",
  "tbon",
@@ -1277,7 +1289,7 @@ name = "txn_lock"
 version = "0.11.0"
 dependencies = [
  "collate",
- "ds-ext",
+ "ds-ext 0.4.0",
  "futures",
  "tokio",
 ]

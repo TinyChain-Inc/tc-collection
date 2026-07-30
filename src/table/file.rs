@@ -105,6 +105,10 @@ impl TableStore {
         Ok(Self { table })
     }
 
+    async fn sync(&self) -> std::io::Result<()> {
+        self.table.sync().await
+    }
+
     async fn row_stream(
         &self,
         range: Range<tc_ir::Id, Value>,
@@ -117,8 +121,13 @@ impl TableStore {
     }
 
     async fn get_row(&self, key: &[Value]) -> std::io::Result<Option<Row<Value>>> {
+        let schema = self.schema().clone();
+        let range = schema.range_from_key(key).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
+        })?;
         let view = self.table.read().await;
-        view.get_row(key).await
+        let mut rows = view.rows(range, &[], false, None).await?;
+        rows.try_next().await
     }
 
     async fn upsert_row(&self, key: Vec<Value>, values: Vec<Value>) -> std::io::Result<()> {
@@ -178,7 +187,7 @@ impl Delta {
     }
 
     async fn already_deleted(&self, key: &[Value]) -> std::io::Result<bool> {
-        Ok(self.deletes.get_row(key).await?.is_some())
+        self.deletes.get_row(key).await.map(|row| row.is_some())
     }
 
     async fn merge_into<'a>(
@@ -311,6 +320,19 @@ impl PersistentTable {
 
     pub fn finalized(&self) -> Option<TxnId> {
         self.state.read().expect("state read lock").finalized
+    }
+
+    /// Sync the canonical (persistent) state to disk.
+    ///
+    /// This flushes any in-memory modifications to the filesystem so they
+    /// survive a restart. Pending and committed deltas are not synced —
+    /// Chain owns replay durability for those.
+    pub async fn sync(&self) -> std::io::Result<()> {
+        let persistent = {
+            let state = self.state.read().expect("state read lock");
+            state.persistent.clone()
+        };
+        persistent.sync().await
     }
 
     pub async fn upsert_row(
@@ -671,20 +693,34 @@ impl PersistentTable {
         snapshot: &VisibleSnapshot,
         key: &[Value],
     ) -> Option<Row<Value>> {
-        for delta in &snapshot.deltas {
-            if let Some(row) = delta.inserts.get_row(key).await.expect("check insert delta") {
-                return Some(row);
-            }
-            if delta.deletes.get_row(key).await.expect("check delete delta").is_some() {
-                return None;
-            }
-        }
-
-        snapshot
+        let mut row = snapshot
             .persistent
             .get_row(key)
             .await
-            .expect("check persistent visibility")
+            .expect("check persistent visibility");
+
+        for delta in &snapshot.deltas {
+            if delta
+                .deletes
+                .get_row(key)
+                .await
+                .expect("check delete delta")
+                .is_some()
+            {
+                row = None;
+            }
+
+            if let Some(inserted) = delta
+                .inserts
+                .get_row(key)
+                .await
+                .expect("check insert delta")
+            {
+                row = Some(inserted);
+            }
+        }
+
+        row
     }
 
     async fn is_row_visible(&self, snapshot: &VisibleSnapshot, key: &[Value]) -> bool {
@@ -772,27 +808,29 @@ impl PersistentTable {
     }
 }
 
-impl Transact for PersistentTable {
-    type Commit = ();
-
-    async fn commit(&self, txn_id: TxnId) -> Self::Commit {
+impl PersistentTable {
+    /// Commit the pending delta at `txn_id`.
+    ///
+    /// Returns `Err(Outdated)` if the txn is at or before the finalize frontier,
+    /// `Ok(())` for a duplicate commit (idempotent no-op), or `Err(Conflict)` if
+    /// the semaphore cannot be acquired due to a future overlapping read.
+    pub fn commit(&self, txn_id: TxnId) -> Result<(), txn_lock::Error> {
         let _permit = self
             .semaphore
-            .try_write(txn_id, txn_lock::set::Range::All)
-            .expect("Table commit: semaphore reservation");
+            .try_write(txn_id, txn_lock::set::Range::All)?;
 
         let mut state = self.state.write().expect("state write lock");
 
         if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
             drop(state);
             self.release_txn_reservation(txn_id);
-            panic!("Table commit failed: {} is outdated", txn_id);
+            return Err(txn_lock::Error::Outdated);
         }
 
         if state.committed.contains_key(&txn_id) {
             drop(state);
             self.release_txn_reservation(txn_id);
-            return;
+            return Ok(());
         }
 
         if let Some(delta) = state.pending.remove(&txn_id) {
@@ -801,78 +839,111 @@ impl Transact for PersistentTable {
 
         drop(state);
         self.release_txn_reservation(txn_id);
+
+        Ok(())
+    }
+
+    /// Roll back the pending delta at `txn_id`.
+    ///
+    /// Returns `Err(Outdated)` if the txn is at or before the finalize frontier,
+    /// `Err(Conflict)` if the txn is already committed, or `Err(Conflict)` if the
+    /// semaphore cannot be acquired due to a future overlapping read.
+    pub fn rollback(&self, txn_id: TxnId) -> Result<(), txn_lock::Error> {
+        let _permit = self
+            .semaphore
+            .try_write(txn_id, txn_lock::set::Range::All)?;
+
+        let mut state = self.state.write().expect("state write lock");
+
+        if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
+            drop(state);
+            self.release_txn_reservation(txn_id);
+            return Err(txn_lock::Error::Outdated);
+        }
+
+        if state.committed.contains_key(&txn_id) {
+            drop(state);
+            self.release_txn_reservation(txn_id);
+            return Err(txn_lock::Error::Conflict);
+        }
+
+        state.pending.remove(&txn_id);
+
+        drop(state);
+        self.release_txn_reservation(txn_id);
+
+        Ok(())
+    }
+
+    /// Finalize all committed deltas up to `txn_id` into persistent state.
+    ///
+    /// Finalize is monotonic. A stale finalize (≤ frontier) is a no-op.
+    ///
+    /// Unlike commit/rollback, finalize does **not** acquire a semaphore write
+    /// permit. Finalize is a lifecycle operation that merges already-committed
+    /// data into canon — it does not introduce new pending writes. Acquiring a
+    /// write permit via `try_write` would conflict with future read reservations
+    /// (e.g. readers at txn N+1), which is incorrect: finalize at txn N should
+    /// proceed even when later transactions hold read permits. Synchronization
+    /// is provided by the state write lock, and `semaphore.finalize(drop_past=true)`
+    /// cleans up semaphore versions ≤ `txn_id`.
+    pub async fn finalize(&self, txn_id: TxnId) -> Result<(), txn_lock::Error> {
+        let (persistent, committed_to_apply) = {
+            let state = self.state.write().expect("state write lock");
+
+            if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
+                return Ok(());
+            }
+
+            let committed_to_apply = state
+                .committed
+                .iter()
+                .filter_map(|(id, delta)| (*id <= txn_id).then_some(delta.clone()))
+                .collect::<Vec<_>>();
+
+            (state.persistent.clone(), committed_to_apply)
+        };
+
+        for delta in &committed_to_apply {
+            persistent
+                .apply_delta(delta)
+                .await
+                .map_err(background_error)?;
+        }
+
+        {
+            let mut state = self.state.write().expect("state write lock");
+            state.committed.retain(|id, _| *id > txn_id);
+            state.pending.retain(|id, _| *id > txn_id);
+            state.finalized = Some(state.finalized.map_or(txn_id, |prior| prior.max(txn_id)));
+        }
+
+        self.release_txn_frontier(txn_id);
+
+        Ok(())
+    }
+}
+
+impl Transact for PersistentTable {
+    type Commit = ();
+
+    async fn commit(&self, txn_id: TxnId) -> Self::Commit {
+        PersistentTable::commit(self, txn_id).expect("Table commit failed");
     }
 
     fn rollback(&self, txn_id: &TxnId) -> impl std::future::Future<Output = ()> + Send {
         let txn_id = *txn_id;
         async move {
-            let _permit = self
-                .semaphore
-                .try_write(txn_id, txn_lock::set::Range::All)
-                .expect("Table rollback: semaphore reservation");
-
-            let mut state = self.state.write().expect("state write lock");
-
-            if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
-                drop(state);
-                self.release_txn_reservation(txn_id);
-                panic!("Table rollback failed: {} is outdated", txn_id);
-            }
-
-            if state.committed.contains_key(&txn_id) {
-                drop(state);
-                self.release_txn_reservation(txn_id);
-                panic!("Table rollback failed: {} is already committed", txn_id);
-            }
-
-            state.pending.remove(&txn_id);
-
-            drop(state);
-            self.release_txn_reservation(txn_id);
+            PersistentTable::rollback(self, txn_id).expect("Table rollback failed");
         }
     }
 
     fn finalize(&self, txn_id: &TxnId) -> impl std::future::Future<Output = ()> + Send {
         let txn_id = *txn_id;
         async move {
-            let _permit = self
-                .semaphore
-                .try_write(txn_id, txn_lock::set::Range::All)
-                .expect("Table finalize: semaphore reservation");
-
-            let (persistent, committed_to_apply) = {
-                let state = self.state.write().expect("state write lock");
-
-                if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
-                    drop(state);
-                    self.release_txn_reservation(txn_id);
-                    return;
-                }
-
-                let committed_to_apply = state
-                    .committed
-                    .iter()
-                    .filter_map(|(id, delta)| (*id <= txn_id).then_some(delta.clone()))
-                    .collect::<Vec<_>>();
-
-                (state.persistent.clone(), committed_to_apply)
-            };
-
-            for delta in &committed_to_apply {
-                persistent
-                    .apply_delta(delta)
-                    .await
-                    .expect("Table finalize: apply delta");
-            }
-
-            {
-                let mut state = self.state.write().expect("state write lock");
-                state.committed.retain(|id, _| *id > txn_id);
-                state.pending.retain(|id, _| *id > txn_id);
-                state.finalized = Some(state.finalized.map_or(txn_id, |prior| prior.max(txn_id)));
-            }
-
-            self.release_txn_frontier(txn_id);
+            PersistentTable::finalize(self, txn_id)
+                .await
+                .expect("Table finalize failed");
         }
     }
 }

@@ -1,3 +1,5 @@
+#![deny(clippy::needless_question_mark)]
+
 pub use fensor;
 
 pub mod btree;

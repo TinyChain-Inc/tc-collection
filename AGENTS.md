@@ -29,6 +29,14 @@ local and lean, and push cross-host orchestration to client libraries.
 - Keep `TRANSACTIONAL_COLLECTION_CONTRACT.md` aligned with implementation changes and
   use its checklist as the required gate for BTree/Table/Tensor migration slices.
 
+## Code style
+
+- Do not wrap `?` expressions in `Ok(...)`. The `?` operator already returns
+  `Err` on failure and passes through `Ok` on success, so `Ok(expr?)` is
+  redundant — write `expr?` (or `expr` if it's the last expression in the
+  function body). This is enforced by `#![deny(clippy::needless_question_mark)]`
+  in `src/lib.rs`.
+
 ## Locking and transaction safety
 
 - Treat lock ordering as part of the public correctness contract for transactional
