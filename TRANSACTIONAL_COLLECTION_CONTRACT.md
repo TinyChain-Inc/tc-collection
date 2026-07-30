@@ -120,14 +120,41 @@ BTree port. Each row must map to executable tests.
 7. Earlier overlapping writes fail closed with conflict.
    - Evidence: `overlapping_write_in_past_txn_fails_closed` in `src/btree/tests.rs`.
 
-## BTree parity gaps to close
+## BTree parity gap status
 
-1. Rollback visibility/regression coverage should be explicit.
-2. Finalize idempotency/stale finalize no-op coverage should be explicit.
-3. Duplicate commit idempotency coverage should be explicit.
-4. Chain-ordered event replay coverage should be explicit.
+Previously identified parity gaps and their current status. Closed gaps map to
+executable tests in `src/btree/tests.rs`.
+
+1. Rollback visibility/regression coverage should be explicit. **Closed.**
+   - Evidence: `rollback_unblocks_later_read_and_discards_pending` and
+     `repeated_rollback_and_finalize_are_idempotent` in `src/btree/tests.rs`.
+2. Finalize idempotency/stale finalize no-op coverage should be explicit. **Closed.**
+   - Evidence: `stale_finalize_is_noop` and
+     `repeated_rollback_and_finalize_are_idempotent` in `src/btree/tests.rs`.
+3. Duplicate commit idempotency coverage should be explicit. **Closed.**
+   - Evidence: `duplicate_commit_is_idempotent` in `src/btree/tests.rs`.
+4. Chain-ordered event replay coverage should be explicit. **Open.**
+   - Current coverage is limited to `direct_mutation_flow_from_chain_state`,
+     which drives the deterministic mutation flow directly rather than replaying
+     canonical chain events. Explicit replay-order coverage depends on
+     `tc-chain` integration and remains to be implemented.
 5. Lifecycle no-op/error branches should explicitly assert semaphore-reservation
-   release (no blocked later reads after stale/no-op operations).
+   release (no blocked later reads after stale/no-op operations). **Closed.**
+   - Evidence: `lifecycle_noop_paths_do_not_leak_reservations_soak` in
+     `src/btree/tests.rs` (200-iteration soak over duplicate commit, stale
+     finalize, and finalize paths asserting that later reads do not starve).
+
+## Remaining BTree parity gaps beyond the original list
+
+The following parity checklist items have no test coverage in this crate yet:
+
+1. Restart recovery for prepared and unresolved-finalize paths under
+   Chain-driven replay (depends on `tc-chain`).
+2. Corruption/malformed persisted state tests failing closed with structured
+   errors.
+3. Read/write/range/scan benchmarks with regression budgets vs v1 baselines.
+4. Table and Tensor lifecycle parity (see `ROADMAP.md` items 4-6); `Collection`
+   currently has only the `BTree` variant.
 
 ## Migration policy
 
