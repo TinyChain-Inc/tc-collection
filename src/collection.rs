@@ -55,23 +55,17 @@ impl Transact for Collection {
 
     async fn commit(&self, txn_id: TxnId) -> Self::Commit {
         match self {
-            Self::BTree(btree) => btree.commit(txn_id).expect("Collection commit failed"),
-            Self::Table(table) => {
-                PersistentTable::commit(table, txn_id).expect("Collection commit failed")
-            }
+            Self::BTree(btree) => Transact::commit(btree, txn_id).await,
+            Self::Table(table) => Transact::commit(table, txn_id).await,
         }
     }
 
     fn rollback(&self, txn_id: &TxnId) -> impl std::future::Future<Output = ()> + Send {
         let txn_id = *txn_id;
         async move {
-            match self {
-                Self::BTree(btree) => {
-                    btree.rollback(txn_id).expect("Collection rollback failed")
-                }
-                Self::Table(table) => {
-                    PersistentTable::rollback(table, txn_id).expect("Collection rollback failed")
-                }
+            match &self {
+                Self::BTree(btree) => Transact::rollback(btree, &txn_id).await,
+                Self::Table(table) => Transact::rollback(table, &txn_id).await,
             }
         }
     }
@@ -79,16 +73,9 @@ impl Transact for Collection {
     fn finalize(&self, txn_id: &TxnId) -> impl std::future::Future<Output = ()> + Send {
         let txn_id = *txn_id;
         async move {
-            match self {
-                Self::BTree(btree) => btree
-                    .finalize(txn_id)
-                    .await
-                    .expect("Collection finalize failed"),
-                Self::Table(table) => {
-                    PersistentTable::finalize(table, txn_id)
-                        .await
-                        .expect("Collection finalize failed");
-                }
+            match &self {
+                Self::BTree(btree) => Transact::finalize(btree, &txn_id).await,
+                Self::Table(table) => Transact::finalize(table, &txn_id).await,
             }
         }
     }

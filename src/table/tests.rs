@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tc_ir::{Id, NetworkTime, TxnId};
+use tc_ir::{NetworkTime, TxnId};
 use tc_value::{Value, ValueType};
 use tokio::sync::Barrier;
 use tokio::time::{Duration, sleep, timeout};
