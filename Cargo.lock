@@ -290,16 +290,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "frand"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0632aefca5b3940174bbea720a111b3ec3433a67852ab737299565c3ce2d32b4"
-dependencies = [
- "glam",
- "rand_core",
-]
-
-[[package]]
 name = "freqfs"
 version = "0.13.0"
 dependencies = [
@@ -446,22 +436,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "glam"
-version = "0.32.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34627c5158214743a374170fed714833fdf4e4b0cbcc1ea98417866a4c5d4441"
-
-[[package]]
 name = "ha-ndarray"
-version = "0.5.0"
+version = "0.4.0"
 dependencies = [
- "frand",
  "get-size",
  "lazy_static",
  "num_cpus",
- "number-general",
+ "pkg-config",
+ "rand",
  "rayon",
- "safecast",
  "smallvec",
  "transpose",
 ]
@@ -842,6 +825,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b3cff922bd51709b605d9ead9aa71031d81447142d828eb4a6eba76fe619f9b"
 
 [[package]]
+name = "pkg-config"
+version = "0.3.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
+
+[[package]]
 name = "potential_utf"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1146,6 +1135,7 @@ dependencies = [
 name = "tc-collection"
 version = "0.1.0"
 dependencies = [
+ "b-table",
  "b-tree",
  "collate",
  "destream",

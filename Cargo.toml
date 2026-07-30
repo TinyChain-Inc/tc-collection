@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+b-table = { path = "../deps/b-table", features = ["stream"] }
 b-tree = { path = "../deps/b-tree", features = ["stream"] }
 collate = { path = "../deps/collate", features = ["stream"] }
 destream = { path = "../deps/destream", version = "0.10.1" }
