@@ -1,4 +1,4 @@
-sensor_id,ts,temp,hum
+part_a,part_b,val1,val2
 1,1000,21.4,48.2
 1,1001,21.6,48.0
 1,1002,21.5,48.1

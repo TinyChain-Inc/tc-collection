@@ -2,26 +2,27 @@
 
 Small, deterministic datasets reused by the `Table` port test matrix in
 [`TABLE_PARITY_PORT.md`](../../TABLE_PARITY_PORT.md) §7. Fixtures are CSV with a
-header row; the first column(s) listed as the key in the spec are the primary
-key. Values are intentionally tiny so tests stay fast.
+header row; the key column(s) are noted below. Values are intentionally tiny so
+tests stay fast. Column names are generic and structural — they describe the
+table shape each fixture exercises, not any application domain.
 
 ## Schemas
 
-### users.csv
+### simple_pk.csv
 - **Key:** `id` (Int)
-- Values: `name` (String), `age` (Int), `city` (String)
+- Values: `label` (String), `score` (Int), `tag` (String)
 - 5 rows. Use for: primary-key reads, `upsert`/`delete`, single-column range on
   `id`, `count`, `select`/`order`/`limit` views.
 
-### orders.csv
-- **Key:** `order_id` (Int)
-- Values: `user_id` (Int), `total` (Float), `status` (String)
+### index_and_range.csv
+- **Key:** `id` (Int)
+- Values: `ref_id` (Int), `amount` (Float), `state` (String)
 - 8 rows. Use for: multi-key visibility, `select`/`order`/`limit`, range slice
-  on `order_id` or `total`, auxiliary index on `user_id` for cross-row lookup.
+  on `id` or `amount`, auxiliary index on `ref_id` for cross-row lookup.
 
-### sensor_readings.csv
-- **Key:** `sensor_id` (Int), `ts` (Int) — composite primary key
-- Values: `temp` (Float), `hum` (Float)
+### composite_key.csv
+- **Key:** `part_a` (Int), `part_b` (Int) — composite primary key
+- Values: `val1` (Float), `val2` (Float)
 - 12 rows. Use for: composite-key reads, auxiliary-index coverage, streaming /
   scan performance baselines, deterministic merge-order checks.
 

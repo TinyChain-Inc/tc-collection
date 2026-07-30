@@ -215,9 +215,9 @@ intent of each fixture.
 
 | Fixture | Columns (key in **bold**) | Rows | Purpose |
 | --- | --- | --- | --- |
-| `users.csv` | **id**:Int, name:String, age:Int, city:String | 5 | Primary-key reads, upsert/delete, single-column range, count. |
-| `orders.csv` | **order_id**:Int, user_id:Int, total:Float, status:String | 8 | Multi-key visibility, `select`/`order`/`limit` views, range slice. |
-| `sensor_readings.csv` | **sensor_id**:Int, **ts**:Int, temp:Float, hum:Float | 12 | Composite key, auxiliary-index coverage, streaming/scan perf baseline. |
+| `simple_pk.csv` | **id**:Int, label:String, score:Int, tag:String | 5 | Single-column primary-key reads, upsert/delete, single-column range, count. |
+| `index_and_range.csv` | **id**:Int, ref_id:Int, amount:Float, state:String | 8 | Range slice, `select`/`order`/`limit` views, auxiliary index on `ref_id`. |
+| `composite_key.csv` | **part_a**:Int, **part_b**:Int, val1:Float, val2:Float | 12 | Composite primary key, auxiliary-index coverage, streaming/scan perf baseline. |
 
 ## 7. Test matrix
 

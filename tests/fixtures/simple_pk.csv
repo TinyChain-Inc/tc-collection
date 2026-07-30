@@ -1,4 +1,4 @@
-id,name,age,city
+id,label,score,tag
 1,Alice,30,Portland
 2,Bob,25,Seattle
 3,Carol,41,Portland

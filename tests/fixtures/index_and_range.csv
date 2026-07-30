@@ -1,4 +1,4 @@
-order_id,user_id,total,status
+id,ref_id,amount,state
 101,1,19.99,pending
 102,1,45.50,shipped
 103,2,12.00,pending
