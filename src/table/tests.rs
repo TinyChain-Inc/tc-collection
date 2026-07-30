@@ -1,7 +1,10 @@
 //! Transactional visibility and ordering regression tests for `PersistentTable`.
-use super::{Column, PersistentTable, TableSchema};
+use super::{Column, ColumnRange, Limited, PersistentTable, Range, Rows, Selection, TableSchema, TableSlice};
 use crate::btree::{StorageConfig, PersistentFile};
 use freqfs::Cache;
+use futures::TryStreamExt;
+use std::collections::HashMap;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tc_ir::{NetworkTime, Transact, TxnId};
@@ -1166,4 +1169,609 @@ fn rollback_unblocks_later_read_and_discards_pending_table() {
             assert!(row.is_none(), "rolled-back key must not be visible");
         })
     });
+}
+
+fn id(name: &str) -> tc_ir::Id {
+    name.parse().expect("Id")
+}
+
+fn range_in(col: &str, start: Value, end: Value) -> Range<tc_ir::Id, Value> {
+    let mut map = HashMap::new();
+    map.insert(
+        id(col),
+        ColumnRange::In((Bound::Included(start), Bound::Excluded(end))),
+    );
+    map.into()
+}
+
+fn range_eq(col: &str, val: Value) -> Range<tc_ir::Id, Value> {
+    let mut map = HashMap::new();
+    map.insert(id(col), ColumnRange::Eq(val));
+    map.into()
+}
+
+async fn collect_rows(rows: Rows) -> Vec<Vec<Value>> {
+    let mut result = Vec::new();
+    let mut rows = std::pin::pin!(rows);
+    while let Some(row) = rows.try_next().await.expect("read row") {
+        result.push(row.into_vec());
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// §7.5 Query correctness
+// ---------------------------------------------------------------------------
+
+#[test]
+fn slice_returns_in_range_rows_table() {
+    run_async_test("slice_returns_in_range_rows_table", || {
+        Box::pin(async {
+            let root = init_root("slice-in-range").await;
+            let (persistent, txn) = load_roots(&root);
+            let table = PersistentTable::new(persistent, txn, simple_schema());
+
+            for i in 1..=5u64 {
+                table
+                    .upsert_row(tx(10), vec![Value::from(i)], vec![Value::from(format!("v{i}"))])
+                    .await
+                    .expect("insert");
+            }
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
+
+            let slice = table.slice(range_in("id", Value::from(2_u64), Value::from(5_u64)), &[], false);
+            let rows = slice.rows(tx(11)).await.expect("slice rows");
+            let collected = collect_rows(rows).await;
+
+            let ids: Vec<Value> = collected.iter().map(|r| r[0].clone()).collect();
+            assert_eq!(
+                ids,
+                vec![Value::from(2_u64), Value::from(3_u64), Value::from(4_u64)],
+                "slice should return only in-range rows [2, 5)"
+            );
+
+            assert_eq!(slice.count(tx(11)).await, 3);
+            assert!(!slice.is_empty(tx(11)).await);
+        })
+    });
+}
+
+#[test]
+fn select_projects_columns_table() {
+    run_async_test("select_projects_columns_table", || {
+        Box::pin(async {
+            let root = init_root("select-projects").await;
+            let (persistent, txn) = load_roots(&root);
+            let table = PersistentTable::new(persistent, txn, simple_schema());
+
+            table
+                .upsert_row(tx(10), vec![Value::from(1_u64)], vec![Value::from("alpha")])
+                .await
+                .expect("insert");
+            table
+                .upsert_row(tx(10), vec![Value::from(2_u64)], vec![Value::from("beta")])
+                .await
+                .expect("insert");
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
+
+            let selection = table.select(&[id("label")]);
+            let rows = selection.rows(tx(11)).await.expect("select rows");
+            let collected = collect_rows(rows).await;
+
+            assert_eq!(collected.len(), 2, "should have 2 projected rows");
+            assert_eq!(collected[0], vec![Value::from("alpha")], "first row should project label only");
+            assert_eq!(collected[1], vec![Value::from("beta")], "second row should project label only");
+
+            assert_eq!(selection.count(tx(11)).await, 2);
+            assert!(!selection.is_empty(tx(11)).await);
+        })
+    });
+}
+
+#[test]
+fn limit_caps_row_stream_table() {
+    run_async_test("limit_caps_row_stream_table", || {
+        Box::pin(async {
+            let root = init_root("limit-caps").await;
+            let (persistent, txn) = load_roots(&root);
+            let table = PersistentTable::new(persistent, txn, simple_schema());
+
+            for i in 1..=10u64 {
+                table
+                    .upsert_row(tx(10), vec![Value::from(i)], vec![Value::from(format!("v{i}"))])
+                    .await
+                    .expect("insert");
+            }
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
+
+            let limited = table.limit(3);
+            assert_eq!(limited.count(tx(11)).await, 3, "count should be capped at 3");
+
+            let rows = limited.rows(tx(11)).await.expect("limited rows");
+            let collected = collect_rows(rows).await;
+            assert_eq!(collected.len(), 3, "stream should yield exactly 3 rows");
+
+            let limited_zero = table.limit(0);
+            assert_eq!(limited_zero.count(tx(11)).await, 0);
+            assert!(limited_zero.is_empty(tx(11)).await);
+
+            let limited_large = table.limit(100);
+            assert_eq!(limited_large.count(tx(11)).await, 10, "limit larger than table should return all");
+        })
+    });
+}
+
+#[test]
+fn order_by_uses_supporting_index_table() {
+    run_async_test("order_by_uses_supporting_index_table", || {
+        Box::pin(async {
+            let root = init_root("order-by-index").await;
+            let (persistent, txn) = load_roots(&root);
+            let table = PersistentTable::new(persistent, txn, schema_with_index());
+
+            // Use ref_ids where textual and numeric ordering coincide
+            // (tc_value::Value compares numbers by their string representation).
+            let data = [
+                (1u64, 30u64, "a"),
+                (2u64, 10u64, "b"),
+                (3u64, 50u64, "c"),
+                (4u64, 20u64, "d"),
+                (5u64, 40u64, "e"),
+            ];
+            for (id_val, ref_id, label) in data {
+                table
+                    .upsert_row(
+                        tx(10),
+                        vec![Value::from(id_val)],
+                        vec![Value::from(ref_id), Value::from(label)],
+                    )
+                    .await
+                    .expect("insert");
+            }
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
+
+            let ordered = table.order_by(&[id("ref_id")], false);
+            let rows = ordered.rows(tx(11)).await.expect("ordered rows");
+            let collected = collect_rows(rows).await;
+
+            let ref_ids: Vec<Value> = collected.iter().map(|r| r[1].clone()).collect();
+            assert_eq!(
+                ref_ids,
+                vec![
+                    Value::from(10_u64),
+                    Value::from(20_u64),
+                    Value::from(30_u64),
+                    Value::from(40_u64),
+                    Value::from(50_u64),
+                ],
+                "rows should be ordered by ref_id ascending"
+            );
+
+            // Verify reverse ordering
+            let ordered_rev = table.order_by(&[id("ref_id")], true);
+            let rows = ordered_rev.rows(tx(11)).await.expect("ordered reverse rows");
+            let collected = collect_rows(rows).await;
+            let ref_ids_rev: Vec<Value> = collected.iter().map(|r| r[1].clone()).collect();
+            assert_eq!(
+                ref_ids_rev,
+                vec![
+                    Value::from(50_u64),
+                    Value::from(40_u64),
+                    Value::from(30_u64),
+                    Value::from(20_u64),
+                    Value::from(10_u64),
+                ],
+                "reverse order_by should flip iteration"
+            );
+        })
+    });
+}
+
+#[test]
+fn reverse_flips_order_table() {
+    run_async_test("reverse_flips_order_table", || {
+        Box::pin(async {
+            let root = init_root("reverse-flips").await;
+            let (persistent, txn) = load_roots(&root);
+            let table = PersistentTable::new(persistent, txn, simple_schema());
+
+            for i in 1..=5u64 {
+                table
+                    .upsert_row(tx(10), vec![Value::from(i)], vec![Value::from(format!("v{i}"))])
+                    .await
+                    .expect("insert");
+            }
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
+
+            let forward = table.slice(Range::default(), &[], false);
+            let rows = forward.rows(tx(11)).await.expect("forward rows");
+            let forward_ids: Vec<Value> = collect_rows(rows).await.iter().map(|r| r[0].clone()).collect();
+            assert_eq!(
+                forward_ids,
+                vec![Value::from(1_u64), Value::from(2_u64), Value::from(3_u64), Value::from(4_u64), Value::from(5_u64)],
+            );
+
+            let reverse = table.slice(Range::default(), &[], true);
+            let rows = reverse.rows(tx(11)).await.expect("reverse rows");
+            let reverse_ids: Vec<Value> = collect_rows(rows).await.iter().map(|r| r[0].clone()).collect();
+            assert_eq!(
+                reverse_ids,
+                vec![Value::from(5_u64), Value::from(4_u64), Value::from(3_u64), Value::from(2_u64), Value::from(1_u64)],
+                "reverse should flip iteration order"
+            );
+        })
+    });
+}
+
+#[test]
+fn unsupported_range_fails_closed_table() {
+    run_async_test("unsupported_range_fails_closed_table", || {
+        Box::pin(async {
+            let root = init_root("unsupported-range").await;
+            let (persistent, txn) = load_roots(&root);
+            let table = PersistentTable::new(persistent, txn, simple_schema());
+
+            table
+                .upsert_row(tx(10), vec![Value::from(1_u64)], vec![Value::from("alpha")])
+                .await
+                .expect("insert");
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
+
+            // A range on a non-existent column cannot be supported by any index
+            // and must fail closed.
+            let range = range_eq("nonexistent", Value::from(42_u64));
+            let result = table.rows(tx(11), range, vec![], false).await;
+            assert!(result.is_err(), "unsupported range should fail closed");
+
+            // Similarly, ordering by a non-existent column must fail closed.
+            let result = table.rows(tx(11), Range::default(), vec![id("nonexistent")], false).await;
+            assert!(result.is_err(), "unsupported order should fail closed");
+        })
+    });
+}
+
+// ---------------------------------------------------------------------------
+// §7.6 Streaming / no-materialization
+// ---------------------------------------------------------------------------
+
+#[test]
+fn truncate_use_scratch_not_buffer_table() {
+    run_async_test("truncate_use_scratch_not_buffer_table", || {
+        Box::pin(async {
+            let root = init_root("truncate-scratch").await;
+            let (persistent, txn) = load_roots(&root);
+            let table = PersistentTable::new(persistent, txn, simple_schema());
+
+            for i in 1..=5u64 {
+                table
+                    .upsert_row(tx(10), vec![Value::from(i)], vec![Value::from(format!("v{i}"))])
+                    .await
+                    .expect("insert");
+            }
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
+
+            // Truncate rows with id in [2, 4)
+            table
+                .truncate(tx(11), range_in("id", Value::from(2_u64), Value::from(4_u64)))
+                .await
+                .expect("truncate");
+
+            assert!(table.read_row(tx(11), &[Value::from(1_u64)]).await.is_some(), "id 1 should remain");
+            assert!(table.read_row(tx(11), &[Value::from(2_u64)]).await.is_none(), "id 2 should be deleted");
+            assert!(table.read_row(tx(11), &[Value::from(3_u64)]).await.is_none(), "id 3 should be deleted");
+            assert!(table.read_row(tx(11), &[Value::from(4_u64)]).await.is_some(), "id 4 should remain");
+            assert!(table.read_row(tx(11), &[Value::from(5_u64)]).await.is_some(), "id 5 should remain");
+
+            assert_eq!(table.count(tx(11)).await, 3, "3 rows should remain after truncate");
+
+            // Commit and finalize the truncate
+            table.commit(tx(11)).await;
+            table.finalize(&tx(11)).await;
+
+            assert_eq!(table.count(tx(12)).await, 3, "count should persist after finalize");
+        })
+    });
+}
+
+#[test]
+fn view_composition_is_lazy_table() {
+    run_async_test("view_composition_is_lazy_table", || {
+        Box::pin(async {
+            let root = init_root("view-composition-lazy").await;
+            let (persistent, txn) = load_roots(&root);
+            let table = PersistentTable::new(persistent, txn, schema_with_index());
+
+            for i in 1..=8u64 {
+                table
+                    .upsert_row(
+                        tx(10),
+                        vec![Value::from(i)],
+                        vec![Value::from(i * 10), Value::from(format!("item{i}"))],
+                    )
+                    .await
+                    .expect("insert");
+            }
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
+
+            // Compose: slice [3, 7) -> limit 2 -> select ["label"]
+            let slice = table.slice(range_in("id", Value::from(3_u64), Value::from(7_u64)), &[], false);
+            let limited = slice.limit(2);
+            let selection = limited.select(vec![id("label")]);
+
+            let rows = selection.rows(tx(11)).await.expect("composed view rows");
+            let collected = collect_rows(rows).await;
+
+            assert_eq!(collected.len(), 2, "limit should cap at 2 rows");
+            assert_eq!(
+                collected[0],
+                vec![Value::from("item3")],
+                "first row should be id 3 with only label projected"
+            );
+            assert_eq!(
+                collected[1],
+                vec![Value::from("item4")],
+                "second row should be id 4 with only label projected"
+            );
+
+            // Also verify count on composed view
+            assert_eq!(limited.count(tx(11)).await, 2, "limited count should be 2");
+        })
+    });
+}
+
+// ---------------------------------------------------------------------------
+// §7.1 Lifecycle — no-op paths release reservations
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lifecycle_noop_paths_release_reservations_table() {
+    run_async_test("lifecycle_noop_paths_release_reservations_table", || {
+        Box::pin(async {
+            let root = init_root("lifecycle-noop-reservations").await;
+            let (persistent, txn) = load_roots(&root);
+            let table = PersistentTable::new(persistent, txn, simple_schema());
+
+            table
+                .upsert_row(tx(10), vec![Value::from(1_u64)], vec![Value::from("a")])
+                .await
+                .expect("insert");
+            table.commit(tx(10)).await;
+
+            // Duplicate commit (no-op) — should release reservation.
+            table.commit(tx(10)).await;
+
+            // Finalize tx(10), then duplicate finalize (stale no-op).
+            table.finalize(&tx(10)).await;
+            assert_eq!(table.finalized(), Some(tx(10)));
+            table.finalize(&tx(10)).await;
+            assert_eq!(table.finalized(), Some(tx(10)));
+
+            // After all no-op paths, a later read should not be blocked.
+            let row = timeout(
+                Duration::from_secs(1),
+                table.read_row(tx(11), &[Value::from(1_u64)]),
+            )
+            .await
+            .expect("later read should not be blocked after no-op lifecycle paths");
+
+            assert!(row.is_some(), "row should be visible");
+
+            // Write at a new txn should succeed (no leaked reservations).
+            table
+                .upsert_row(tx(12), vec![Value::from(2_u64)], vec![Value::from("b")])
+                .await
+                .expect("write should succeed after no-op paths");
+        })
+    });
+}
+
+// ---------------------------------------------------------------------------
+// §7.2 Visibility — overlapping read blocks until earlier finalize
+// ---------------------------------------------------------------------------
+
+#[test]
+fn overlapping_read_blocks_until_earlier_finalize_table() {
+    run_async_test("overlapping_read_blocks_until_earlier_finalize_table", || {
+        Box::pin(async {
+            let root = init_root("overlapping-read-finalize").await;
+            let (persistent, txn) = load_roots(&root);
+            let table = PersistentTable::new(persistent, txn, simple_schema());
+
+            table
+                .upsert_row(tx(10), vec![Value::from(1_u64)], vec![Value::from("hot")])
+                .await
+                .expect("insert pending");
+
+            // Later read should block while earlier pending write is active
+            assert!(
+                timeout(Duration::from_millis(50), table.read_row(tx(11), &[Value::from(1_u64)]))
+                    .await
+                    .is_err(),
+                "later read should block while earlier pending write is active"
+            );
+
+            // Commit + finalize the earlier txn
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
+
+            // Now the later read should complete
+            let row = timeout(
+                Duration::from_secs(1),
+                table.read_row(tx(11), &[Value::from(1_u64)]),
+            )
+            .await
+            .expect("later read should complete after earlier finalize");
+
+            assert!(row.is_some(), "row should be visible after finalize");
+        })
+    });
+}
+
+// ---------------------------------------------------------------------------
+// §7.8 Concurrency / locking
+// ---------------------------------------------------------------------------
+
+#[test]
+fn concurrent_read_write_finalize_table() {
+    run_async_test("concurrent_read_write_finalize_table", || {
+        Box::pin(async {
+            let root = init_root("concurrent-rwf").await;
+            let (persistent, txn) = load_roots(&root);
+            let table = PersistentTable::new(persistent, txn, simple_schema());
+
+            // Seed the table
+            for i in 1..=20u64 {
+                table
+                    .upsert_row(tx(1), vec![Value::from(i)], vec![Value::from(format!("v{i}"))])
+                    .await
+                    .expect("seed insert");
+            }
+            table.commit(tx(1)).await;
+            table.finalize(&tx(1)).await;
+
+            let t_read = table.clone();
+            let t_write = table.clone();
+            let t_finalize = table.clone();
+
+            // Spawn concurrent operations with a timeout to detect deadlock
+            let result = timeout(Duration::from_secs(5), async {
+                let read_task = tokio::spawn(async move {
+                    for i in 1..=20u64 {
+                        let _ = t_read.read_row(tx(100), &[Value::from(i)]).await;
+                    }
+                });
+
+                let write_task = tokio::spawn(async move {
+                    for i in 1..=10u64 {
+                        let _ = t_write
+                            .upsert_row(tx(50), vec![Value::from(i)], vec![Value::from("updated")])
+                            .await;
+                    }
+                    t_write.commit(tx(50)).await;
+                });
+
+                let finalize_task = tokio::spawn(async move {
+                    t_finalize.finalize(&tx(1)).await;
+                });
+
+                let _ = tokio::join!(read_task, write_task, finalize_task);
+            })
+            .await;
+
+            assert!(result.is_ok(), "concurrent read/write/finalize should not deadlock");
+        })
+    });
+}
+
+#[test]
+fn lock_order_no_deadlock_table() {
+    run_async_test("lock_order_no_deadlock_table", || {
+        Box::pin(async {
+            let root = init_root("lock-order-no-deadlock").await;
+            let (persistent, txn) = load_roots(&root);
+            let table = PersistentTable::new(persistent, txn, simple_schema());
+
+            for i in 1..=10u64 {
+                table
+                    .upsert_row(tx(1), vec![Value::from(i)], vec![Value::from(format!("v{i}"))])
+                    .await
+                    .expect("seed");
+            }
+            table.commit(tx(1)).await;
+            table.finalize(&tx(1)).await;
+
+            // Interleave commit, finalize, read, and write at different txns
+            // to exercise lock ordering. If lock order is canonical, no deadlock.
+            let result = timeout(Duration::from_secs(3), async {
+                let t1 = table.clone();
+                let t2 = table.clone();
+
+                let w1 = tokio::spawn(async move {
+                    t1.upsert_row(tx(10), vec![Value::from(1_u64)], vec![Value::from("w1")])
+                        .await
+                        .expect("w1");
+                    t1.commit(tx(10)).await;
+                    t1.finalize(&tx(10)).await;
+                });
+
+                let w2 = tokio::spawn(async move {
+                    t2.upsert_row(tx(20), vec![Value::from(2_u64)], vec![Value::from("w2")])
+                        .await
+                        .expect("w2");
+                    t2.commit(tx(20)).await;
+                    t2.finalize(&tx(20)).await;
+                });
+
+                let _ = tokio::join!(w1, w2);
+            })
+            .await;
+
+            assert!(result.is_ok(), "interleaved operations should not deadlock");
+        })
+    });
+}
+
+#[test]
+fn finalize_sync_drops_guard_first_table() {
+    run_async_test("finalize_sync_drops_guard_first_table", || {
+        Box::pin(async {
+            let root = init_root("finalize-drops-guard").await;
+            let (persistent, txn) = load_roots(&root);
+            let table = PersistentTable::new(persistent, txn, simple_schema());
+
+            // Insert rows in multiple txns, then finalize in order.
+            // If finalize holds the state guard while applying deltas (which
+            // acquire table read/write locks), it would deadlock. This test
+            // verifies that finalize drops the guard before applying deltas.
+            for i in 1..=5u64 {
+                table
+                    .upsert_row(tx(10), vec![Value::from(i)], vec![Value::from(format!("v{i}"))])
+                    .await
+                    .expect("insert txn 10");
+            }
+            table.commit(tx(10)).await;
+
+            for i in 6..=10u64 {
+                table
+                    .upsert_row(tx(11), vec![Value::from(i)], vec![Value::from(format!("v{i}"))])
+                    .await
+                    .expect("insert txn 11");
+            }
+            table.commit(tx(11)).await;
+
+            // Finalize should merge both committed deltas without deadlock
+            let result = timeout(Duration::from_secs(2), table.finalize(&tx(11))).await;
+            assert!(result.is_ok(), "finalize should complete without deadlock");
+
+            // Verify all rows are visible after finalize
+            assert_eq!(table.count(tx(12)).await, 10, "all 10 rows should be visible after finalize");
+            assert_eq!(table.finalized(), Some(tx(11)));
+        })
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Rows stream — Send + Sync assertions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rows_and_views_are_send_and_sync() {
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    assert_send::<Rows>();
+    assert_send::<TableSlice>();
+    assert_sync::<TableSlice>();
+    assert_send::<Limited>();
+    assert_sync::<Limited>();
+    assert_send::<Selection>();
+    assert_sync::<Selection>();
 }

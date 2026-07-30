@@ -8,29 +8,73 @@ use collate::Collator;
 use freqfs::DirLock;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-use tc_ir::{Transact, TxnId};
+use tc_ir::{Id, Transact, TxnId};
 use tc_value::Value;
 
 use super::schema::{TableIndexSchema, TableSchema};
+use super::stream::Rows;
+use super::view::{Limited, Selection, TableSlice};
 use crate::btree::{StorageConfig, PersistentFile};
 
 fn background_error(err: impl fmt::Display) -> txn_lock::Error {
     txn_lock::Error::Background(err.to_string())
 }
 
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+/// Collator for merging row streams that are ordered by specific column indices.
+///
+/// When `order` is empty (natural primary-key order), `indices` is set to
+/// `[0, 1, ..., key_len-1]` so the collator compares the primary-key prefix.
+/// When `order` is non-empty, `indices` holds the positions of the order
+/// columns within the row (which is always in primary-column order: key
+/// columns followed by value columns).
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RowCollator {
-    key_len: usize,
+    indices: Vec<usize>,
     reverse: bool,
+}
+
+impl RowCollator {
+    /// Build a collator for the given schema and order specification.
+    ///
+    /// If `order` is empty, the collator compares by the primary key columns
+    /// (indices `0..key_len`). Otherwise, it compares by the positions of the
+    /// named order columns within the full row (key + value columns).
+    fn for_order(schema: &TableSchema, order: &[Id], reverse: bool) -> Self {
+        let key = schema.key();
+        let values = schema.values();
+        let all: Vec<&Id> = key.iter().chain(values.iter()).collect();
+
+        let indices: Vec<usize> = if order.is_empty() {
+            (0..key.len()).collect()
+        } else {
+            order
+                .iter()
+                .filter_map(|col| all.iter().position(|name| *name == col))
+                .collect()
+        };
+
+        Self { indices, reverse }
+    }
 }
 
 impl Collate for RowCollator {
     type Value = Vec<Value>;
 
     fn cmp(&self, left: &Self::Value, right: &Self::Value) -> std::cmp::Ordering {
-        let lk = &left[..self.key_len.min(left.len())];
-        let rk = &right[..self.key_len.min(right.len())];
-        let ord = lk.cmp(rk);
+        let mut ord = std::cmp::Ordering::Equal;
+        for &i in &self.indices {
+            let l = left.get(i);
+            let r = right.get(i);
+            ord = match (l, r) {
+                (Some(l), Some(r)) => l.cmp(r),
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (None, None) => std::cmp::Ordering::Equal,
+            };
+            if ord != std::cmp::Ordering::Equal {
+                break;
+            }
+        }
         if self.reverse {
             ord.reverse()
         } else {
@@ -143,10 +187,8 @@ impl Delta {
         range: Range<tc_ir::Id, Value>,
         order: &[tc_ir::Id],
         reverse: bool,
-        key_len: usize,
+        collator: RowCollator,
     ) -> BoxStream<'a, Result<Vec<Value>, std::io::Error>> {
-        let collator = RowCollator { key_len, reverse };
-
         let inserted = self
             .inserts
             .row_stream(range.clone(), order, reverse)
@@ -155,11 +197,45 @@ impl Delta {
             .map_ok(|row| row.to_vec())
             .boxed();
 
-        let merged = try_merge(collator, inserted, rows).boxed();
+        let merged = try_merge(collator.clone(), inserted, rows).boxed();
 
         let deleted = self
             .deletes
             .row_stream(range, order, reverse)
+            .await
+            .expect("stream delete delta rows")
+            .map_ok(|row| row.to_vec())
+            .boxed();
+
+        try_diff(collator, merged, deleted).boxed()
+    }
+
+    /// Owned variant of [`merge_into`](Self::merge_into) that produces a
+    /// `'static` stream suitable for returning from `rows()`.
+    ///
+    /// `self` is consumed (Delta is `Clone`) so the returned stream does not
+    /// borrow from the caller's stack.
+    async fn merge_into_owned(
+        self,
+        rows: BoxStream<'static, Result<Vec<Value>, std::io::Error>>,
+        range: Range<tc_ir::Id, Value>,
+        order: Vec<tc_ir::Id>,
+        reverse: bool,
+        collator: RowCollator,
+    ) -> BoxStream<'static, Result<Vec<Value>, std::io::Error>> {
+        let inserted = self
+            .inserts
+            .row_stream(range.clone(), &order, reverse)
+            .await
+            .expect("stream insert delta rows")
+            .map_ok(|row| row.to_vec())
+            .boxed();
+
+        let merged = try_merge(collator.clone(), inserted, rows).boxed();
+
+        let deleted = self
+            .deletes
+            .row_stream(range, &order, reverse)
             .await
             .expect("stream delete delta rows")
             .map_ok(|row| row.to_vec())
@@ -341,9 +417,9 @@ impl PersistentTable {
             .acquire_read_permit(txn_id, txn_lock::set::Range::All)
             .await;
 
-        let key_len = self.schema.key().len();
+        let collator = RowCollator::for_order(&self.schema, order, reverse);
 
-        self.for_each_visible_row_until(txn_id, range, order, reverse, key_len, |row| {
+        self.for_each_visible_row_until(txn_id, range, order, reverse, collator, |row| {
             on_row(row);
             true
         })
@@ -363,6 +439,140 @@ impl PersistentTable {
         count
     }
 
+    /// Return `true` if there are no visible rows in `range` at `txn_id`.
+    pub async fn is_empty_in(
+        &self,
+        txn_id: TxnId,
+        range: Range<tc_ir::Id, Value>,
+    ) -> bool {
+        !self.any_row_in(txn_id, range, &[], false).await
+    }
+
+    /// Construct a permit-bound row stream over the visible state at `txn_id`.
+    ///
+    /// The stream is fully lazy — rows are produced on demand by polling the
+    /// returned [`Rows`]. The read permit is held for the lifetime of the
+    /// stream so the transactional snapshot stays coherent.
+    ///
+    /// If the given `range` is not supported by any index, this returns an
+    /// `Unsupported` I/O error wrapped in a background transactional error.
+    pub async fn rows(
+        &self,
+        txn_id: TxnId,
+        range: Range<Id, Value>,
+        order: Vec<Id>,
+        reverse: bool,
+    ) -> Result<Rows, txn_lock::Error> {
+        let permit = self
+            .acquire_read_permit(txn_id, txn_lock::set::Range::All)
+            .await;
+
+        let snapshot = self.visible_snapshot(txn_id);
+        let collator = RowCollator::for_order(&self.schema, &order, reverse);
+
+        let mut visible: BoxStream<'static, Result<Vec<Value>, std::io::Error>> = snapshot
+            .persistent
+            .row_stream(range.clone(), &order, reverse)
+            .await
+            .map_err(background_error)?
+            .map_ok(|row| row.to_vec())
+            .boxed();
+
+        for delta in snapshot.deltas.into_iter() {
+            visible = delta
+                .merge_into_owned(visible, range.clone(), order.clone(), reverse, collator.clone())
+                .await;
+        }
+
+        let stream = visible.map_ok(Row::from_vec).boxed();
+        Ok(Rows::new(stream, permit))
+    }
+
+    /// Create a range + order + reverse view over this table.
+    ///
+    /// The view is structural — it holds no row data. Row streaming, count,
+    /// and containment checks delegate to this table with the view's bounds.
+    pub fn slice(
+        &self,
+        range: Range<Id, Value>,
+        order: &[Id],
+        reverse: bool,
+    ) -> TableSlice {
+        TableSlice::new(self.clone(), range, order.to_vec(), reverse)
+    }
+
+    /// Create an ordered view over this table using the given `columns`.
+    ///
+    /// Equivalent to `slice(Range::default(), columns, reverse)`.
+    pub fn order_by(&self, columns: &[Id], reverse: bool) -> TableSlice {
+        self.slice(Range::default(), columns, reverse)
+    }
+
+    /// Create a row-cap view that yields at most `n` rows.
+    pub fn limit(&self, n: u64) -> Limited {
+        self.slice(Range::default(), &[], false).limit(n)
+    }
+
+    /// Create a column-projection view that yields only `columns`.
+    pub fn select(&self, columns: &[Id]) -> Selection {
+        self.slice(Range::default(), &[], false)
+            .select(columns.to_vec())
+    }
+
+    /// Delete all visible rows in `range` at `txn_id`.
+    ///
+    /// Rows are streamed and deleted one-by-one into the pending delta — the
+    /// full affected set is never buffered in a `Vec` (v1 no-materialization
+    /// invariant). A single `Range::All` write permit is acquired upfront so
+    /// no per-key semaphore re-acquisition is needed during the streamed
+    /// delete loop.
+    pub async fn truncate(
+        &self,
+        txn_id: TxnId,
+        range: Range<Id, Value>,
+    ) -> Result<(), txn_lock::Error> {
+        let key_len = self.schema.key().len();
+        let collator = RowCollator::for_order(&self.schema, &[], false);
+
+        let _permit = self
+            .semaphore
+            .try_write(txn_id, txn_lock::set::Range::All)?;
+
+        let pending = self.pending_delta_for_txn(txn_id).await?;
+
+        let snapshot = self.visible_snapshot(txn_id);
+
+        let mut visible: BoxStream<'_, Result<Vec<Value>, std::io::Error>> = snapshot
+            .persistent
+            .row_stream(range.clone(), &[], false)
+            .await
+            .expect("stream persistent rows for truncate")
+            .map_ok(|row| row.to_vec())
+            .boxed();
+
+        for delta in &snapshot.deltas {
+            visible = delta
+                .merge_into(visible, range.clone(), &[], false, collator.clone())
+                .await;
+        }
+
+        while let Some(row) = visible.try_next().await.expect("read truncate stream") {
+            let key: Vec<Value> = row[..key_len].to_vec();
+            let values: Vec<Value> = row[key_len..].to_vec();
+
+            pending
+                .delete_from_inserts(&key)
+                .await
+                .map_err(background_error)?;
+            pending
+                .add_to_deletes(&key, values)
+                .await
+                .map_err(background_error)?;
+        }
+
+        Ok(())
+    }
+
     async fn any_row_in(
         &self,
         txn_id: TxnId,
@@ -370,10 +580,10 @@ impl PersistentTable {
         order: &[tc_ir::Id],
         reverse: bool,
     ) -> bool {
-        let key_len = self.schema.key().len();
+        let collator = RowCollator::for_order(&self.schema, order, reverse);
 
         let mut found = false;
-        self.for_each_visible_row_until(txn_id, range, order, reverse, key_len, |_| {
+        self.for_each_visible_row_until(txn_id, range, order, reverse, collator, |_| {
             found = true;
             false
         })
@@ -388,7 +598,7 @@ impl PersistentTable {
         range: Range<tc_ir::Id, Value>,
         order: &[tc_ir::Id],
         reverse: bool,
-        key_len: usize,
+        collator: RowCollator,
         mut on_row: F,
     ) where
         F: FnMut(Row<Value>) -> bool,
@@ -405,7 +615,7 @@ impl PersistentTable {
 
         for delta in &snapshot.deltas {
             visible = delta
-                .merge_into(visible, range.clone(), order, reverse, key_len)
+                .merge_into(visible, range.clone(), order, reverse, collator.clone())
                 .await;
         }
 

@@ -152,9 +152,9 @@ The following parity checklist items have no test coverage in this crate yet:
    Chain-driven replay (depends on `tc-chain`).
 2. Corruption/malformed persisted state tests failing closed with structured
    errors.
-3. Read/write/range/scan benchmarks with regression budgets vs v1 baselines.
-4. Table and Tensor lifecycle parity (see `ROADMAP.md` items 4-6); `Collection`
-   currently has only the `BTree` variant.
+ 3. Read/write/range/scan benchmarks with regression budgets vs v1 baselines.
+ 4. Tensor lifecycle parity (see `ROADMAP.md` items 5-6); `Collection`
+    currently has the `BTree` and `Table` variants.
 
 ## Table v1 parity port
 
@@ -169,8 +169,72 @@ required gate for every Table implementation slice:
 
 Table implementation work must land the [§7 test
 matrix](TABLE_PARITY_PORT.md#7-test-matrix) cases and satisfy the §9 acceptance
-criteria before the Table variant is promotable. No production `Table`
-implementation exists yet (`Collection` currently has only the `BTree` variant).
+criteria before the Table variant is promotable.
+
+## Table v1 parity matrix (current verified coverage)
+
+This matrix captures behavior-preserving parity targets for the transactional
+Table port. Each row maps to executable tests in `src/table/tests.rs`.
+
+1. `pending` visibility is txn-local until finalized; later overlapping reads
+   block rather than observing uncommitted state.
+   - Evidence: `pending_is_visible_only_to_its_txn_table`,
+     `no_pending_leakage_across_txns_table`.
+2. Committed deltas are visible in txn order (`<= txn_id`).
+   - Evidence: `committed_is_visible_in_txn_order_table`.
+3. Writes after commit/finalize are rejected.
+   - Evidence: `cannot_write_after_commit_or_finalize_table`.
+4. `finalize` merges committed deltas into canon and advances the frontier.
+   - Evidence: `finalize_merges_committed_into_canon`,
+     `finalize_sync_drops_guard_first_table`.
+5. Streamed row iteration matches expected materialized visibility.
+   - Evidence: `streamed_rows_match_materialized_table`,
+     `count_matches_streamed_fold_table`.
+6. `slice(range)` returns only in-range rows.
+   - Evidence: `slice_returns_in_range_rows_table`.
+7. `select(cols)` projects the requested columns lazily.
+   - Evidence: `select_projects_columns_table`.
+8. `limit(n)` caps the row stream without materializing the full set.
+   - Evidence: `limit_caps_row_stream_table`.
+9. `order_by(cols, rev)` orders via a supporting auxiliary index.
+   - Evidence: `order_by_uses_supporting_index_table`.
+10. `reverse` flips iteration order.
+    - Evidence: `reverse_flips_order_table`.
+11. Unsupported range/order fails closed with a structured error.
+    - Evidence: `unsupported_range_fails_closed_table`.
+12. `truncate(range)` streams rows into the pending delete delta without
+    buffering the full affected set.
+    - Evidence: `truncate_use_scratch_not_buffer_table`.
+13. View composition (`slice.limit.select`) stays lazy.
+    - Evidence: `view_composition_is_lazy_table`.
+14. Earlier overlapping writes fail closed with conflict.
+    - Evidence: `overlapping_write_in_past_txn_fails_closed_table`.
+15. Later overlapping read blocks until earlier pending txn finalizes.
+    - Evidence: `overlapping_read_blocks_until_earlier_finalize_table`.
+16. Rollback discards pending and unblocks later reads.
+    - Evidence: `rollback_discards_pending_and_unblocks`,
+      `rollback_unblocks_later_read_and_discards_pending_table`.
+17. Duplicate commit and stale finalize are idempotent no-ops that release
+    semaphore reservations.
+    - Evidence: `duplicate_commit_is_idempotent_table`,
+      `stale_finalize_is_noop_table`,
+      `repeated_rollback_and_finalize_are_idempotent_table`,
+      `lifecycle_noop_paths_release_reservations_table`.
+18. Concurrent read/write/finalize does not deadlock under a multi-thread
+    runtime.
+    - Evidence: `concurrent_read_write_finalize_table`,
+      `lock_order_no_deadlock_table`.
+
+## Table parity gap status
+
+1. Restart recovery for prepared and unresolved-finalize paths under
+   Chain-driven replay (depends on `tc-chain`). **Open.**
+2. Corruption/malformed persisted state tests failing closed with structured
+   errors. **Open.**
+3. Read/write/range/scan benchmarks with regression budgets vs v1 baselines.
+   **Open.**
+4. `update(range, values)` via temp scratch index. **Open** (truncate is
+   implemented; update is a follow-up).
 
 ## Migration policy
 
