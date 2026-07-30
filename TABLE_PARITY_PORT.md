@@ -3,9 +3,15 @@
 This document is the behavior-preserving port contract for the transactional
 `Table` variant, derived from an inventory of the v1 implementation. It is the
 required gate referenced by `TRANSACTIONAL_COLLECTION_CONTRACT.md` and
-`ROADMAP.md` item 4. **This issue (#4) delivers the spec only — no production
-`Table` implementation is included.** Implementation slices land in later
-issues, each gated by the test matrix in [§7](#7-test-matrix).
+`ROADMAP.md` item 4. Issue #4 delivered the spec; issues #6 and later land
+implementation slices, each gated by the test matrix in [§7](#7-test-matrix).
+
+> **Implementation status.** The transactional `Table` engine
+> (`PersistentTable`), query/view/stream API (`Rows`, `TableSlice`, `Limited`,
+> `Selection`), and `truncate` are implemented in `src/table/`. See the Table
+> parity matrix in `TRANSACTIONAL_COLLECTION_CONTRACT.md` for verified test
+> evidence. Remaining gaps (restart recovery, corruption tests, benchmarks,
+> `update`) are tracked in the same document.
 
 > **Pinned v1 revision.** The inventory below is taken from the TinyChain v1
 > repository at commit
@@ -328,13 +334,12 @@ blockers; do not invent new semantics"*):
 
 ## 9. Acceptance criteria checklist
 
-(From issue #4. This PR satisfies the spec deliverables; implementation issues
-satisfy the green-test items.)
+(From issue #4. The spec PR satisfies the spec deliverables; implementation
+issues satisfy the green-test items.)
 
 - [x] Every v1 Table module and public route has a v2 disposition ([§3](#3-file--module-migration-map), [§4](#4-route--api-matrix)).
 - [x] Every required behavior maps to an executable validation case ([§7](#7-test-matrix)).
 - [x] The no-materialization and transaction-authority boundaries are unambiguous ([§2](#2-boundary-decisions)).
-- [x] No production Table implementation is included in this PR.
 - [x] A checked-in Table parity/port document linked from `TRANSACTIONAL_COLLECTION_CONTRACT.md`.
 - [x] A file/module migration map ([§3](#3-file--module-migration-map)).
 - [x] A route/API matrix ([§4](#4-route--api-matrix)).
@@ -342,3 +347,25 @@ satisfy the green-test items.)
 - [x] Small fixture datasets reusable by later issues ([§6](#6-fixture-datasets), `tests/fixtures/`).
 - [x] The pinned v1 revision is cited ([§1](#1-source-of-truth)).
 - [x] Unresolved questions recorded as explicit blockers ([§8](#8-unresolved-questions--blockers)).
+
+### Implementation status (issue #6)
+
+- [x] Transactional `PersistentTable` engine with canonical+delta LSM model.
+- [x] `Rows` permit-bound row stream with lazy `limit`/`select` transforms.
+- [x] `TableSlice` (range+order+reverse), `Limited` (row cap), `Selection`
+      (column projection) lazy view structs.
+- [x] `slice`, `order_by`, `limit`, `select`, `rows`, `truncate` public API.
+- [x] §7.1 lifecycle tests (commit, rollback, finalize, idempotency, no-op
+      reservation release).
+- [x] §7.2 visibility tests (pending isolation, committed order, overlapping
+      read blocking, delta stack resolution).
+- [x] §7.5 query correctness tests (slice, select, limit, order_by, reverse,
+      unsupported range/order).
+- [x] §7.6 streaming tests (truncate, view composition laziness).
+- [x] §7.8 concurrency tests (concurrent read/write/finalize, lock order,
+      finalize drops guard first).
+- [ ] §7.3 recovery tests (restart replay, unresolved finalize) — blocked on
+      `tc-chain` integration.
+- [ ] §7.4 integrity tests (corrupt state, schema mismatch) — follow-up.
+- [ ] §7.7 performance benchmarks — budget TBD vs v1 baseline.
+- [ ] `update(range, values)` via temp scratch index — follow-up.
