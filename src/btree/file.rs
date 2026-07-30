@@ -46,12 +46,12 @@ impl Collate for KeyStreamCollator {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct BTreeStorageConfig {
+pub struct StorageConfig {
     pub block_size: usize,
     pub order: usize,
 }
 
-impl Default for BTreeStorageConfig {
+impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             block_size: 4_096,
@@ -62,14 +62,14 @@ impl Default for BTreeStorageConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct KeySchema {
-    storage: BTreeStorageConfig,
+    storage: StorageConfig,
     key_arity: usize,
     key_types: Option<Vec<ValueType>>,
 }
 
 impl KeySchema {
     fn new(
-        storage: BTreeStorageConfig,
+        storage: StorageConfig,
         key_arity: usize,
         key_types: Option<Vec<ValueType>>,
     ) -> Self {
@@ -93,7 +93,7 @@ impl KeySchema {
 
 impl Default for KeySchema {
     fn default() -> Self {
-        Self::new(BTreeStorageConfig::default(), UNARY_KEY_ARITY, None)
+        Self::new(StorageConfig::default(), UNARY_KEY_ARITY, None)
     }
 }
 
@@ -150,7 +150,7 @@ impl PersistentStore {
 
     fn from_dir(
         dir: DirLock<PersistentFile>,
-        storage: BTreeStorageConfig,
+        storage: StorageConfig,
         key_arity: usize,
         key_types: Option<Vec<ValueType>>,
     ) -> std::io::Result<Self> {
@@ -294,7 +294,7 @@ impl BTree {
         Self::with_storage_and_key_types(
             persistent_dir,
             txn_root,
-            BTreeStorageConfig::default(),
+            StorageConfig::default(),
             UNARY_KEY_ARITY,
             None,
         )
@@ -309,7 +309,7 @@ impl BTree {
         Self::with_storage_and_key_types(
             persistent_dir,
             txn_root,
-            BTreeStorageConfig::default(),
+            StorageConfig::default(),
             key_arity,
             Some(key_types),
         )
@@ -318,7 +318,7 @@ impl BTree {
     pub fn with_storage_and_key_types(
         persistent_dir: DirLock<PersistentFile>,
         txn_root: DirLock<PersistentFile>,
-        storage: BTreeStorageConfig,
+        storage: StorageConfig,
         key_arity: usize,
         key_types: Option<Vec<ValueType>>,
     ) -> Self {
@@ -734,7 +734,7 @@ impl BTree {
 
     fn load_store(
         persistent_dir: DirLock<PersistentFile>,
-        storage: BTreeStorageConfig,
+        storage: StorageConfig,
         key_arity: usize,
         key_types: Option<Vec<ValueType>>,
     ) -> PersistentStore {

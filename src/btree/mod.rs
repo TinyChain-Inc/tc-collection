@@ -9,7 +9,7 @@ mod stream;
 pub use codec::{
     BTreeColumnSchema, BTreeDecodeContext, DecodedBTreePayload,
 };
-pub use file::{BTree, BTreeSlice, BTreeStorageConfig};
+pub use file::{BTree, BTreeSlice, StorageConfig};
 pub use stream::PersistentFile;
 
 #[cfg(test)]

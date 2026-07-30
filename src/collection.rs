@@ -56,7 +56,7 @@ impl Transact for Collection {
     async fn commit(&self, txn_id: TxnId) -> Self::Commit {
         match self {
             Self::BTree(btree) => btree.commit(txn_id).expect("Collection commit failed"),
-            Self::Table(table) => table.commit(txn_id).expect("Collection commit failed"),
+            Self::Table(table) => table.commit(txn_id).await,
         }
     }
 
@@ -68,7 +68,7 @@ impl Transact for Collection {
                     btree.rollback(txn_id).expect("Collection rollback failed")
                 }
                 Self::Table(table) => {
-                    table.rollback(txn_id).expect("Collection rollback failed")
+                    table.rollback(&txn_id).await;
                 }
             }
         }
@@ -82,10 +82,9 @@ impl Transact for Collection {
                     .finalize(txn_id)
                     .await
                     .expect("Collection finalize failed"),
-                Self::Table(table) => table
-                    .finalize(txn_id)
-                    .await
-                    .expect("Collection finalize failed"),
+                Self::Table(table) => {
+                    table.finalize(&txn_id).await;
+                }
             }
         }
     }

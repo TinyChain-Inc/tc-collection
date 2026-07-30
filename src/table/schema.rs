@@ -6,7 +6,7 @@ use tc_error::TCError;
 use tc_ir::Id;
 use tc_value::{Value, ValueType};
 
-use crate::btree::BTreeStorageConfig;
+use crate::btree::StorageConfig;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Column {
@@ -24,11 +24,11 @@ impl fmt::Display for Column {
 pub struct TableIndexSchema {
     column_names: Vec<Id>,
     column_types: Vec<ValueType>,
-    storage: BTreeStorageConfig,
+    storage: StorageConfig,
 }
 
 impl TableIndexSchema {
-    pub fn new(columns: Vec<Column>, storage: BTreeStorageConfig) -> Result<Self, TCError> {
+    pub fn new(columns: Vec<Column>, storage: StorageConfig) -> Result<Self, TCError> {
         if columns.is_empty() {
             return Err(tc_error::bad_request!(
                 "table index must have at least one column"
@@ -49,16 +49,15 @@ impl TableIndexSchema {
         &self.column_types
     }
 
-    pub fn storage(&self) -> &BTreeStorageConfig {
+    pub fn storage(&self) -> &StorageConfig {
         &self.storage
     }
 
-    pub fn into_columns(self) -> Vec<Column> {
+    pub fn into_columns(self) -> impl Iterator<Item = Column> {
         self.column_names
             .into_iter()
             .zip(self.column_types)
             .map(|(name, dtype)| Column { name, dtype })
-            .collect()
     }
 }
 
@@ -123,7 +122,7 @@ impl TableSchema {
         key: Vec<Column>,
         values: Vec<Column>,
         indices: Vec<(String, Vec<Id>)>,
-        storage: BTreeStorageConfig,
+        storage: StorageConfig,
     ) -> Result<Self, TCError> {
         if key.is_empty() {
             return Err(tc_error::bad_request!(
@@ -207,7 +206,7 @@ impl TableSchema {
         Ok(range.into())
     }
 
-    pub fn storage(&self) -> &BTreeStorageConfig {
+    pub fn storage(&self) -> &StorageConfig {
         self.primary.storage()
     }
 }

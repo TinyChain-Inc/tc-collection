@@ -1,10 +1,10 @@
 //! Transactional visibility and ordering regression tests for `PersistentTable`.
 use super::{Column, PersistentTable, TableSchema};
-use crate::btree::{BTreeStorageConfig, PersistentFile};
+use crate::btree::{StorageConfig, PersistentFile};
 use freqfs::Cache;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tc_ir::{NetworkTime, TxnId};
+use tc_ir::{NetworkTime, Transact, TxnId};
 use tc_value::{Value, ValueType};
 use tokio::time::{Duration, timeout};
 
@@ -80,7 +80,7 @@ fn simple_schema() -> TableSchema {
         name: "label".parse().expect("Id"),
         dtype: ValueType::String,
     }];
-    TableSchema::new(key, values, Vec::new(), BTreeStorageConfig::default())
+    TableSchema::new(key, values, Vec::new(), StorageConfig::default())
         .expect("create test schema")
 }
 
@@ -101,7 +101,7 @@ fn composite_schema() -> TableSchema {
             dtype: ValueType::String,
         },
     ];
-    TableSchema::new(key, values, Vec::new(), BTreeStorageConfig::default())
+    TableSchema::new(key, values, Vec::new(), StorageConfig::default())
         .expect("create composite key schema")
 }
 
@@ -124,7 +124,7 @@ fn schema_with_index() -> TableSchema {
         "by_ref".to_string(),
         vec!["ref_id".parse().expect("Id")],
     )];
-    TableSchema::new(key, values, indices, BTreeStorageConfig::default())
+    TableSchema::new(key, values, indices, StorageConfig::default())
         .expect("create schema with index")
 }
 
@@ -190,8 +190,8 @@ fn delete_moves_row_to_pending_deletes() {
                 )
                 .await
                 .expect("upsert row");
-            table.commit(tx(10)).expect("commit 10");
-            table.finalize(tx(10)).await.expect("finalize 10");
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
 
             table
                 .delete_row(tx(11), vec![Value::from(1_u64)])
@@ -235,7 +235,7 @@ fn commit_promotes_pending_to_committed() {
                 "pending row should be visible to own txn"
             );
 
-            table.commit(tx(10)).expect("commit 10");
+            table.commit(tx(10)).await;
 
             assert!(
                 table.read_row(tx(10), &[Value::from(1_u64)]).await.is_some(),
@@ -276,7 +276,7 @@ fn rollback_discards_pending_and_unblocks() {
                 "later txn read should block while earlier overlapping write is pending"
             );
 
-            table.rollback(tx(10)).expect("rollback 10");
+            table.rollback(&tx(10)).await;
 
             let row = timeout(
                 Duration::from_secs(1),
@@ -306,8 +306,8 @@ fn finalize_merges_committed_into_canon() {
                 )
                 .await
                 .expect("upsert row");
-            table.commit(tx(10)).expect("commit 10");
-            table.finalize(tx(10)).await.expect("finalize 10");
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
 
             assert!(
                 table
@@ -338,9 +338,9 @@ fn duplicate_commit_is_idempotent_table() {
                 .await
                 .expect("upsert row");
 
-            table.commit(tx(10)).expect("first commit");
-            table.commit(tx(10)).expect("second commit should be no-op");
-            table.finalize(tx(10)).await.expect("finalize 10");
+            table.commit(tx(10)).await;
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
 
             assert!(
                 table
@@ -369,13 +369,12 @@ fn stale_finalize_is_noop_table() {
                 )
                 .await
                 .expect("upsert row");
-            table.commit(tx(10)).expect("commit 10");
-            table.finalize(tx(10)).await.expect("finalize 10");
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
 
             table
-                .finalize(tx(9))
-                .await
-                .expect("stale finalize should be no-op");
+                .finalize(&tx(9))
+                .await;
 
             assert_eq!(table.finalized(), Some(tx(10)));
             assert!(
@@ -405,7 +404,7 @@ fn cannot_write_after_commit_or_finalize_table() {
                 )
                 .await
                 .expect("upsert row");
-            table.commit(tx(10)).expect("commit");
+            table.commit(tx(10)).await;
 
             assert_eq!(
                 table
@@ -418,7 +417,7 @@ fn cannot_write_after_commit_or_finalize_table() {
                 Err(txn_lock::Error::Committed)
             );
 
-            table.finalize(tx(10)).await.expect("finalize");
+            table.finalize(&tx(10)).await;
             assert_eq!(
                 table
                     .upsert_row(
@@ -475,8 +474,8 @@ fn pending_is_visible_only_to_its_txn_table() {
                 "later txn read should block while earlier overlapping write is pending"
             );
 
-            table.commit(tx(10)).expect("commit 10");
-            table.finalize(tx(10)).await.expect("finalize 10");
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
 
             let row = timeout(
                 Duration::from_secs(1),
@@ -506,7 +505,7 @@ fn committed_is_visible_in_txn_order_table() {
                 )
                 .await
                 .expect("insert key");
-            table.commit(tx(10)).expect("commit");
+            table.commit(tx(10)).await;
 
             assert!(
                 table
@@ -522,7 +521,7 @@ fn committed_is_visible_in_txn_order_table() {
                     .is_some(),
                 "committed row should be visible at commit txn"
             );
-            table.finalize(tx(10)).await.expect("finalize 10");
+            table.finalize(&tx(10)).await;
             assert!(
                 table
                     .read_row(tx(11), &[Value::from(1_u64)])
@@ -604,8 +603,8 @@ fn read_resolves_delta_stack_table() {
                 )
                 .await
                 .expect("insert original");
-            table.commit(tx(10)).expect("commit 10");
-            table.finalize(tx(10)).await.expect("finalize 10");
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
 
             table
                 .upsert_row(
@@ -652,7 +651,7 @@ fn streamed_rows_match_materialized_table() {
                 .delete_row(tx(10), vec![Value::from(2_u64)])
                 .await
                 .expect("delete row");
-            table.commit(tx(10)).expect("commit 10");
+            table.commit(tx(10)).await;
 
             table
                 .upsert_row(
@@ -711,8 +710,8 @@ fn count_matches_streamed_fold_table() {
                     .await
                     .expect("insert row");
             }
-            table.commit(tx(10)).expect("commit 10");
-            table.finalize(tx(10)).await.expect("finalize 10");
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
 
             for i in (1..=10u64).step_by(2) {
                 table
@@ -744,8 +743,8 @@ fn contains_all_key_range_table() {
                     .await
                     .expect("insert row");
             }
-            table.commit(tx(10)).expect("commit 10");
-            table.finalize(tx(10)).await.expect("finalize 10");
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
 
             assert!(table.contains_row(tx(11), &[Value::from(3_u64)]).await);
             assert!(!table.contains_row(tx(11), &[Value::from(99_u64)]).await);
@@ -771,11 +770,10 @@ fn empty_table_semantics_across_lifecycle_table() {
                     .is_none()
             );
 
-            table.commit(tx(95)).expect("empty commit should be allowed");
+            table.commit(tx(95)).await;
             table
-                .finalize(tx(95))
-                .await
-                .expect("empty finalize should be allowed");
+                .finalize(&tx(95))
+                .await;
 
             assert!(table.is_empty(tx(96)).await);
             assert_eq!(table.count(tx(96)).await, 0);
@@ -865,8 +863,8 @@ fn composite_key_upsert_and_read() {
                 &[Value::from(1_u64), Value::from(2_u64), Value::from("alpha")]
             );
 
-            table.commit(tx(10)).expect("commit 10");
-            table.finalize(tx(10)).await.expect("finalize 10");
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
 
             let mut streamed = Vec::new();
             table
@@ -906,8 +904,8 @@ fn table_with_auxiliary_index() {
                     .await
                     .expect("insert row");
             }
-            table.commit(tx(10)).expect("commit 10");
-            table.finalize(tx(10)).await.expect("finalize 10");
+            table.commit(tx(10)).await;
+            table.finalize(&tx(10)).await;
 
             assert!(table.contains_row(tx(11), &[Value::from(3_u64)]).await);
             assert_eq!(table.count(tx(11)).await, 5);
@@ -948,8 +946,8 @@ fn large_scan_completes_under_timeout_table() {
                     .expect("insert large keyset");
             }
 
-            table.commit(tx(20)).expect("commit 20");
-            table.finalize(tx(20)).await.expect("finalize 20");
+            table.commit(tx(20)).await;
+            table.finalize(&tx(20)).await;
 
             let mut seen = 0_u64;
             timeout(Duration::from_secs(10), async {
@@ -1052,10 +1050,10 @@ fn repeated_rollback_and_finalize_are_idempotent_table() {
                 .await
                 .expect("insert key for rollback");
 
-            table.rollback(tx(92)).expect("first rollback");
+            table.rollback(&tx(92)).await;
             table
-                .rollback(tx(92))
-                .expect("second rollback should be no-op");
+                .rollback(&tx(92))
+                .await;
 
             table
                 .upsert_row(
@@ -1065,13 +1063,12 @@ fn repeated_rollback_and_finalize_are_idempotent_table() {
                 )
                 .await
                 .expect("insert key for finalize");
-            table.commit(tx(93)).expect("commit 93");
+            table.commit(tx(93)).await;
 
-            table.finalize(tx(93)).await.expect("first finalize");
+            table.finalize(&tx(93)).await;
             table
-                .finalize(tx(93))
-                .await
-                .expect("second finalize should be no-op");
+                .finalize(&tx(93))
+                .await;
 
             assert_eq!(table.finalized(), Some(tx(93)));
             assert!(
@@ -1157,7 +1154,7 @@ fn rollback_unblocks_later_read_and_discards_pending_table() {
                 "later txn read should block while earlier overlapping write is pending"
             );
 
-            table.rollback(tx(10)).expect("rollback 10");
+            table.rollback(&tx(10)).await;
 
             let row = timeout(
                 Duration::from_secs(1),

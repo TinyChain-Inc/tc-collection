@@ -862,7 +862,7 @@ fn multi_column_partial_overlap_blocking_behavior() {
             let btree = BTree::with_storage_and_key_types(
                 persistent,
                 txn,
-                super::BTreeStorageConfig::default(),
+                super::StorageConfig::default(),
                 2,
                 None,
             );
