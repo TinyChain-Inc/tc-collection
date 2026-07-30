@@ -29,6 +29,24 @@ local and lean, and push cross-host orchestration to client libraries.
 - Keep `TRANSACTIONAL_COLLECTION_CONTRACT.md` aligned with implementation changes and
   use its checklist as the required gate for BTree/Table/Tensor migration slices.
 
+## Code style
+
+- Do not wrap `?` expressions in `Ok(...)`. The `?` operator already returns
+  `Err` on failure and passes through `Ok` on success, so `Ok(expr?)` is
+  redundant — write `expr?` (or `expr` if it's the last expression in the
+  function body). This is enforced by `#![deny(clippy::needless_question_mark)]`
+  in `src/lib.rs`.
+
+## Trait implementations
+
+- When a type has inherent methods that return `Result` (e.g. `commit`/`rollback`/
+  `finalize`) and also implements the `Transact` trait (which returns `()`), the
+  `Transact` impl is the **single** place that converts `Result` to `()` via
+  `.expect()`. Callers that need the infallible API must go through the trait
+  method, not call the inherent method directly with a redundant `.expect()`.
+  This keeps error-handling policy in one place and avoids duplicate panic
+  messages drifting out of sync.
+
 ## Locking and transaction safety
 
 - Treat lock ordering as part of the public correctness contract for transactional
@@ -41,6 +59,11 @@ local and lean, and push cross-host orchestration to client libraries.
 - Keep lock lifetimes as short as possible: mutate under guard, release guard,
   then run persistence or replay steps. Avoid helpers that combine these phases
   unless they prove lock independence.
+- `finalize` must not acquire a semaphore write permit. Finalize is a lifecycle
+  operation that merges already-committed data into canon; it is not a new write.
+  Synchronization is provided by the state write lock and
+  `semaphore.finalize(drop_past=true)` for cleanup. Acquiring `try_write` would
+  incorrectly conflict with future read reservations.
 - New migration slices must include deadlock regression coverage for lock-order
   interactions, especially unresolved-finalize recovery and finalize+sync flows.
 - Transactional collection data structures must fail closed on any conflict,
