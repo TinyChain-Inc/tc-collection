@@ -1162,6 +1162,7 @@ dependencies = [
  "tc-value",
  "tokio",
  "txn_lock",
+ "umask",
 ]
 
 [[package]]

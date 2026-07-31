@@ -19,3 +19,6 @@ tc-value = { path = "../tc-value" }
 pathlink = { path = "../deps/pathlink" }
 tokio = { version = "1.51", features = ["fs", "rt", "sync", "time", "macros", "rt-multi-thread"] }
 txn_lock = { path = "../deps/txn_lock" }
+
+[dev-dependencies]
+umask = "2.1"
