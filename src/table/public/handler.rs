@@ -13,7 +13,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use b_table::Range;
-use safecast::{CastFrom, TryCastInto};
+use safecast::{CastFrom, Match, TryCastInto};
 use tc_error::{bad_request, TCError, TCResult};
 use tc_ir::{Id, Map, Scalar, Transaction, TxnId};
 use tc_value::Value;
@@ -491,7 +491,12 @@ where
         let table = self.table.clone();
         let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
-            let (columns, reverse): (Vec<Id>, bool) = value.try_cast_into(|v| bad_request!("invalid order request: {v:?}"))?;
+            let (columns, reverse): (Vec<Id>, bool) = if value.matches::<(Vec<Id>, bool)>() {
+                value.try_cast_into(|v| bad_request!("invalid order request: {v:?}"))?
+            } else {
+                let columns: Vec<Id> = value.try_cast_into(|v| bad_request!("invalid column list: {v:?}"))?;
+                (columns, false)
+            };
             let slice = table.order_by(&columns, reverse);
             Ok(Resp::from(crate::Collection::from(
                 crate::table::Table::from(slice),
