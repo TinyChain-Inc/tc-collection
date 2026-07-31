@@ -3,7 +3,9 @@ use std::fmt;
 
 use b_table::{ColumnRange, IndexSchema, Range, Schema};
 use b_tree::Schema as BTreeSchema;
-use tc_error::{TCError, TCResult};
+use safecast::{CastFrom, TryCastFrom};
+use std::str::FromStr;
+use tc_error::TCError;
 use tc_ir::Id;
 use tc_value::{Value, ValueType};
 
@@ -288,70 +290,111 @@ impl TableSchema {
     pub fn columns(&self) -> impl Iterator<Item = &Id> {
         self.key.iter().chain(self.values.iter())
     }
+}
 
-    /// Try to construct a [`TableSchema`] from its [`Value`] representation.
-    ///
-    /// The encoding mirrors the v1 wire format:
-    /// ```text
-    /// Value::Tuple([
-    ///     Value::Tuple([key_columns, value_columns]),
-    ///     indices
-    /// ])
-    /// ```
-    /// where each column is `Value::Tuple([name_string, dtype_string])` and
-    /// each index is `Value::Tuple([name_string, Value::Tuple([col_name, ...])])`.
-    pub fn try_from_value(value: Value) -> TCResult<Self> {
-        let (key_values, indices_value) = match &value {
-            Value::Tuple(outer) if outer.len() == 2 => (&outer[0], &outer[1]),
-            other => return Err(tc_error::bad_request!("invalid table schema: {other:?}")),
+impl TryCastFrom<Value> for TableSchema {
+    fn can_cast_from(value: &Value) -> bool {
+        let Value::Tuple(outer) = value else {
+            return false;
         };
-
-        let (key_cols, value_cols) = match key_values {
-            Value::Tuple(inner) if inner.len() == 2 => (&inner[0], &inner[1]),
-            other => return Err(tc_error::bad_request!("invalid table schema header: {other:?}")),
+        if outer.len() != 2 {
+            return false;
+        }
+        let Value::Tuple(inner) = &outer[0] else {
+            return false;
         };
-
-        let key = parse_columns(key_cols)?;
-        let values = parse_columns(value_cols)?;
-        let indices = parse_indices(indices_value)?;
-
-        Self::new(key, values, indices, StorageConfig::default())
+        inner.len() == 2
+            && is_column_list(&inner[0])
+            && is_column_list(&inner[1])
+            && is_index_list(&outer[1])
     }
 
-    /// Encode this schema as a [`Value`] (inverse of [`try_from_value`](Self::try_from_value)).
-    pub fn to_value(&self) -> Value {
-        let key = self
+    fn opt_cast_from(value: Value) -> Option<Self> {
+        let Value::Tuple(outer) = &value else {
+            return None;
+        };
+        if outer.len() != 2 {
+            return None;
+        }
+        let Value::Tuple(inner) = &outer[0] else {
+            return None;
+        };
+        if inner.len() != 2 {
+            return None;
+        }
+
+        let key = cast_column_list(&inner[0])?;
+        let values = cast_column_list(&inner[1])?;
+        let indices = cast_index_list(&outer[1])?;
+
+        Self::new(key, values, indices, StorageConfig::default()).ok()
+    }
+}
+
+fn is_column_list(value: &Value) -> bool {
+    let Value::Tuple(tuple) = value else {
+        return false;
+    };
+    tuple.iter().all(Column::can_cast_from)
+}
+
+fn is_index_list(value: &Value) -> bool {
+    match value {
+        Value::None => true,
+        Value::Tuple(tuple) => tuple.iter().all(<(String, Vec<Id>)>::can_cast_from),
+        _ => false,
+    }
+}
+
+fn cast_column_list(value: &Value) -> Option<Vec<Column>> {
+    let Value::Tuple(tuple) = value else {
+        return None;
+    };
+    tuple.iter().cloned().map(Column::opt_cast_from).collect()
+}
+
+fn cast_index_list(value: &Value) -> Option<Vec<(String, Vec<Id>)>> {
+    match value {
+        Value::None => Some(Vec::new()),
+        Value::Tuple(tuple) => tuple.iter().cloned().map(<(String, Vec<Id>)>::opt_cast_from).collect(),
+        _ => None,
+    }
+}
+
+impl CastFrom<TableSchema> for Value {
+    fn cast_from(schema: TableSchema) -> Self {
+        let key = schema
             .key
             .iter()
-            .zip(self.primary.column_types().iter().take(self.key.len()))
+            .zip(schema.primary.column_types().iter().take(schema.key.len()))
             .map(|(name, dtype)| {
                 Value::Tuple(vec![
                     Value::String(name.to_string()),
-                    Value::String(dtype_to_string(dtype)),
+                    Value::String(dtype.to_string()),
                 ])
             })
             .collect::<Vec<_>>();
         let key = Value::Tuple(key);
 
-        let values = self
+        let values = schema
             .values
             .iter()
-            .zip(self.primary.column_types().iter().skip(self.key.len()))
+            .zip(schema.primary.column_types().iter().skip(schema.key.len()))
             .map(|(name, dtype)| {
                 Value::Tuple(vec![
                     Value::String(name.to_string()),
-                    Value::String(dtype_to_string(dtype)),
+                    Value::String(dtype.to_string()),
                 ])
             })
             .collect::<Vec<_>>();
         let values = Value::Tuple(values);
 
-        let indices = self
+        let indices = schema
             .indices
             .iter()
-            .map(|(name, schema)| {
-                let col_count = BTreeSchema::len(schema) - self.key.len();
-                let cols = schema
+            .map(|(name, index_schema)| {
+                let col_count = BTreeSchema::len(index_schema) - schema.key.len();
+                let cols = index_schema
                     .columns()
                     .iter()
                     .take(col_count)
@@ -369,102 +412,42 @@ impl TableSchema {
     }
 }
 
-fn parse_columns(value: &Value) -> TCResult<Vec<Column>> {
-    let tuple = match value {
-        Value::Tuple(tuple) => tuple,
-        other => return Err(tc_error::bad_request!("expected column list, got {other:?}")),
-    };
+impl TryCastFrom<Value> for Column {
+    fn can_cast_from(value: &Value) -> bool {
+        let Value::Tuple(pair) = value else {
+            return false;
+        };
+        pair.len() == 2
+            && matches!(&pair[0], Value::String(_))
+            && matches!(&pair[1], Value::String(s) if ValueType::from_str(s).is_ok())
+    }
 
-    tuple
-        .iter()
-        .map(parse_column)
-        .collect::<TCResult<Vec<_>>>()
-}
-
-fn parse_column(value: &Value) -> TCResult<Column> {
-    let pair = match value {
-        Value::Tuple(pair) if pair.len() == 2 => pair,
-        other => return Err(tc_error::bad_request!("invalid column definition: {other:?}")),
-    };
-
-    let name = match &pair[0] {
-        Value::String(s) => s.parse::<Id>().map_err(|e| {
-            tc_error::bad_request!("invalid column name {s:?}: {e}")
-        })?,
-        other => return Err(tc_error::bad_request!("column name must be a string, got {other:?}")),
-    };
-
-    let dtype = match &pair[1] {
-        Value::String(s) => parse_value_type(s)?,
-        other => {
-            return Err(tc_error::bad_request!(
-                "column dtype must be a string, got {other:?}"
-            ))
+    fn opt_cast_from(value: Value) -> Option<Self> {
+        let Value::Tuple(pair) = &value else {
+            return None;
+        };
+        if pair.len() != 2 {
+            return None;
         }
-    };
-
-    Ok(Column { name, dtype })
-}
-
-fn parse_indices(value: &Value) -> TCResult<Vec<(String, Vec<Id>)>> {
-    let tuple = match value {
-        Value::Tuple(tuple) => tuple,
-        Value::None => return Ok(Vec::new()),
-        other => return Err(tc_error::bad_request!("expected index list, got {other:?}")),
-    };
-
-    tuple.iter().map(parse_index).collect()
-}
-
-fn parse_index(value: &Value) -> TCResult<(String, Vec<Id>)> {
-    let pair = match value {
-        Value::Tuple(pair) if pair.len() == 2 => pair,
-        other => return Err(tc_error::bad_request!("invalid index definition: {other:?}")),
-    };
-
-    let name = match &pair[0] {
-        Value::String(s) => s.clone(),
-        other => return Err(tc_error::bad_request!("index name must be a string, got {other:?}")),
-    };
-
-    let cols = match &pair[1] {
-        Value::Tuple(cols) => cols
-            .iter()
-            .map(|c| match c {
-                Value::String(s) => s.parse::<Id>().map_err(|e| {
-                    tc_error::bad_request!("invalid index column name {s:?}: {e}")
-                }),
-                other => Err(tc_error::bad_request!(
-                    "index column name must be a string, got {other:?}"
-                )),
-            })
-            .collect::<TCResult<Vec<_>>>()?,
-        other => return Err(tc_error::bad_request!("expected index column list, got {other:?}")),
-    };
-
-    Ok((name, cols))
-}
-
-fn parse_value_type(s: &str) -> TCResult<ValueType> {
-    match s {
-        "Number" => Ok(ValueType::Number),
-        "String" => Ok(ValueType::String),
-        "Link" => Ok(ValueType::Link),
-        "None" => Ok(ValueType::None),
-        "Tuple" => Ok(ValueType::Tuple),
-        other => Err(tc_error::bad_request!("unknown value type: {other}")),
+        let Value::String(name_str) = &pair[0] else {
+            return None;
+        };
+        let Value::String(dtype_str) = &pair[1] else {
+            return None;
+        };
+        let name = name_str.parse::<Id>().ok()?;
+        let dtype = ValueType::from_str(dtype_str).ok()?;
+        Some(Column { name, dtype })
     }
 }
 
-fn dtype_to_string(dtype: &ValueType) -> String {
-    match dtype {
-        ValueType::Number => "Number",
-        ValueType::String => "String",
-        ValueType::Link => "Link",
-        ValueType::None => "None",
-        ValueType::Tuple => "Tuple",
+impl CastFrom<Column> for Value {
+    fn cast_from(col: Column) -> Self {
+        Value::Tuple(vec![
+            Value::String(col.name.to_string()),
+            Value::String(col.dtype.to_string()),
+        ])
     }
-    .to_string()
 }
 
 impl fmt::Display for TableSchema {

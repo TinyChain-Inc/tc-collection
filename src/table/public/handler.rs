@@ -244,14 +244,14 @@ where
             let kor = KeyOrRange::try_from_value(&table, key_value)?;
             match kor {
                 KeyOrRange::All => {
-                    let values = value_map_from_value(value_value)?;
+                    let values: HashMap<Id, Value> = value_value.try_cast_into(|v| bad_request!("invalid update values: {v:?}"))?;
                     table
                         .update(txn_id, Range::default(), values)
                         .await
                         .map_err(TCError::from)
                 }
                 KeyOrRange::Range(range) => {
-                    let values = value_map_from_value(value_value)?;
+                    let values: HashMap<Id, Value> = value_value.try_cast_into(|v| bad_request!("invalid update values: {v:?}"))?;
                     table.update(txn_id, range, values).await.map_err(TCError::from)
                 }
                 KeyOrRange::Key(key) => {
@@ -491,7 +491,7 @@ where
         let table = self.table.clone();
         let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
-            let (columns, reverse) = parse_order_request(value)?;
+            let (columns, reverse): (Vec<Id>, bool) = value.try_cast_into(|v| bad_request!("invalid order request: {v:?}"))?;
             let slice = table.order_by(&columns, reverse);
             Ok(Resp::from(crate::Collection::from(
                 crate::table::Table::from(slice),
@@ -536,7 +536,7 @@ where
         let table = self.table.clone();
         let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
-            let columns = parse_column_list(value)?;
+            let columns: Vec<Id> = value.try_cast_into(|v| bad_request!("invalid column list: {v:?}"))?;
             let selection = table.select(&columns);
             Ok(Resp::from(crate::Collection::from(
                 crate::table::Table::from(selection),
@@ -629,7 +629,7 @@ where
         let root = self.root.clone();
         let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
-            let schema = TableSchema::try_from_value(value)?;
+            let schema: TableSchema = value.try_cast_into(|v| bad_request!("invalid table schema: {v:?}"))?;
             let table = create_table(&root, txn_id, schema).await?;
             Ok(Resp::from(crate::Collection::from(table)))
         }))
@@ -671,7 +671,7 @@ where
         request.expect_empty()?;
 
         Ok(Box::pin(async move {
-            let schema = TableSchema::try_from_value(schema_value)?;
+            let schema: TableSchema = schema_value.try_cast_into(|v| bad_request!("invalid table schema: {v:?}"))?;
             let table = create_table(&root, txn_id, schema).await?;
 
             if let Some(source_scalar) = source_value {
@@ -765,75 +765,4 @@ async fn copy_inline_rows(
     }
 
     Ok(())
-}
-
-/// Parse an order request: either `(columns, reverse)` or just `columns`.
-fn parse_order_request(value: Value) -> TCResult<(Vec<Id>, bool)> {
-    match value {
-        Value::Tuple(ref tuple) if tuple.len() == 2 => {
-            let columns = parse_column_list(tuple[0].clone())?;
-            let reverse = match &tuple[1] {
-                Value::Number(n) => {
-                    let n: u64 = u64::cast_from(*n);
-                    n != 0
-                }
-                Value::None => false,
-                other => return Err(bad_request!("invalid reverse flag: {other:?}")),
-            };
-            Ok((columns, reverse))
-        }
-        other => {
-            let columns = parse_column_list(other)?;
-            Ok((columns, false))
-        }
-    }
-}
-
-/// Parse a column list from a `Value`.
-fn parse_column_list(value: Value) -> TCResult<Vec<Id>> {
-    match value {
-        Value::Tuple(tuple) => tuple
-            .into_iter()
-            .map(|v| match v {
-                Value::String(s) => s
-                    .parse::<Id>()
-                    .map_err(|e| bad_request!("invalid column name {s:?}: {e}")),
-                other => Err(bad_request!("column name must be a string, got {other:?}")),
-            })
-            .collect(),
-        Value::String(s) => {
-            let id = s
-                .parse::<Id>()
-                .map_err(|e| bad_request!("invalid column name {s:?}: {e}"))?;
-            Ok(vec![id])
-        }
-        other => Err(bad_request!("invalid column list: {other:?}")),
-    }
-}
-
-/// Parse a `Map<Value>` (column → new value) from a `Value`.
-fn value_map_from_value(value: Value) -> TCResult<HashMap<Id, Value>> {
-    let tuple = match value {
-        Value::Tuple(tuple) => tuple,
-        Value::None => return Ok(HashMap::new()),
-        other => return Err(bad_request!("invalid update values: {other:?}")),
-    };
-
-    let mut map = HashMap::new();
-    for entry in tuple {
-        let pair = match entry {
-            Value::Tuple(pair) if pair.len() == 2 => pair,
-            other => return Err(bad_request!("invalid update entry: {other:?}")),
-        };
-        let name = match &pair[0] {
-            Value::String(s) => s
-                .parse::<Id>()
-                .map_err(|e| bad_request!("invalid column name {s:?}: {e}"))?,
-            other => {
-                return Err(bad_request!("column name must be a string, got {other:?}"))
-            }
-        };
-        map.insert(name, pair[1].clone());
-    }
-    Ok(map)
 }

@@ -1173,6 +1173,7 @@ dependencies = [
  "log",
  "pathlink",
  "serde",
+ "txn_lock",
 ]
 
 [[package]]
@@ -1198,6 +1199,7 @@ dependencies = [
  "hr-id",
  "number-general",
  "pathlink",
+ "safecast",
 ]
 
 [[package]]
@@ -1293,7 +1295,6 @@ dependencies = [
  "collate",
  "ds-ext 0.4.0",
  "futures",
- "tc-error",
  "tokio",
 ]
 

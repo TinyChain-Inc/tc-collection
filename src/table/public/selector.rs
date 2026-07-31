@@ -2,6 +2,9 @@
 //!
 //! Ports the v1 `KeyOrRange` and `cast_into_range` helpers that decode a
 //! request `Value` into an All / Key / Range selector for a table.
+//! These are inherently schema-dependent (they need the table's column
+//! list to validate), so they remain as functions rather than
+//! `TryCastFrom` impls — matching the v1 pattern.
 
 use std::collections::HashMap;
 use std::ops::Bound;
@@ -99,8 +102,14 @@ pub(crate) fn cast_into_range(
 
         let col_range = match &pair[1] {
             Value::Tuple(bounds) if bounds.len() == 2 => {
-                let lower = parse_bound(&bounds[0]);
-                let upper = parse_bound(&bounds[1]);
+                let lower = match &bounds[0] {
+                    Value::None => Bound::Unbounded,
+                    other => Bound::Included(other.clone()),
+                };
+                let upper = match &bounds[1] {
+                    Value::None => Bound::Unbounded,
+                    other => Bound::Included(other.clone()),
+                };
                 ColumnRange::In((lower, upper))
             }
             _ => ColumnRange::Eq(pair[1].clone()),
@@ -110,14 +119,4 @@ pub(crate) fn cast_into_range(
     }
 
     Ok(ranges.into())
-}
-
-/// Parse a [`Value`] into a [`Bound<Value>`].
-///
-/// `Value::None` → `Unbounded`; any other value → `Included(value)`.
-fn parse_bound(value: &Value) -> Bound<Value> {
-    match value {
-        Value::None => Bound::Unbounded,
-        other => Bound::Included(other.clone()),
-    }
 }

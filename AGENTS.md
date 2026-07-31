@@ -37,6 +37,31 @@ local and lean, and push cross-host orchestration to client libraries.
   function body). This is enforced by `#![deny(clippy::needless_question_mark)]`
   in `src/lib.rs`.
 
+## Type conversions
+
+Prefer standard trait impls (`From`, `TryFrom`, `CastFrom`, `TryCastFrom`)
+over hand-written `parse_*` / `cast_*` / `to_*` helper functions.  This keeps
+conversions idiomatic, composable, and discoverable.
+
+- **Infallible conversions** (e.g. encoding a `TableSchema` as a `Value`):
+  implement `CastFrom<TableSchema> for Value` (which provides `CastInto` for
+  free) or `From<TableSchema> for Value`.  Do not write a `to_value()` method.
+- **Fallible conversions** (e.g. decoding a `Value` into a `TableSchema`):
+  implement `TryCastFrom<Value> for TableSchema` (which provides
+  `TryCastInto` for free).  Callers then write
+  `value.try_cast_into(|v| bad_request!(...))?` instead of calling a
+  custom `try_from_value` function.
+- **String ↔ enum** (e.g. `ValueType`): use `FromStr` and `Display` rather
+  than match-based `parse_*` and `*_to_string` helpers.
+- **Composite types** (e.g. `Column`, `(Vec<Id>, bool)`, `HashMap<Id, Value>`):
+  implement `TryCastFrom<Value>` so handlers can use `.try_cast_into(...)` at
+  every call site, matching the v1 pattern.
+- When a conversion trait impl belongs in another crate (orphan rules), add
+  it there rather than working around it with a local helper.  Add a comment
+  noting the cross-crate dependency.
+- Use `safecast::TryCastInto` at call sites (not `TryCastFrom` directly) for
+  ergonomics: `request.try_cast_into(|v| bad_request!("..."))?`.
+
 ## Trait implementations
 
 - When a type has inherent methods that return `Result` (e.g. `commit`/`rollback`/

@@ -9,6 +9,7 @@ use freqfs::Cache;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use safecast::TryCastInto;
 use tc_ir::{Claim, Map, NetworkTime, Scalar, Transaction, TxnId};
 use tc_value::ValueType;
 use umask::Mode;
@@ -156,7 +157,7 @@ fn simple_schema() -> TableSchema {
 }
 
 fn schema_value() -> tc_value::Value {
-    simple_schema().to_value()
+    safecast::CastFrom::cast_from(simple_schema())
 }
 
 async fn make_table_with_data() -> PersistentTable {
@@ -208,8 +209,8 @@ fn route_resolves_all_paths() {
 #[test]
 fn schema_roundtrip() {
     let original = simple_schema();
-    let encoded = original.to_value();
-    let decoded = TableSchema::try_from_value(encoded).expect("decode schema");
+    let encoded: tc_value::Value = safecast::CastFrom::cast_from(original.clone());
+    let decoded: TableSchema = encoded.try_cast_into(|v| tc_error::bad_request!("invalid schema: {v:?}")).expect("decode schema");
     assert_eq!(original.key(), decoded.key());
     assert_eq!(original.values(), decoded.values());
 }
