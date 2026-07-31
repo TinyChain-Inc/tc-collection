@@ -4,7 +4,6 @@ use std::fmt;
 use b_table::{ColumnRange, IndexSchema, Range, Schema};
 use b_tree::Schema as BTreeSchema;
 use safecast::{CastFrom, TryCastFrom};
-use std::str::FromStr;
 use tc_error::TCError;
 use tc_ir::Id;
 use tc_value::{Value, ValueType};
@@ -370,7 +369,7 @@ impl CastFrom<TableSchema> for Value {
             .map(|(name, dtype)| {
                 Value::Tuple(vec![
                     Value::String(name.to_string()),
-                    Value::String(dtype.to_string()),
+                    Value::cast_from(dtype.clone()),
                 ])
             })
             .collect::<Vec<_>>();
@@ -383,7 +382,7 @@ impl CastFrom<TableSchema> for Value {
             .map(|(name, dtype)| {
                 Value::Tuple(vec![
                     Value::String(name.to_string()),
-                    Value::String(dtype.to_string()),
+                    Value::cast_from(dtype.clone()),
                 ])
             })
             .collect::<Vec<_>>();
@@ -419,7 +418,7 @@ impl TryCastFrom<Value> for Column {
         };
         pair.len() == 2
             && matches!(&pair[0], Value::String(_))
-            && matches!(&pair[1], Value::String(s) if ValueType::from_str(s).is_ok())
+            && ValueType::can_cast_from(&pair[1])
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
@@ -432,11 +431,8 @@ impl TryCastFrom<Value> for Column {
         let Value::String(name_str) = &pair[0] else {
             return None;
         };
-        let Value::String(dtype_str) = &pair[1] else {
-            return None;
-        };
         let name = name_str.parse::<Id>().ok()?;
-        let dtype = ValueType::from_str(dtype_str).ok()?;
+        let dtype = ValueType::opt_cast_from(pair[1].clone())?;
         Some(Column { name, dtype })
     }
 }
@@ -445,7 +441,7 @@ impl CastFrom<Column> for Value {
     fn cast_from(col: Column) -> Self {
         Value::Tuple(vec![
             Value::String(col.name.to_string()),
-            Value::String(col.dtype.to_string()),
+            Value::cast_from(col.dtype),
         ])
     }
 }
