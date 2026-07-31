@@ -37,6 +37,16 @@ local and lean, and push cross-host orchestration to client libraries.
   function body). This is enforced by `#![deny(clippy::needless_question_mark)]`
   in `src/lib.rs`.
 
+## Generic type naming
+
+Use `State` (not e.g. `Resp` or `T`) as the generic type parameter name
+when a handler or trait expects a host-level state type — even though
+`tc-collection` does not depend on `tc-state` directly.  This matches
+the v1 convention (`State: From<Collection> + From<Value> + From<u64>`)
+and keeps the codebase consistent across crates.  The bounds on `State`
+express what the handler needs (`From<Collection>`, `From<Value>`,
+`From<u64>`, etc.) without naming a concrete type.
+
 ## Type conversions
 
 Prefer standard trait impls (`From`, `TryFrom`, `CastFrom`, `TryCastFrom`)

@@ -14,7 +14,8 @@ use tc_value::Value;
 use super::schema::{TableIndexSchema, TableSchema};
 use super::stream::Rows;
 use super::view::{Limited, Selection, TableSlice};
-use crate::btree::{StorageConfig, PersistentFile};
+use crate::btree::StorageConfig;
+use crate::PersistentFile;
 
 fn background_error(err: impl fmt::Display) -> txn_lock::Error {
     txn_lock::Error::Background(err.to_string())

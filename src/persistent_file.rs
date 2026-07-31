@@ -1,4 +1,9 @@
-//! Persistent file adapters for BTree node loading/saving through freqfs.
+//! Persistent file adapter for on-disk collection node loading/saving.
+//!
+//! This type wraps `b_tree::Node` for use with `freqfs` and is shared by
+//! BTree, Table, and other collection types — it is not specific to any
+//! one collection variant.
+
 use std::fs::Metadata;
 
 use freqfs::{FileLoad, FileSave};

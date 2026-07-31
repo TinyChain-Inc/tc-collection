@@ -2,7 +2,8 @@
 
 use super::{route, Static};
 use super::selector::KeyOrRange;
-use crate::btree::{StorageConfig, PersistentFile};
+use crate::btree::StorageConfig;
+use crate::PersistentFile;
 use crate::table::{Column, PersistentTable, TableSchema};
 use crate::Collection;
 use freqfs::Cache;
@@ -693,16 +694,16 @@ fn static_copy_from_inline_rows() {
 
             match resp {
                 State::Collection(Collection::Table(table)) => {
-                    if let crate::table::Table::File(table) = table {
-                        assert_eq!(table.count(tx(40)).await, 2);
-                        let row = table.read_row(tx(40), &[Value::from(10_u64)]).await;
+                    if let crate::table::Table::Temp(table) = table {
+                        assert_eq!(table.count().await, 2);
+                        let row = table.read_row(&[Value::from(10_u64)]).await;
                         assert!(row.is_some());
                         assert_eq!(
                             row.unwrap().as_ref(),
                             &[Value::from(10_u64), Value::from("row1")]
                         );
                     } else {
-                        panic!("expected File table");
+                        panic!("expected Temp table");
                     }
                 }
                 other => panic!("expected collection, got {other:?}"),
@@ -719,13 +720,17 @@ fn copy_from_direct_method() {
             let source = make_table_with_data().await;
 
             let root = init_root("copy-direct").await;
-            let (persistent, txn) = load_roots(&root);
-            let dest = PersistentTable::new(persistent, txn, simple_schema());
+            std::fs::create_dir_all(root.join("temp")).expect("create temp dir");
+            let cache = Cache::<PersistentFile>::new(16 * 1024 * 1024, None);
+            let dir = Arc::clone(&cache).load(root.join("temp")).expect("load temp dir");
+
+            let dest = crate::table::TempTable::create(simple_schema(), dir)
+                .expect("create temp table");
 
             dest.copy_from(tx(10), &source).await.expect("copy");
 
-            assert_eq!(dest.count(tx(10)).await, 3);
-            let row = dest.read_row(tx(10), &[Value::from(2_u64)]).await;
+            assert_eq!(dest.count().await, 3);
+            let row = dest.read_row(&[Value::from(2_u64)]).await;
             assert!(row.is_some());
             assert_eq!(
                 row.unwrap().as_ref(),

@@ -2,7 +2,7 @@
 //!
 //! Ports the v1 `table/public.rs` routing logic.  Each route is a separate
 //! handler **struct** (not an enum variant) with a `From` impl, following
-//! the v1 pattern.  Handlers are generic over the response type `Resp`,
+//! the v1 pattern.  Handlers are generic over the response type `State`,
 //! which must support `From<Collection>` and `From<Value>` (and `From<u64>`
 //! for `CountHandler`) — this mirrors v1's `State: From<Collection> + From<Value>
 //! + From<u64>` bounds.
@@ -22,7 +22,7 @@ pub mod selector;
 
 use freqfs::DirLock;
 
-use crate::btree::PersistentFile;
+use crate::PersistentFile;
 use crate::table::PersistentTable;
 
 pub use handler::{
@@ -51,12 +51,12 @@ pub use handler::{
 /// | `["limit"]` | [`LimitHandler`] |
 /// | `["order"]` | [`OrderHandler`] |
 /// | `["select"]` | [`SelectHandler`] |
-pub fn route<'a, Resp>(
+pub fn route<'a, State>(
     table: &'a PersistentTable,
     path: &[pathlink::PathSegment],
-) -> Option<Box<dyn RouteHandler<Resp> + 'a>>
+) -> Option<Box<dyn RouteHandler<State> + 'a>>
 where
-    Resp: From<crate::Collection> + From<tc_value::Value> + From<u64> + Clone + Send + 'static,
+    State: From<crate::Collection> + From<tc_value::Value> + From<u64> + Clone + Send + 'static,
 {
     if path.is_empty() {
         Some(Box::new(TableHandler::from(table.clone())))
@@ -93,14 +93,14 @@ where
 /// Unlike v1, the verb traits have associated types that make them
 /// non-object-safe, so we use a custom dispatch trait that erases the
 /// future types while preserving the request/response types.
-pub trait RouteHandler<Resp>: Send + Sync {
+pub trait RouteHandler<State>: Send + Sync {
     fn get(
         &self,
         txn: &dyn tc_ir::Transaction,
         request: tc_ir::Scalar,
     ) -> tc_error::TCResult<
         std::pin::Pin<
-            Box<dyn std::future::Future<Output = tc_error::TCResult<Resp>> + Send + '_>,
+            Box<dyn std::future::Future<Output = tc_error::TCResult<State>> + Send + '_>,
         >,
     >;
 
@@ -120,7 +120,7 @@ pub trait RouteHandler<Resp>: Send + Sync {
         request: tc_ir::Scalar,
     ) -> tc_error::TCResult<
         std::pin::Pin<
-            Box<dyn std::future::Future<Output = tc_error::TCResult<Resp>> + Send + '_>,
+            Box<dyn std::future::Future<Output = tc_error::TCResult<State>> + Send + '_>,
         >,
     >;
 
@@ -155,12 +155,12 @@ impl Static {
     /// |------|---------|
     /// | `[]` | [`CreateHandler`] |
     /// | `["copy_from"]` | [`CopyHandler`] |
-    pub fn route<Resp>(
+    pub fn route<State>(
         &self,
         path: &[pathlink::PathSegment],
-    ) -> Option<Box<dyn StaticRouteHandler<Resp> + '_>>
+    ) -> Option<Box<dyn StaticRouteHandler<State> + '_>>
     where
-        Resp: From<crate::Collection> + Clone + Send + 'static,
+        State: From<crate::Collection> + Clone + Send + 'static,
     {
         if path.is_empty() {
             Some(Box::new(CreateHandler::new(self.root.clone())))
@@ -172,14 +172,14 @@ impl Static {
     }
 }
 
-pub trait StaticRouteHandler<Resp>: Send + Sync {
+pub trait StaticRouteHandler<State>: Send + Sync {
     fn get(
         &self,
         txn: &dyn tc_ir::Transaction,
         request: tc_ir::Scalar,
     ) -> tc_error::TCResult<
         std::pin::Pin<
-            Box<dyn std::future::Future<Output = tc_error::TCResult<Resp>> + Send + '_>,
+            Box<dyn std::future::Future<Output = tc_error::TCResult<State>> + Send + '_>,
         >,
     >;
 
@@ -189,7 +189,7 @@ pub trait StaticRouteHandler<Resp>: Send + Sync {
         request: tc_ir::Map<tc_ir::Scalar>,
     ) -> tc_error::TCResult<
         std::pin::Pin<
-            Box<dyn std::future::Future<Output = tc_error::TCResult<Resp>> + Send + '_>,
+            Box<dyn std::future::Future<Output = tc_error::TCResult<State>> + Send + '_>,
         >,
     >;
 }

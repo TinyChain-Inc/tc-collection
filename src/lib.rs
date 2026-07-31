@@ -2,6 +2,9 @@
 
 pub use fensor;
 
+mod persistent_file;
+pub use persistent_file::PersistentFile;
+
 pub mod btree;
 pub mod collection;
 pub mod table;
