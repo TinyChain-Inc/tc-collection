@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
@@ -556,7 +556,7 @@ impl PersistentTable {
         &self,
         txn_id: TxnId,
         range: Range<Id, Value>,
-        values: HashMap<Id, Value>,
+        values: tc_ir::Map<Value>,
     ) -> Result<(), txn_lock::Error> {
         let value_columns = self.schema.values();
         for name in values.keys() {

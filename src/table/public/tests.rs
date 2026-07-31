@@ -482,14 +482,12 @@ fn put_update_all() {
             let handler = route::<State>(&table, &[]).expect("root");
             let txn = MockTxn::new(30);
 
+            let mut value_map = Map::new();
+            value_map.insert("label".parse().expect("Id"), Scalar::Value(Value::from("updated")));
+
             let mut params = Map::new();
             params.insert("key".parse().expect("Id"), Scalar::Value(Value::None));
-            params.insert(
-                "value".parse().expect("Id"),
-                Scalar::Value(Value::Tuple(vec![
-                    Value::Tuple(vec![Value::from("label"), Value::from("updated")]),
-                ])),
-            );
+            params.insert("value".parse().expect("Id"), Scalar::Map(value_map));
 
             let fut = handler.put(&txn, params).expect("put update");
             fut.await.expect("update ok");
@@ -522,14 +520,12 @@ fn put_update_range() {
                 ]),
             ]);
 
+            let mut value_map = Map::new();
+            value_map.insert("label".parse().expect("Id"), Scalar::Value(Value::from("range_updated")));
+
             let mut params = Map::new();
             params.insert("key".parse().expect("Id"), Scalar::Value(key_selector));
-            params.insert(
-                "value".parse().expect("Id"),
-                Scalar::Value(Value::Tuple(vec![
-                    Value::Tuple(vec![Value::from("label"), Value::from("range_updated")]),
-                ])),
-            );
+            params.insert("value".parse().expect("Id"), Scalar::Map(value_map));
 
             let fut = handler.put(&txn, params).expect("put update range");
             fut.await.expect("update ok");
@@ -559,11 +555,10 @@ fn put_update_range() {
 fn update_direct_method() {
     run_async_test("update_direct_method", || {
         Box::pin(async {
-            use std::collections::HashMap;
             use tc_value::Value;
             let table = make_table_with_data().await;
 
-            let mut updates = HashMap::new();
+            let mut updates = tc_ir::Map::new();
             updates.insert("label".parse().expect("Id"), Value::from("method_updated"));
 
             table

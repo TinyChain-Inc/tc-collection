@@ -8,7 +8,6 @@
 //! `From` impls — this mirrors v1's `State: From<Collection> + From<Value>
 //! + From<u64>` bounds.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -238,27 +237,28 @@ where
         let table = self.table.clone();
         let mut params = request;
         let key_value: Value = params.require("key")?.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
-        let value_value: Value = params.require("value")?.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+        let value_scalar = params.require("value")?;
 
         Ok(Box::pin(async move {
             let kor = KeyOrRange::try_from_value(&table, key_value)?;
             match kor {
                 KeyOrRange::All => {
-                    let values: HashMap<Id, Value> = value_value.try_cast_into(|v| bad_request!("invalid update values: {v:?}"))?;
+                    let values: tc_ir::Map<Value> = value_scalar.try_cast_into(|v| bad_request!("invalid update values: {v:?}"))?;
                     table
                         .update(txn_id, Range::default(), values)
                         .await
                         .map_err(TCError::from)
                 }
                 KeyOrRange::Range(range) => {
-                    let values: HashMap<Id, Value> = value_value.try_cast_into(|v| bad_request!("invalid update values: {v:?}"))?;
+                    let values: tc_ir::Map<Value> = value_scalar.try_cast_into(|v| bad_request!("invalid update values: {v:?}"))?;
                     table.update(txn_id, range, values).await.map_err(TCError::from)
                 }
                 KeyOrRange::Key(key) => {
-                    let values = if let Value::Tuple(tuple) = value_value {
+                    let value: Value = value_scalar.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+                    let values = if let Value::Tuple(tuple) = value {
                         tuple
                     } else {
-                        vec![value_value]
+                        vec![value]
                     };
                     table.upsert_row(txn_id, key, values).await.map_err(TCError::from)
                 }
