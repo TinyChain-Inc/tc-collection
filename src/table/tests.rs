@@ -1,6 +1,7 @@
 //! Transactional visibility and ordering regression tests for `PersistentTable`.
 use super::{Column, ColumnRange, Limited, PersistentTable, Range, Rows, Selection, TableSchema, TableSlice};
-use crate::btree::{StorageConfig, PersistentFile};
+use crate::btree::StorageConfig;
+use crate::PersistentFile;
 use freqfs::Cache;
 use futures::{future::join_all, TryStreamExt};
 use std::collections::HashMap;

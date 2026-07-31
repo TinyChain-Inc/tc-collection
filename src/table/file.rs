@@ -14,7 +14,8 @@ use tc_value::Value;
 use super::schema::{TableIndexSchema, TableSchema};
 use super::stream::Rows;
 use super::view::{Limited, Selection, TableSlice};
-use crate::btree::{StorageConfig, PersistentFile};
+use crate::btree::StorageConfig;
+use crate::PersistentFile;
 
 fn background_error(err: impl fmt::Display) -> txn_lock::Error {
     txn_lock::Error::Background(err.to_string())
@@ -539,6 +540,110 @@ impl PersistentTable {
     pub fn select(&self, columns: &[Id]) -> Selection {
         self.slice(Range::default(), &[], false)
             .select(columns.to_vec())
+    }
+
+    /// Update all visible rows in `range` at `txn_id` with the given column
+    /// `values`.
+    ///
+    /// Only value columns (not key columns) may be updated.  Rows are streamed
+    /// from the visible snapshot, updated in-place, and upserted into the
+    /// pending delta — the full affected set is never buffered in a `Vec`
+    /// (v1 no-materialization invariant).  A single `Range::All` write permit
+    /// is acquired upfront so no per-key semaphore re-acquisition is needed
+    /// during the streamed update loop.
+    ///
+    /// Ported from v1 `TableFile::update`.
+    pub async fn update(
+        &self,
+        txn_id: TxnId,
+        range: Range<Id, Value>,
+        values: tc_ir::Map<Value>,
+    ) -> Result<(), txn_lock::Error> {
+        let value_columns = self.schema.values();
+        for name in values.keys() {
+            if !value_columns.contains(name) {
+                return Err(background_error(format!(
+                    "cannot update key column {name}"
+                )));
+            }
+        }
+
+        let key_len = self.schema.key().len();
+        let collator = RowCollator::for_order(&self.schema, &[], false);
+
+        let _permit = self
+            .semaphore
+            .try_write(txn_id, txn_lock::set::Range::All)?;
+
+        let pending = self.pending_delta_for_txn(txn_id).await?;
+
+        let snapshot = self.visible_snapshot(txn_id);
+
+        let mut visible: BoxStream<'_, Result<Vec<Value>, std::io::Error>> = snapshot
+            .persistent
+            .row_stream(range.clone(), &[], false)
+            .await
+            .map_err(background_error)?
+            .map_ok(|row| row.to_vec())
+            .boxed();
+
+        for delta in &snapshot.deltas {
+            visible = delta
+                .merge_into(visible, range.clone(), &[], false, collator.clone())
+                .await;
+        }
+
+        while let Some(mut row) = visible.try_next().await.map_err(background_error)? {
+            for (i, name) in value_columns.iter().enumerate() {
+                if let Some(value) = values.get(name) {
+                    row[key_len + i] = value.clone();
+                }
+            }
+
+            let key: Vec<Value> = row[..key_len].to_vec();
+            let updated_values: Vec<Value> = row[key_len..].to_vec();
+
+            pending.upsert(key, updated_values).await.map_err(background_error)?;
+        }
+
+        Ok(())
+    }
+
+    /// Copy all rows from `source` into this table at `txn_id`.
+    ///
+    /// Rows are streamed from the source table's visible snapshot and upserted
+    /// one-by-one into this table's pending delta — no full source is ever
+    /// buffered (v1 no-materialization invariant).
+    ///
+    /// The source table must have a compatible schema (same key and value
+    /// column count and types).
+    ///
+    /// Ported from v1 `CopyFrom<FE, T> for TableFile`.
+    pub async fn copy_from(
+        &self,
+        txn_id: TxnId,
+        source: &PersistentTable,
+    ) -> Result<(), txn_lock::Error> {
+        let _permit = self
+            .semaphore
+            .try_write(txn_id, txn_lock::set::Range::All)?;
+
+        let pending = self.pending_delta_for_txn(txn_id).await?;
+
+        let key_len = self.schema.key().len();
+
+        let mut rows = source
+            .rows(txn_id, Range::default(), Vec::new(), false)
+            .await?;
+
+        while let Some(row) = rows.try_next().await.map_err(background_error)? {
+            let row_vec = row.into_vec();
+            let key: Vec<Value> = row_vec[..key_len].to_vec();
+            let values: Vec<Value> = row_vec[key_len..].to_vec();
+            pending.upsert(key, values).await.map_err(background_error)?;
+        }
+
+        Ok(())
     }
 
     /// Delete all visible rows in `range` at `txn_id`.

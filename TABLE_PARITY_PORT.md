@@ -146,7 +146,7 @@ mirrors `src/btree/` (`mod.rs` / `file.rs` / `stream.rs` / `codec.rs` /
 | `table/file.rs` — `State` | `src/table/file.rs` | — | Port: `committed`/`pending` `BTreeMap<TxnId, Delta>`, `finalized`, `txn_root`. |
 | `table/file.rs` — `Transact`/`Persist`/`CopyFrom`/`Restore`/`FromStream` | `src/table/file.rs` + `src/table/codec.rs` | `b_table::TableLock::create`/`load`/`sync`; `freqfs::DirLock` | Port: lifecycle per `Transact` trait (`tc_ir::Transact`, as BTree does). `Restore`/`FromStream`/`CopyFrom` are **deferred** (see [§8](#8-unresolved-questions--blockers) B2/B3). |
 | `table/public.rs` — route handlers | `src/table/route.rs` | — | Port: handler structs + `Route` impl (see [§4](#4-route--api-matrix)). Express via shared IR envelopes (`AGENTS.md`). |
-| `table/public.rs` — `Static` (`create`, `copy_from`) | `src/table/route.rs` | `b_table::TableLock::create` | Port: `create`. `copy_from` stays `not_implemented` parity (v1 stubs it). |
+| `table/public.rs` — `Static` (`create`, `copy_from`) | `src/table/public/` | `b_table::TableLock::create` | Port: `create` and `copy_from` (inline rows + direct method). |
 | `table/public.rs` — `KeyOrRange` / `cast_into_range` | `src/table/route.rs` | `b_table::Range` / `ColumnRange` | Port: selector parsing (All / Key / Range). |
 | `public/table.rs` — `Collection`/`CollectionType`/`Static` routing | `src/collection.rs` + `src/table/route.rs` | — | Port: add `Collection::Table` dispatch and the collection-level `schema` route. |
 
@@ -161,7 +161,7 @@ envelopes rather than adapter-specific shapes.
 | Route | Verb | v1 handler | v2 disposition | Error envelope |
 | --- | --- | --- | --- | --- |
 | `/state/collection/table` (static) | GET | `CreateHandler` | `create(schema)` → `TableFile::create` | `bad_request` on invalid schema |
-| `/state/collection/table/copy_from` | POST | `CopyHandler` | **Parity stub** (`not_implemented!("copy a Table")`) — v1 itself does not implement it | `not_implemented` |
+| `/state/collection/table/copy_from` | POST | `CopyHandler` | Port: `copy_from` with inline row data; direct method for table-to-table | `bad_request` on invalid schema/rows |
 | `<table>` | GET | `TableHandler` (All→self, Range→slice, Key→read row) | port: read/slice/read-row dispatch | `bad_request` on invalid selector |
 | `<table>` | PUT | `TableHandler` (All/Range→update, Key→upsert) | port: `update(range, values)` / `upsert(key, values)` | `bad_request` on bad values/cols |
 | `<table>` | POST | `TableHandler` (body→range→slice) | port: `slice(range)` | `bad_request` on invalid selection |
@@ -204,10 +204,15 @@ impact. The following are intentional and bounded:
    is fallible (`Result<(), txn_lock::Error>`) and `rollback`/`finalize` panic
    on invariant violation, matching BTree. *Rationale:* stack alignment.
    *Migration impact:* none for clients.
-3. **`copy_from` remains unimplemented.** v1's `CopyHandler` returns
-   `not_implemented!("copy a Table")`; the port preserves this stub rather than
-   inventing copy semantics. *Rationale:* no new semantics before parity.
-   *Migration impact:* identical to v1.
+3. **`copy_from` route handler accepts inline row data.** v1's `CopyHandler`
+   returns `not_implemented!("copy a Table")`. The v2 port implements `copy_from`
+   with two paths: (a) the route handler accepts inline row tuples as the
+   `source` parameter, inserting them directly; (b) the `PersistentTable::copy_from`
+   method streams rows from a source table for host-resolved references. When
+   the source is a `Scalar::Ref`, the host must resolve it before calling
+   `copy_from` directly. *Rationale:* `tc-collection` does not perform reference
+   resolution; the host owns that. *Migration impact:* clients can use
+   `copy_from` with inline data or via host-resolved references.
 4. **No new transaction semantics.** Visibility, isolation, finalize, and replay
    semantics are byte-for-behavior identical to v1. No opportunistic merge,
    repair, or fallback paths are introduced (`AGENTS.md`).
@@ -368,4 +373,53 @@ issues satisfy the green-test items.)
       `tc-chain` integration.
 - [ ] §7.4 integrity tests (corrupt state, schema mismatch) — follow-up.
 - [ ] §7.7 performance benchmarks — budget TBD vs v1 baseline.
-- [ ] `update(range, values)` via temp scratch index — follow-up.
+- [x] `update(range, values)` — streams rows in range, applies column updates,
+      upserts into pending delta (ported from v1 `TableFile::update`).
+- [x] `copy_from` — streams source rows into a new table (ported from v1
+      `CopyFrom` trait impl). Route handler supports inline row data; direct
+      method supports table-to-table copy.
+
+### Implementation status (issue #9)
+
+- [x] `src/table/public/` — public API route handlers porting v1 `table/public.rs`,
+      split into focused submodules:
+      - `mod.rs` — `TableRouter` (per-instance) and `TableStatic` (class-level)
+      - `handler.rs` — `TableRoute` enum and `HandleGet`/`HandlePut`/
+        `HandlePost`/`HandleDelete` implementations
+      - `selector.rs` — `KeyOrRange` and `cast_into_range` selector parsing
+      - `response.rs` — `TableResponse` enum
+      - `static_route.rs` — `TableStaticRoute` for `create`/`copy_from`
+      - `tests.rs` — route-level test coverage
+- [x] `TableRouter` implements `tc_ir::Route` for per-instance table routes
+      (`columns`, `contains`, `count`, `key_columns`, `key_names`, `limit`,
+      `order`, `select`, root read/slice/upsert/update/truncate/delete).
+- [x] `TableStatic` implements `tc_ir::Route` for class-level routes (`create`,
+      `copy_from`).
+- [x] `HandleGet`/`HandlePut`/`HandlePost`/`HandleDelete` implementations on
+      `TableRoute` dispatch to existing `PersistentTable` methods.
+- [x] `KeyOrRange` selector parsing (All / Key / Range) ported from v1.
+- [x] `cast_into_range` helper ported from v1.
+- [x] `TableSchema::try_from_value` / `to_value` for schema encoding/decoding.
+- [x] `CollectionRouter` in `src/collection.rs` with collection-level `schema`
+      route (ports v1 `public/table.rs` `SchemaHandler`).
+- [x] `Collection::router()` method makes routing reachable from the host —
+      the host calls `collection.router()` to obtain a `CollectionRouter` that
+      implements `tc_ir::Route`.
+- [x] `TableResponse` enum covers scalar (`Value`), table, slice, limited, and
+      selection responses.
+- [x] `update` (All/Range PUT) fully implemented — streams rows in range,
+      applies column updates, upserts into pending delta. No full
+      materialization (v1 no-materialization invariant).
+- [x] `copy_from` implemented — supports inline row data via the route handler
+      and table-to-table copy via `PersistentTable::copy_from`. The route
+      handler accepts `schema` and `source` parameters; when `source` is inline
+      row data, rows are inserted directly. When the source is a table
+      reference, the host resolves it and calls `copy_from` directly.
+- [x] 29 route-level tests: route resolution, GET/PUT/POST/DELETE handlers,
+      schema roundtrip, `KeyOrRange` parsing, method-not-supported, collection
+      schema route, static create, `copy_from` (inline + direct), `update`
+      (all + range + direct method).
+- [x] Transaction identity propagated via `tc_ir::Transaction` (`txn.id()`).
+- [x] Authorization context preserved via `Claim` (enforced at host layer per
+      `AGENTS.md`).
+- [x] Structured `tc_error::TCError` envelopes for all error paths.

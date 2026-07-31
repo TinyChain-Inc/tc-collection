@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fmt;
 
 use b_table::{ColumnRange, IndexSchema, Range, Schema};
+use b_tree::Schema as BTreeSchema;
+use safecast::{CastFrom, TryCastFrom};
 use tc_error::TCError;
 use tc_ir::Id;
 use tc_value::{Value, ValueType};
@@ -279,6 +281,168 @@ impl Schema for TableSchema {
         }
 
         Ok(values)
+    }
+}
+
+impl TableSchema {
+    /// Return an iterator over all column names (key followed by value columns).
+    pub fn columns(&self) -> impl Iterator<Item = &Id> {
+        self.key.iter().chain(self.values.iter())
+    }
+}
+
+impl TryCastFrom<Value> for TableSchema {
+    fn can_cast_from(value: &Value) -> bool {
+        let Value::Tuple(outer) = value else {
+            return false;
+        };
+        if outer.len() != 2 {
+            return false;
+        }
+        let Value::Tuple(inner) = &outer[0] else {
+            return false;
+        };
+        inner.len() == 2
+            && is_column_list(&inner[0])
+            && is_column_list(&inner[1])
+            && is_index_list(&outer[1])
+    }
+
+    fn opt_cast_from(value: Value) -> Option<Self> {
+        let Value::Tuple(outer) = &value else {
+            return None;
+        };
+        if outer.len() != 2 {
+            return None;
+        }
+        let Value::Tuple(inner) = &outer[0] else {
+            return None;
+        };
+        if inner.len() != 2 {
+            return None;
+        }
+
+        let key = cast_column_list(&inner[0])?;
+        let values = cast_column_list(&inner[1])?;
+        let indices = cast_index_list(&outer[1])?;
+
+        Self::new(key, values, indices, StorageConfig::default()).ok()
+    }
+}
+
+fn is_column_list(value: &Value) -> bool {
+    let Value::Tuple(tuple) = value else {
+        return false;
+    };
+    tuple.iter().all(Column::can_cast_from)
+}
+
+fn is_index_list(value: &Value) -> bool {
+    match value {
+        Value::None => true,
+        Value::Tuple(tuple) => tuple.iter().all(<(String, Vec<Id>)>::can_cast_from),
+        _ => false,
+    }
+}
+
+fn cast_column_list(value: &Value) -> Option<Vec<Column>> {
+    let Value::Tuple(tuple) = value else {
+        return None;
+    };
+    tuple.iter().cloned().map(Column::opt_cast_from).collect()
+}
+
+fn cast_index_list(value: &Value) -> Option<Vec<(String, Vec<Id>)>> {
+    match value {
+        Value::None => Some(Vec::new()),
+        Value::Tuple(tuple) => tuple.iter().cloned().map(<(String, Vec<Id>)>::opt_cast_from).collect(),
+        _ => None,
+    }
+}
+
+impl CastFrom<TableSchema> for Value {
+    fn cast_from(schema: TableSchema) -> Self {
+        let key = schema
+            .key
+            .iter()
+            .zip(schema.primary.column_types().iter().take(schema.key.len()))
+            .map(|(name, dtype)| {
+                Value::Tuple(vec![
+                    Value::String(name.to_string()),
+                    Value::cast_from(dtype.clone()),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let key = Value::Tuple(key);
+
+        let values = schema
+            .values
+            .iter()
+            .zip(schema.primary.column_types().iter().skip(schema.key.len()))
+            .map(|(name, dtype)| {
+                Value::Tuple(vec![
+                    Value::String(name.to_string()),
+                    Value::cast_from(dtype.clone()),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let values = Value::Tuple(values);
+
+        let indices = schema
+            .indices
+            .iter()
+            .map(|(name, index_schema)| {
+                let col_count = BTreeSchema::len(index_schema) - schema.key.len();
+                let cols = index_schema
+                    .columns()
+                    .iter()
+                    .take(col_count)
+                    .map(|c| Value::String(c.to_string()))
+                    .collect::<Vec<_>>();
+                Value::Tuple(vec![
+                    Value::String(name.clone()),
+                    Value::Tuple(cols),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let indices = Value::Tuple(indices);
+
+        Value::Tuple(vec![Value::Tuple(vec![key, values]), indices])
+    }
+}
+
+impl TryCastFrom<Value> for Column {
+    fn can_cast_from(value: &Value) -> bool {
+        let Value::Tuple(pair) = value else {
+            return false;
+        };
+        pair.len() == 2
+            && matches!(&pair[0], Value::String(_))
+            && ValueType::can_cast_from(&pair[1])
+    }
+
+    fn opt_cast_from(value: Value) -> Option<Self> {
+        let Value::Tuple(pair) = &value else {
+            return None;
+        };
+        if pair.len() != 2 {
+            return None;
+        }
+        let Value::String(name_str) = &pair[0] else {
+            return None;
+        };
+        let name = name_str.parse::<Id>().ok()?;
+        let dtype = ValueType::opt_cast_from(pair[1].clone())?;
+        Some(Column { name, dtype })
+    }
+}
+
+impl CastFrom<Column> for Value {
+    fn cast_from(col: Column) -> Self {
+        Value::Tuple(vec![
+            Value::String(col.name.to_string()),
+            Value::cast_from(col.dtype),
+        ])
     }
 }
 

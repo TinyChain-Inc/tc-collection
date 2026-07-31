@@ -13,7 +13,7 @@ use tc_error::TCError;
 use tc_ir::{Transact, TxnId};
 use tc_value::{Value, ValueType};
 
-use super::stream::PersistentFile;
+use super::PersistentFile;
 
 const UNARY_KEY_ARITY: usize = 1;
 
