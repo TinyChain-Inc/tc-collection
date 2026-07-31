@@ -1183,6 +1183,7 @@ dependencies = [
  "hr-id",
  "number-general",
  "pathlink",
+ "safecast",
  "serde",
  "tc-error",
  "tc-value",
@@ -1292,6 +1293,7 @@ dependencies = [
  "collate",
  "ds-ext 0.4.0",
  "futures",
+ "tc-error",
  "tokio",
 ]
 

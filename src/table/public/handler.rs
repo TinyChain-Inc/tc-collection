@@ -13,7 +13,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use b_table::Range;
-use safecast::CastFrom;
+use safecast::{CastFrom, TryCastInto};
 use tc_error::{bad_request, TCError, TCResult};
 use tc_ir::{Id, Map, Scalar, Transaction, TxnId};
 use tc_value::Value;
@@ -21,41 +21,6 @@ use tc_value::Value;
 use super::selector::{cast_into_range, KeyOrRange};
 use super::RouteHandler;
 use crate::table::{PersistentTable, TableSchema};
-
-/// Convert a [`txn_lock::Error`] into a [`TCError`].
-///
-/// TODO: this should be `impl From<txn_lock::Error> for TCError` in the
-/// `tc-error` crate (or `txn_lock`), but neither crate currently depends
-/// on the other.
-fn txn_err(err: txn_lock::Error) -> TCError {
-    match err {
-        txn_lock::Error::Committed => TCError::conflict("transaction already committed"),
-        txn_lock::Error::Conflict => TCError::conflict(err),
-        txn_lock::Error::Outdated => TCError::not_found("transaction has been finalized"),
-        txn_lock::Error::WouldBlock => TCError::conflict("transactional lock would block"),
-        txn_lock::Error::Background(cause) => TCError::internal(cause),
-    }
-}
-
-/// Extract a [`Value`] from a [`Scalar`] request envelope.
-///
-/// TODO: this should be `impl TryCastFrom<Scalar> for Value` in the
-/// `tc-ir` crate (where `Scalar` is defined).
-pub(crate) fn scalar_to_value(scalar: Scalar) -> TCResult<Value> {
-    match scalar {
-        Scalar::Value(value) => Ok(value),
-        Scalar::Tuple(items) => {
-            let values = items
-                .into_iter()
-                .map(scalar_to_value)
-                .collect::<TCResult<Vec<_>>>()?;
-            Ok(Value::Tuple(values))
-        }
-        Scalar::Map(_) => Err(bad_request!("expected a value, not a map")),
-        Scalar::Ref(_) => Err(bad_request!("expected a value, not a reference")),
-        Scalar::Op(_) => Err(bad_request!("expected a value, not an op")),
-    }
-}
 
 // ─── SchemaHandler ─────────────────────────────────────────────────────
 
@@ -242,7 +207,7 @@ where
     ) -> TCResult<GetFut<'_, Resp>> {
         let txn_id = txn.id();
         let table = self.table.clone();
-        let value = scalar_to_value(request)?;
+        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
             let kor = KeyOrRange::try_from_value(&table, value)?;
             match kor {
@@ -272,8 +237,8 @@ where
         let txn_id = txn.id();
         let table = self.table.clone();
         let mut params = request;
-        let key_value = scalar_to_value(params.require("key")?)?;
-        let value_value = scalar_to_value(params.require("value")?)?;
+        let key_value: Value = params.require("key")?.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+        let value_value: Value = params.require("value")?.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
 
         Ok(Box::pin(async move {
             let kor = KeyOrRange::try_from_value(&table, key_value)?;
@@ -283,11 +248,11 @@ where
                     table
                         .update(txn_id, Range::default(), values)
                         .await
-                        .map_err(txn_err)
+                        .map_err(TCError::from)
                 }
                 KeyOrRange::Range(range) => {
                     let values = value_map_from_value(value_value)?;
-                    table.update(txn_id, range, values).await.map_err(txn_err)
+                    table.update(txn_id, range, values).await.map_err(TCError::from)
                 }
                 KeyOrRange::Key(key) => {
                     let values = if let Value::Tuple(tuple) = value_value {
@@ -295,7 +260,7 @@ where
                     } else {
                         vec![value_value]
                     };
-                    table.upsert_row(txn_id, key, values).await.map_err(txn_err)
+                    table.upsert_row(txn_id, key, values).await.map_err(TCError::from)
                 }
             }
         }))
@@ -307,7 +272,7 @@ where
         request: Scalar,
     ) -> TCResult<GetFut<'_, Resp>> {
         let table = self.table.clone();
-        let value = scalar_to_value(request)?;
+        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
             let range = cast_into_range(&table, value)?;
             let slice = table.slice(range, &[], false);
@@ -324,7 +289,7 @@ where
     ) -> TCResult<PutFut<'_>> {
         let txn_id = txn.id();
         let table = self.table.clone();
-        let value = scalar_to_value(request)?;
+        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
             let kor = KeyOrRange::try_from_value(&table, value)?;
             match kor {
@@ -332,13 +297,13 @@ where
                     table
                         .truncate(txn_id, Range::default())
                         .await
-                        .map_err(txn_err)
+                        .map_err(TCError::from)
                 }
                 KeyOrRange::Key(key) => {
-                    table.delete_row(txn_id, key).await.map_err(txn_err)
+                    table.delete_row(txn_id, key).await.map_err(TCError::from)
                 }
                 KeyOrRange::Range(range) => {
-                    table.truncate(txn_id, range).await.map_err(txn_err)
+                    table.truncate(txn_id, range).await.map_err(TCError::from)
                 }
             }
         }))
@@ -356,7 +321,7 @@ where
     ) -> TCResult<GetFut<'_, Resp>> {
         let txn_id = txn.id();
         let table = self.table.clone();
-        let value = scalar_to_value(request)?;
+        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
             let kor = KeyOrRange::try_from_value(&table, value)?;
             let filled = match kor {
@@ -416,7 +381,7 @@ where
     ) -> TCResult<GetFut<'_, Resp>> {
         let txn_id = txn.id();
         let table = self.table.clone();
-        let value = scalar_to_value(request)?;
+        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
             let kor = KeyOrRange::try_from_value(&table, value)?;
             let count: u64 = match kor {
@@ -472,7 +437,7 @@ where
         request: Scalar,
     ) -> TCResult<GetFut<'_, Resp>> {
         let table = self.table.clone();
-        let value = scalar_to_value(request)?;
+        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
             let limit = match value {
                 Value::Number(n) => u64::cast_from(n),
@@ -524,7 +489,7 @@ where
         request: Scalar,
     ) -> TCResult<GetFut<'_, Resp>> {
         let table = self.table.clone();
-        let value = scalar_to_value(request)?;
+        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
             let (columns, reverse) = parse_order_request(value)?;
             let slice = table.order_by(&columns, reverse);
@@ -569,7 +534,7 @@ where
         request: Scalar,
     ) -> TCResult<GetFut<'_, Resp>> {
         let table = self.table.clone();
-        let value = scalar_to_value(request)?;
+        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
             let columns = parse_column_list(value)?;
             let selection = table.select(&columns);
@@ -613,7 +578,7 @@ where
         _txn: &dyn Transaction,
         request: Scalar,
     ) -> TCResult<GetFut<'_, Resp>> {
-        let value = scalar_to_value(request)?;
+        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         if value != Value::None {
             return Err(bad_request!("this route takes no parameters"));
         }
@@ -662,7 +627,7 @@ where
     ) -> TCResult<GetFut<'_, Resp>> {
         let txn_id = txn.id();
         let root = self.root.clone();
-        let value = scalar_to_value(request)?;
+        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
             let schema = TableSchema::try_from_value(value)?;
             let table = create_table(&root, txn_id, schema).await?;
@@ -701,7 +666,7 @@ where
     ) -> TCResult<GetFut<'_, Resp>> {
         let txn_id = txn.id();
         let root = self.root.clone();
-        let schema_value = scalar_to_value(request.require("schema")?)?;
+        let schema_value: Value = request.require("schema")?.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         let source_value = request.optional("source")?;
         request.expect_empty()?;
 
@@ -710,7 +675,7 @@ where
             let table = create_table(&root, txn_id, schema).await?;
 
             if let Some(source_scalar) = source_value {
-                let source_value = scalar_to_value(source_scalar)?;
+                let source_value = source_scalar.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
                 copy_inline_rows(&table, txn_id, source_value).await?;
             }
 
