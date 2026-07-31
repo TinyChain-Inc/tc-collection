@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::ops::Bound;
 
 use b_table::{ColumnRange, IndexSchema, Range};
+use safecast::TryCastInto;
 use tc_error::{bad_request, not_found, TCResult};
 use tc_ir::Id;
 use tc_value::Value;
@@ -102,14 +103,8 @@ pub(crate) fn cast_into_range(
 
         let col_range = match &pair[1] {
             Value::Tuple(bounds) if bounds.len() == 2 => {
-                let lower = match &bounds[0] {
-                    Value::None => Bound::Unbounded,
-                    other => Bound::Included(other.clone()),
-                };
-                let upper = match &bounds[1] {
-                    Value::None => Bound::Unbounded,
-                    other => Bound::Included(other.clone()),
-                };
+                let lower: Bound<Value> = bounds[0].clone().try_cast_into(|_| ()).unwrap_or(Bound::Unbounded);
+                let upper: Bound<Value> = bounds[1].clone().try_cast_into(|_| ()).unwrap_or(Bound::Unbounded);
                 ColumnRange::In((lower, upper))
             }
             _ => ColumnRange::Eq(pair[1].clone()),
