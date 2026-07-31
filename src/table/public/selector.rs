@@ -121,29 +121,3 @@ fn parse_bound(value: &Value) -> Bound<Value> {
         other => Bound::Included(other.clone()),
     }
 }
-
-/// Return the primary column names as a `Value::Tuple` of strings.
-pub(crate) fn column_schema(table: &PersistentTable) -> Value {
-    let columns = table
-        .schema()
-        .columns()
-        .map(|c| Value::String(c.to_string()))
-        .collect();
-    Value::Tuple(columns)
-}
-
-/// Return the key column names as a `Value::Tuple` of strings.
-pub(crate) fn key_columns_value(table: &PersistentTable) -> Value {
-    let key = table
-        .schema()
-        .key()
-        .iter()
-        .map(|c| Value::String(c.to_string()))
-        .collect();
-    Value::Tuple(key)
-}
-
-/// Return the key column names (alias of [`key_columns_value`]).
-pub(crate) fn key_names_value(table: &PersistentTable) -> Value {
-    key_columns_value(table)
-}

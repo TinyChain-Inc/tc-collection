@@ -1,16 +1,15 @@
 //! Route-level tests for table public API handlers.
 
-use super::response::TableResponse;
-use super::{TableRouter, TableStatic};
+use super::{route, Static};
 use super::selector::KeyOrRange;
 use crate::btree::{StorageConfig, PersistentFile};
-use crate::table::{Column, TableSchema};
+use crate::table::{Column, PersistentTable, TableSchema};
 use crate::Collection;
 use freqfs::Cache;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use tc_ir::{Claim, HandleDelete, HandleGet, HandlePost, HandlePut, NetworkTime, Route, Scalar, Transaction, TxnId};
+use tc_ir::{Claim, Map, NetworkTime, Scalar, Transaction, TxnId};
 use tc_value::ValueType;
 use umask::Mode;
 
@@ -20,6 +19,46 @@ fn segment(name: &str) -> pathlink::PathSegment {
 
 fn tx(nonce: u16) -> TxnId {
     TxnId::from_parts(NetworkTime::from_nanos(1), nonce)
+}
+
+/// Test response type — mirrors v1's `State: From<Collection> + From<Value>
+/// + From<u64>`.
+#[derive(Clone, Debug)]
+enum State {
+    Collection(Collection),
+    Value(tc_value::Value),
+    Count(u64),
+}
+
+impl PartialEq for State {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Count(a), Self::Count(b)) => a == b,
+            (Self::Value(a), Self::Value(b)) => a == b,
+            (Self::Collection(a), Self::Collection(b)) => {
+                matches!(a, Collection::Table(_)) && matches!(b, Collection::Table(_))
+            }
+            _ => false,
+        }
+    }
+}
+
+impl From<Collection> for State {
+    fn from(c: Collection) -> Self {
+        Self::Collection(c)
+    }
+}
+
+impl From<tc_value::Value> for State {
+    fn from(v: tc_value::Value) -> Self {
+        Self::Value(v)
+    }
+}
+
+impl From<u64> for State {
+    fn from(n: u64) -> Self {
+        Self::Count(n)
+    }
 }
 
 struct MockTxn {
@@ -120,20 +159,21 @@ fn schema_value() -> tc_value::Value {
     simple_schema().to_value()
 }
 
-async fn make_table_with_data() -> crate::table::PersistentTable {
+async fn make_table_with_data() -> PersistentTable {
+    use tc_value::Value;
     let root = init_root("route-tests").await;
     let (persistent, txn) = load_roots(&root);
-    let table = crate::table::PersistentTable::new(persistent, txn, simple_schema());
+    let table = PersistentTable::new(persistent, txn, simple_schema());
     table
-        .upsert_row(tx(10), vec![tc_value::Value::from(1_u64)], vec![tc_value::Value::from("alpha")])
+        .upsert_row(tx(10), vec![Value::from(1_u64)], vec![Value::from("alpha")])
         .await
         .expect("upsert 1");
     table
-        .upsert_row(tx(10), vec![tc_value::Value::from(2_u64)], vec![tc_value::Value::from("beta")])
+        .upsert_row(tx(10), vec![Value::from(2_u64)], vec![Value::from("beta")])
         .await
         .expect("upsert 2");
     table
-        .upsert_row(tx(10), vec![tc_value::Value::from(3_u64)], vec![tc_value::Value::from("gamma")])
+        .upsert_row(tx(10), vec![Value::from(3_u64)], vec![Value::from("gamma")])
         .await
         .expect("upsert 3");
     table.commit(tx(10)).expect("commit");
@@ -144,40 +184,21 @@ async fn make_table_with_data() -> crate::table::PersistentTable {
 // ── Route resolution ──────────────────────────────────────────
 
 #[test]
-fn table_router_resolves_all_routes() {
-    run_async_test("table_router_resolves_all_routes", || {
+fn route_resolves_all_paths() {
+    run_async_test("route_resolves_all_paths", || {
         Box::pin(async {
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table);
-
-            assert!(router.route(&[]).is_some(), "root route");
-            assert!(router.route(&[segment("columns")]).is_some());
-            assert!(router.route(&[segment("contains")]).is_some());
-            assert!(router.route(&[segment("count")]).is_some());
-            assert!(router.route(&[segment("key_columns")]).is_some());
-            assert!(router.route(&[segment("key_names")]).is_some());
-            assert!(router.route(&[segment("limit")]).is_some());
-            assert!(router.route(&[segment("order")]).is_some());
-            assert!(router.route(&[segment("select")]).is_some());
-
-            assert!(router.route(&[segment("unknown")]).is_none(), "unknown route");
-            assert!(router.route(&[segment("count"), segment("extra")]).is_none(), "too deep");
-        })
-    });
-}
-
-#[test]
-fn collection_router_resolves_schema_route() {
-    run_async_test("collection_router_resolves_schema_route", || {
-        Box::pin(async {
-            let table = make_table_with_data().await;
-            let coll = Collection::Table(table);
-            let router = coll.router();
-
-            assert!(router.route(&[]).is_some(), "root");
-            assert!(router.route(&[segment("schema")]).is_some(), "schema route");
-            assert!(router.route(&[segment("count")]).is_some(), "count route");
-            assert!(router.route(&[segment("unknown")]).is_none(), "unknown");
+            assert!(route::<State>(&table, &[]).is_some(), "root");
+            assert!(route::<State>(&table, &[segment("columns")]).is_some());
+            assert!(route::<State>(&table, &[segment("contains")]).is_some());
+            assert!(route::<State>(&table, &[segment("count")]).is_some());
+            assert!(route::<State>(&table, &[segment("key_columns")]).is_some());
+            assert!(route::<State>(&table, &[segment("key_names")]).is_some());
+            assert!(route::<State>(&table, &[segment("limit")]).is_some());
+            assert!(route::<State>(&table, &[segment("order")]).is_some());
+            assert!(route::<State>(&table, &[segment("select")]).is_some());
+            assert!(route::<State>(&table, &[segment("unknown")]).is_none());
+            assert!(route::<State>(&table, &[segment("count"), segment("x")]).is_none());
         })
     });
 }
@@ -196,36 +217,34 @@ fn schema_roundtrip() {
 // ── GET handlers ──────────────────────────────────────────────
 
 #[test]
-fn get_table_all_returns_table() {
-    run_async_test("get_table_all_returns_table", || {
+fn get_table_all() {
+    run_async_test("get_table_all", || {
         Box::pin(async {
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table);
-            let handler = router.route(&[]).expect("root route");
+            let handler = route::<State>(&table, &[]).expect("root");
             let txn = MockTxn::new(20);
             let fut = handler
                 .get(&txn, Scalar::Value(tc_value::Value::None))
-                .expect("get all");
+                .expect("get");
             let resp = fut.await.expect("response");
-            assert!(matches!(resp, TableResponse::Table(_)));
+            assert!(matches!(resp, State::Collection(_)));
         })
     });
 }
 
 #[test]
-fn get_table_key_returns_row() {
-    run_async_test("get_table_key_returns_row", || {
+fn get_table_key() {
+    run_async_test("get_table_key", || {
         Box::pin(async {
             use tc_value::Value;
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table);
-            let handler = router.route(&[]).expect("root route");
+            let handler = route::<State>(&table, &[]).expect("root");
             let txn = MockTxn::new(20);
             let req = Scalar::Value(Value::Tuple(vec![Value::from(2_u64)]));
             let fut = handler.get(&txn, req).expect("get key");
             let resp = fut.await.expect("response");
             match resp {
-                TableResponse::Value(Value::Tuple(row)) => {
+                State::Value(Value::Tuple(row)) => {
                     assert_eq!(row, vec![Value::from(2_u64), Value::from("beta")]);
                 }
                 other => panic!("expected row value, got {other:?}"),
@@ -240,16 +259,14 @@ fn get_columns() {
         Box::pin(async {
             use tc_value::Value;
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table);
-            let path = [segment("columns")];
-            let handler = router.route(&path).expect("columns route");
+            let handler = route::<State>(&table, &[segment("columns")]).expect("columns");
             let txn = MockTxn::new(20);
             let fut = handler
                 .get(&txn, Scalar::Value(Value::None))
-                .expect("get columns");
+                .expect("get");
             let resp = fut.await.expect("response");
             match resp {
-                TableResponse::Value(Value::Tuple(cols)) => {
+                State::Value(Value::Tuple(cols)) => {
                     assert_eq!(cols.len(), 2);
                     assert_eq!(cols[0], Value::from("id"));
                     assert_eq!(cols[1], Value::from("label"));
@@ -264,23 +281,14 @@ fn get_columns() {
 fn get_count_all() {
     run_async_test("get_count_all", || {
         Box::pin(async {
-            use safecast::CastFrom;
-            use tc_value::Value;
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table);
-            let path = [segment("count")];
-            let handler = router.route(&path).expect("count route");
+            let handler = route::<State>(&table, &[segment("count")]).expect("count");
             let txn = MockTxn::new(20);
             let fut = handler
-                .get(&txn, Scalar::Value(Value::None))
-                .expect("get count");
+                .get(&txn, Scalar::Value(tc_value::Value::None))
+                .expect("get");
             let resp = fut.await.expect("response");
-            match resp {
-                TableResponse::Value(Value::Number(n)) => {
-                    assert_eq!(u64::cast_from(n), 3);
-                }
-                other => panic!("expected count value, got {other:?}"),
-            }
+            assert_eq!(resp, State::Count(3));
         })
     });
 }
@@ -289,22 +297,30 @@ fn get_count_all() {
 fn get_count_key() {
     run_async_test("get_count_key", || {
         Box::pin(async {
-            use safecast::CastFrom;
             use tc_value::Value;
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table);
-            let path = [segment("count")];
-            let handler = router.route(&path).expect("count route");
+            let handler = route::<State>(&table, &[segment("count")]).expect("count");
             let txn = MockTxn::new(20);
             let req = Scalar::Value(Value::Tuple(vec![Value::from(2_u64)]));
             let fut = handler.get(&txn, req).expect("get count key");
             let resp = fut.await.expect("response");
-            match resp {
-                TableResponse::Value(Value::Number(n)) => {
-                    assert_eq!(u64::cast_from(n), 1);
-                }
-                other => panic!("expected count value, got {other:?}"),
-            }
+            assert_eq!(resp, State::Count(1));
+        })
+    });
+}
+
+#[test]
+fn get_count_missing_key() {
+    run_async_test("get_count_missing_key", || {
+        Box::pin(async {
+            use tc_value::Value;
+            let table = make_table_with_data().await;
+            let handler = route::<State>(&table, &[segment("count")]).expect("count");
+            let txn = MockTxn::new(20);
+            let req = Scalar::Value(Value::Tuple(vec![Value::from(999_u64)]));
+            let fut = handler.get(&txn, req).expect("get count key");
+            let resp = fut.await.expect("response");
+            assert_eq!(resp, State::Count(0));
         })
     });
 }
@@ -316,18 +332,34 @@ fn get_contains_key() {
             use safecast::CastFrom;
             use tc_value::Value;
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table);
-            let path = [segment("contains")];
-            let handler = router.route(&path).expect("contains route");
+            let handler = route::<State>(&table, &[segment("contains")]).expect("contains");
             let txn = MockTxn::new(20);
             let req = Scalar::Value(Value::Tuple(vec![Value::from(2_u64)]));
             let fut = handler.get(&txn, req).expect("get contains");
             let resp = fut.await.expect("response");
             match resp {
-                TableResponse::Value(Value::Number(n)) => {
-                    assert!(bool::cast_from(n));
-                }
-                other => panic!("expected bool value, got {other:?}"),
+                State::Value(Value::Number(n)) => assert!(bool::cast_from(n)),
+                other => panic!("expected bool, got {other:?}"),
+            }
+        })
+    });
+}
+
+#[test]
+fn get_contains_missing() {
+    run_async_test("get_contains_missing", || {
+        Box::pin(async {
+            use safecast::CastFrom;
+            use tc_value::Value;
+            let table = make_table_with_data().await;
+            let handler = route::<State>(&table, &[segment("contains")]).expect("contains");
+            let txn = MockTxn::new(20);
+            let req = Scalar::Value(Value::Tuple(vec![Value::from(999_u64)]));
+            let fut = handler.get(&txn, req).expect("get contains");
+            let resp = fut.await.expect("response");
+            match resp {
+                State::Value(Value::Number(n)) => assert!(!bool::cast_from(n)),
+                other => panic!("expected bool, got {other:?}"),
             }
         })
     });
@@ -339,16 +371,14 @@ fn get_key_columns() {
         Box::pin(async {
             use tc_value::Value;
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table);
-            let path = [segment("key_columns")];
-            let handler = router.route(&path).expect("key_columns route");
+            let handler = route::<State>(&table, &[segment("key_columns")]).expect("key_columns");
             let txn = MockTxn::new(20);
             let fut = handler
                 .get(&txn, Scalar::Value(Value::None))
-                .expect("get key_columns");
+                .expect("get");
             let resp = fut.await.expect("response");
             match resp {
-                TableResponse::Value(Value::Tuple(cols)) => {
+                State::Value(Value::Tuple(cols)) => {
                     assert_eq!(cols.len(), 1);
                     assert_eq!(cols[0], Value::from("id"));
                 }
@@ -364,14 +394,12 @@ fn get_limit() {
         Box::pin(async {
             use tc_value::Value;
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table);
-            let path = [segment("limit")];
-            let handler = router.route(&path).expect("limit route");
+            let handler = route::<State>(&table, &[segment("limit")]).expect("limit");
             let txn = MockTxn::new(20);
             let req = Scalar::Value(Value::from(2_u64));
             let fut = handler.get(&txn, req).expect("get limit");
             let resp = fut.await.expect("response");
-            assert!(matches!(resp, TableResponse::Limited(_)));
+            assert!(matches!(resp, State::Collection(_)));
         })
     });
 }
@@ -382,14 +410,12 @@ fn get_order() {
         Box::pin(async {
             use tc_value::Value;
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table);
-            let path = [segment("order")];
-            let handler = router.route(&path).expect("order route");
+            let handler = route::<State>(&table, &[segment("order")]).expect("order");
             let txn = MockTxn::new(20);
             let req = Scalar::Value(Value::Tuple(vec![Value::from("id")]));
             let fut = handler.get(&txn, req).expect("get order");
             let resp = fut.await.expect("response");
-            assert!(matches!(resp, TableResponse::Slice(_)));
+            assert!(matches!(resp, State::Collection(_)));
         })
     });
 }
@@ -400,14 +426,12 @@ fn get_select() {
         Box::pin(async {
             use tc_value::Value;
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table);
-            let path = [segment("select")];
-            let handler = router.route(&path).expect("select route");
+            let handler = route::<State>(&table, &[segment("select")]).expect("select");
             let txn = MockTxn::new(20);
             let req = Scalar::Value(Value::Tuple(vec![Value::from("label")]));
             let fut = handler.get(&txn, req).expect("get select");
             let resp = fut.await.expect("response");
-            assert!(matches!(resp, TableResponse::Selection(_)));
+            assert!(matches!(resp, State::Collection(_)));
         })
     });
 }
@@ -420,11 +444,10 @@ fn put_upsert_via_key() {
         Box::pin(async {
             use tc_value::Value;
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table.clone());
-            let handler = router.route(&[]).expect("root route");
+            let handler = route::<State>(&table, &[]).expect("root");
             let txn = MockTxn::new(30);
 
-            let mut params = tc_ir::Map::new();
+            let mut params = Map::new();
             params.insert(
                 "key".parse().expect("Id"),
                 Scalar::Value(Value::Tuple(vec![Value::from(2_u64)])),
@@ -434,7 +457,7 @@ fn put_upsert_via_key() {
                 Scalar::Value(Value::Tuple(vec![Value::from("updated")])),
             );
 
-            let fut = handler.put(&txn, params).expect("put upsert");
+            let fut = handler.put(&txn, params).expect("put");
             fut.await.expect("upsert ok");
 
             let row = table.read_row(tx(30), &[Value::from(2_u64)]).await;
@@ -455,11 +478,10 @@ fn put_update_all() {
         Box::pin(async {
             use tc_value::Value;
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table.clone());
-            let handler = router.route(&[]).expect("root route");
+            let handler = route::<State>(&table, &[]).expect("root");
             let txn = MockTxn::new(30);
 
-            let mut params = tc_ir::Map::new();
+            let mut params = Map::new();
             params.insert("key".parse().expect("Id"), Scalar::Value(Value::None));
             params.insert(
                 "value".parse().expect("Id"),
@@ -468,7 +490,7 @@ fn put_update_all() {
                 ])),
             );
 
-            let fut = handler.put(&txn, params).expect("put update all");
+            let fut = handler.put(&txn, params).expect("put update");
             fut.await.expect("update ok");
 
             for id in [1_u64, 2_u64, 3_u64] {
@@ -489,8 +511,7 @@ fn put_update_range() {
         Box::pin(async {
             use tc_value::Value;
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table.clone());
-            let handler = router.route(&[]).expect("root route");
+            let handler = route::<State>(&table, &[]).expect("root");
             let txn = MockTxn::new(30);
 
             let key_selector = Value::Tuple(vec![
@@ -500,7 +521,7 @@ fn put_update_range() {
                 ]),
             ]);
 
-            let mut params = tc_ir::Map::new();
+            let mut params = Map::new();
             params.insert("key".parse().expect("Id"), Scalar::Value(key_selector));
             params.insert(
                 "value".parse().expect("Id"),
@@ -542,10 +563,7 @@ fn update_direct_method() {
             let table = make_table_with_data().await;
 
             let mut updates = HashMap::new();
-            updates.insert(
-                "label".parse().expect("Id"),
-                Value::from("method_updated"),
-            );
+            updates.insert("label".parse().expect("Id"), Value::from("method_updated"));
 
             table
                 .update(tx(30), b_table::Range::default(), updates)
@@ -571,8 +589,7 @@ fn post_slice() {
         Box::pin(async {
             use tc_value::Value;
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table);
-            let handler = router.route(&[]).expect("root route");
+            let handler = route::<State>(&table, &[]).expect("root");
             let txn = MockTxn::new(20);
 
             let req = Scalar::Value(Value::Tuple(vec![
@@ -582,9 +599,9 @@ fn post_slice() {
                 ]),
             ]));
 
-            let fut = handler.post(&txn, req).expect("post slice");
+            let fut = handler.post(&txn, req).expect("post");
             let resp = fut.await.expect("response");
-            assert!(matches!(resp, TableResponse::Slice(_)));
+            assert!(matches!(resp, State::Collection(_)));
         })
     });
 }
@@ -597,12 +614,11 @@ fn delete_key() {
         Box::pin(async {
             use tc_value::Value;
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table.clone());
-            let handler = router.route(&[]).expect("root route");
+            let handler = route::<State>(&table, &[]).expect("root");
             let txn = MockTxn::new(30);
 
             let req = Scalar::Value(Value::Tuple(vec![Value::from(2_u64)]));
-            let fut = handler.delete(&txn, req).expect("delete key");
+            let fut = handler.delete(&txn, req).expect("delete");
             fut.await.expect("delete ok");
 
             let row = table.read_row(tx(30), &[Value::from(2_u64)]).await;
@@ -617,8 +633,7 @@ fn delete_all_truncates() {
         Box::pin(async {
             use tc_value::Value;
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table.clone());
-            let handler = router.route(&[]).expect("root route");
+            let handler = route::<State>(&table, &[]).expect("root");
             let txn = MockTxn::new(30);
 
             let req = Scalar::Value(Value::None);
@@ -630,52 +645,24 @@ fn delete_all_truncates() {
     });
 }
 
-// ── Collection schema route ───────────────────────────────────
-
-#[test]
-fn collection_schema_route() {
-    run_async_test("collection_schema_route", || {
-        Box::pin(async {
-            use tc_value::Value;
-            let table = make_table_with_data().await;
-            let coll = Collection::Table(table);
-            let router = coll.router();
-            let path = [segment("schema")];
-            let handler = router.route(&path).expect("schema route");
-            let txn = MockTxn::new(20);
-
-            let fut = handler
-                .get(&txn, Scalar::Value(Value::None))
-                .expect("get schema");
-            let resp = fut.await.expect("response");
-            match resp {
-                TableResponse::Value(Value::Tuple(outer)) => {
-                    assert_eq!(outer.len(), 2);
-                }
-                other => panic!("expected schema value, got {other:?}"),
-            }
-        })
-    });
-}
-
 // ── Static routes: create ─────────────────────────────────────
 
 #[test]
-fn static_create_route() {
-    run_async_test("static_create_route", || {
+fn static_create() {
+    run_async_test("static_create", || {
         Box::pin(async {
             let root = init_root("static-create").await;
             let cache = Cache::<PersistentFile>::new(16 * 1024 * 1024, None);
             let dir = Arc::clone(&cache).load(root).expect("load root");
 
-            let stat = TableStatic::new(dir);
-            let handler = stat.route(&[]).expect("create route");
+            let stat = Static::new(dir);
+            let handler = stat.route::<State>(&[]).expect("create route");
             let txn = MockTxn::new(40);
 
             let req = Scalar::Value(schema_value());
             let fut = handler.get(&txn, req).expect("create table");
             let resp = fut.await.expect("response");
-            assert!(matches!(resp, TableResponse::Table(_)));
+            assert!(matches!(resp, State::Collection(_)));
         })
     });
 }
@@ -691,9 +678,9 @@ fn static_copy_from_inline_rows() {
             let cache = Cache::<PersistentFile>::new(16 * 1024 * 1024, None);
             let dir = Arc::clone(&cache).load(root).expect("load root");
 
-            let stat = TableStatic::new(dir);
+            let stat = Static::new(dir);
             let path = [segment("copy_from")];
-            let handler = stat.route(&path).expect("copy_from route");
+            let handler = stat.route::<State>(&path).expect("copy_from route");
             let txn = MockTxn::new(40);
 
             let source_rows = Value::Tuple(vec![
@@ -701,7 +688,7 @@ fn static_copy_from_inline_rows() {
                 Value::Tuple(vec![Value::from(20_u64), Value::from("row2")]),
             ]);
 
-            let mut params = tc_ir::Map::new();
+            let mut params = Map::new();
             params.insert("schema".parse().expect("Id"), Scalar::Value(schema_value()));
             params.insert("source".parse().expect("Id"), Scalar::Value(source_rows));
 
@@ -709,16 +696,20 @@ fn static_copy_from_inline_rows() {
             let resp = fut.await.expect("response");
 
             match resp {
-                TableResponse::Table(table) => {
-                    assert_eq!(table.count(tx(40)).await, 2);
-                    let row = table.read_row(tx(40), &[Value::from(10_u64)]).await;
-                    assert!(row.is_some());
-                    assert_eq!(
-                        row.unwrap().as_ref(),
-                        &[Value::from(10_u64), Value::from("row1")]
-                    );
+                State::Collection(Collection::Table(table)) => {
+                    if let crate::table::Table::File(table) = table {
+                        assert_eq!(table.count(tx(40)).await, 2);
+                        let row = table.read_row(tx(40), &[Value::from(10_u64)]).await;
+                        assert!(row.is_some());
+                        assert_eq!(
+                            row.unwrap().as_ref(),
+                            &[Value::from(10_u64), Value::from("row1")]
+                        );
+                    } else {
+                        panic!("expected File table");
+                    }
                 }
-                other => panic!("expected table, got {other:?}"),
+                other => panic!("expected collection, got {other:?}"),
             }
         })
     });
@@ -733,12 +724,11 @@ fn copy_from_direct_method() {
 
             let root = init_root("copy-direct").await;
             let (persistent, txn) = load_roots(&root);
-            let dest = crate::table::PersistentTable::new(persistent, txn, simple_schema());
+            let dest = PersistentTable::new(persistent, txn, simple_schema());
 
             dest.copy_from(tx(10), &source).await.expect("copy");
 
             assert_eq!(dest.count(tx(10)).await, 3);
-
             let row = dest.read_row(tx(10), &[Value::from(2_u64)]).await;
             assert!(row.is_some());
             assert_eq!(
@@ -769,11 +759,8 @@ fn key_or_range_key() {
         Box::pin(async {
             use tc_value::Value;
             let table = make_table_with_data().await;
-            let kor = KeyOrRange::try_from_value(
-                &table,
-                Value::Tuple(vec![Value::from(1_u64)]),
-            )
-            .expect("parse key");
+            let kor = KeyOrRange::try_from_value(&table, Value::Tuple(vec![Value::from(1_u64)]))
+                .expect("parse key");
             match kor {
                 KeyOrRange::Key(key) => assert_eq!(key, vec![Value::from(1_u64)]),
                 other => panic!("expected Key, got {other:?}"),
@@ -803,32 +790,25 @@ fn key_or_range_range() {
 // ── Method-not-supported ──────────────────────────────────────
 
 #[test]
-fn put_on_count_route_rejected() {
-    run_async_test("put_on_count_route_rejected", || {
+fn put_on_count_rejected() {
+    run_async_test("put_on_count_rejected", || {
         Box::pin(async {
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table);
-            let path = [segment("count")];
-            let handler = router.route(&path).expect("count route");
+            let handler = route::<State>(&table, &[segment("count")]).expect("count");
             let txn = MockTxn::new(20);
-
-            let params = tc_ir::Map::new();
-            let result = handler.put(&txn, params);
+            let result = handler.put(&txn, Map::new());
             assert!(result.is_err());
         })
     });
 }
 
 #[test]
-fn delete_on_columns_route_rejected() {
-    run_async_test("delete_on_columns_route_rejected", || {
+fn delete_on_columns_rejected() {
+    run_async_test("delete_on_columns_rejected", || {
         Box::pin(async {
             let table = make_table_with_data().await;
-            let router = TableRouter::new(table);
-            let path = [segment("columns")];
-            let handler = router.route(&path).expect("columns route");
+            let handler = route::<State>(&table, &[segment("columns")]).expect("columns");
             let txn = MockTxn::new(20);
-
             let result = handler.delete(&txn, Scalar::default());
             assert!(result.is_err());
         })

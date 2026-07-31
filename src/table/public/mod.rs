@@ -1,176 +1,197 @@
 //! Public API route handlers for a transactional [`PersistentTable`].
 //!
-//! Ports the v1 `table/public.rs` routing logic onto the v2 `tc-ir`
-//! `Route`/`HandleGet`/`HandlePut`/`HandlePost`/`HandleDelete` traits.
+//! Ports the v1 `table/public.rs` routing logic.  Each route is a separate
+//! handler **struct** (not an enum variant) with a `From` impl, following
+//! the v1 pattern.  Handlers are generic over the response type `Resp`,
+//! which must support `From<Collection>` and `From<Value>` (and `From<u64>`
+//! for `CountHandler`) — this mirrors v1's `State: From<Collection> + From<Value>
+//! + From<u64>` bounds.
+//!
+//! The host calls [`route`] to construct the appropriate handler for a given
+//! path, then invokes the verb trait method.  No `Route` trait impl or router
+//! struct is needed — the host owns routing, consistent with `AGENTS.md`
+//! ("keep routing logic shard-local and lean").
 //!
 //! ## Module layout
 //!
-//! - [`handler`] — `TableRoute` enum and verb trait implementations
+//! - [`handler`] — individual handler structs + verb trait impls
 //! - [`selector`] — `KeyOrRange` and `cast_into_range` selector parsing
-//! - [`response`] — `TableResponse` enum
-//! - [`static_route`] — `TableStatic`/`TableStaticRoute` for `create`/`copy_from`
-//! - [`router`] — `TableRouter` (per-instance) and `TableStatic` (class-level)
-//!
-//! ## Design
-//!
-//! The v2 `Route` trait returns `Option<&Self::Handler>` (a borrowed handler),
-//! unlike v1 which returned `Box<dyn Handler>`.  [`TableRouter`] therefore
-//! pre-constructs all route handler instances (one per known sub-route) when
-//! it is built from a [`PersistentTable`].  Because `PersistentTable` is
-//! `Arc`-based and cheap to clone, this is inexpensive.
-//!
-//! All handlers use [`Scalar`] as the IR request envelope and [`TableResponse`]
-//! as the response type, per `AGENTS.md` ("express handlers in terms of the
-//! shared IR envelopes").
 
-mod handler;
-mod response;
-mod selector;
-mod static_route;
-
-pub use handler::{scalar_to_value, TableRoute};
-pub use response::TableResponse;
-pub use static_route::TableStaticRoute;
-
-use std::fmt;
+pub mod handler;
+pub mod selector;
 
 use freqfs::DirLock;
-use pathlink::PathSegment;
-use tc_ir::Route;
 
-use super::file::PersistentTable;
 use crate::btree::PersistentFile;
+use crate::table::PersistentTable;
 
-// ─── TableRouter (per-instance) ────────────────────────────────────────
+pub use handler::{
+    ContainsHandler, CopyHandler, CountHandler, CreateHandler, LimitHandler, OrderHandler,
+    SelectHandler, TableHandler,
+};
 
-/// Router for a single [`PersistentTable`] instance.
+/// Construct the appropriate handler for the given table and path.
 ///
-/// Pre-constructs all sub-route handlers when built from a table.  Implements
-/// [`Route`] to resolve a path to the appropriate [`TableRoute`] handler.
+/// Returns `None` if the path does not match any known route.
+///
+/// This is the v2 analogue of v1's `route` function in `table/public.rs`.
+/// The host calls this to obtain a handler, then invokes the verb trait
+/// method (`get`, `put`, `post`, or `delete`).
 ///
 /// Route table (parity port §4):
 ///
 /// | Path | Handler |
 /// |------|---------|
-/// | `[]` | `Table` (read/slice/upsert/update/truncate/delete) |
-/// | `["columns"]` | `Columns` |
-/// | `["contains"]` | `Contains` |
-/// | `["count"]` | `Count` |
-/// | `["key_columns"]` | `KeyColumns` |
-/// | `["key_names"]` | `KeyNames` |
-/// | `["limit"]` | `Limit` |
-/// | `["order"]` | `Order` |
-/// | `["select"]` | `Select` |
-pub struct TableRouter {
-    pub(crate) table: TableRoute,
-    pub(crate) columns: TableRoute,
-    pub(crate) contains: TableRoute,
-    pub(crate) count: TableRoute,
-    pub(crate) key_columns: TableRoute,
-    pub(crate) key_names: TableRoute,
-    pub(crate) limit: TableRoute,
-    pub(crate) order: TableRoute,
-    pub(crate) select: TableRoute,
-}
-
-impl TableRouter {
-    /// Build a router from a [`PersistentTable`].
-    ///
-    /// The table is cloned (cheaply — it is `Arc`-based) into each handler.
-    pub fn new(table: PersistentTable) -> Self {
-        Self {
-            table: TableRoute::Table(table.clone()),
-            columns: TableRoute::Columns(table.clone()),
-            contains: TableRoute::Contains(table.clone()),
-            count: TableRoute::Count(table.clone()),
-            key_columns: TableRoute::KeyColumns(table.clone()),
-            key_names: TableRoute::KeyNames(table.clone()),
-            limit: TableRoute::Limit(table.clone()),
-            order: TableRoute::Order(table.clone()),
-            select: TableRoute::Select(table),
+/// | `[]` | [`TableHandler`] (read/slice/upsert/update/truncate/delete) |
+/// | `["columns"]` | [`handler::SchemaHandler`] (column names) |
+/// | `["contains"]` | [`ContainsHandler`] |
+/// | `["count"]` | [`CountHandler`] |
+/// | `["key_columns"]` | [`handler::SchemaHandler`] (key column ids) |
+/// | `["key_names"]` | [`handler::SchemaHandler`] (key column ids) |
+/// | `["limit"]` | [`LimitHandler`] |
+/// | `["order"]` | [`OrderHandler`] |
+/// | `["select"]` | [`SelectHandler`] |
+pub fn route<'a, Resp>(
+    table: &'a PersistentTable,
+    path: &[pathlink::PathSegment],
+) -> Option<Box<dyn RouteHandler<Resp> + 'a>>
+where
+    Resp: From<crate::Collection> + From<tc_value::Value> + From<u64> + Clone + Send + 'static,
+{
+    if path.is_empty() {
+        Some(Box::new(TableHandler::from(table.clone())))
+    } else if path.len() == 1 {
+        match path[0].as_str() {
+            "columns" => Some(Box::new(handler::SchemaHandler::new(
+                table.clone(),
+                handler::column_schema,
+            ))),
+            "contains" => Some(Box::new(ContainsHandler::from(table.clone()))),
+            "count" => Some(Box::new(CountHandler::from(table.clone()))),
+            "key_columns" => Some(Box::new(handler::SchemaHandler::new(
+                table.clone(),
+                handler::key_columns,
+            ))),
+            "key_names" => Some(Box::new(handler::SchemaHandler::new(
+                table.clone(),
+                handler::key_names,
+            ))),
+            "limit" => Some(Box::new(LimitHandler::from(table.clone()))),
+            "order" => Some(Box::new(OrderHandler::from(table.clone()))),
+            "select" => Some(Box::new(SelectHandler::from(table.clone()))),
+            _ => None,
         }
+    } else {
+        None
     }
 }
 
-impl fmt::Debug for TableRouter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TableRouter")
-            .field("table", &self.table)
-            .finish()
-    }
-}
-
-impl Route for TableRouter {
-    type Handler = TableRoute;
-
-    fn route<'a>(&'a self, path: &'a [PathSegment]) -> Option<&'a Self::Handler> {
-        if path.is_empty() {
-            Some(&self.table)
-        } else if path.len() == 1 {
-            match path[0].as_str() {
-                "columns" => Some(&self.columns),
-                "contains" => Some(&self.contains),
-                "count" => Some(&self.count),
-                "key_columns" => Some(&self.key_columns),
-                "key_names" => Some(&self.key_names),
-                "limit" => Some(&self.limit),
-                "order" => Some(&self.order),
-                "select" => Some(&self.select),
-                _ => None,
-            }
-        } else {
-            None
-        }
-    }
-}
-
-// ─── TableStatic (class-level: create / copy_from) ─────────────────────
-
-/// Static router for the table class routes (`create`, `copy_from`).
+/// Trait object returned by [`route`].  Each handler struct implements this
+/// via its `HandleGet`/`HandlePut`/`HandlePost`/`HandleDelete` impls.
 ///
-/// Holds the root directory under which new tables are created.
-///
-/// Route table:
-/// | Path | Handler |
-/// |------|---------|
-/// | `[]` | `Create` (GET: create a new table from a schema) |
-/// | `["copy_from"]` | `CopyFrom` (POST: create + copy rows) |
-pub struct TableStatic {
-    create: TableStaticRoute,
-    copy_from: TableStaticRoute,
+/// This is the v2 analogue of v1's `Box<dyn Handler<'a, State> + 'a>`.
+/// Unlike v1, the verb traits have associated types that make them
+/// non-object-safe, so we use a custom dispatch trait that erases the
+/// future types while preserving the request/response types.
+pub trait RouteHandler<Resp>: Send + Sync {
+    fn get(
+        &self,
+        txn: &dyn tc_ir::Transaction,
+        request: tc_ir::Scalar,
+    ) -> tc_error::TCResult<
+        std::pin::Pin<
+            Box<dyn std::future::Future<Output = tc_error::TCResult<Resp>> + Send + '_>,
+        >,
+    >;
+
+    fn put(
+        &self,
+        txn: &dyn tc_ir::Transaction,
+        request: tc_ir::Map<tc_ir::Scalar>,
+    ) -> tc_error::TCResult<
+        std::pin::Pin<
+            Box<dyn std::future::Future<Output = tc_error::TCResult<()>> + Send + '_>,
+        >,
+    >;
+
+    fn post(
+        &self,
+        txn: &dyn tc_ir::Transaction,
+        request: tc_ir::Scalar,
+    ) -> tc_error::TCResult<
+        std::pin::Pin<
+            Box<dyn std::future::Future<Output = tc_error::TCResult<Resp>> + Send + '_>,
+        >,
+    >;
+
+    fn delete(
+        &self,
+        txn: &dyn tc_ir::Transaction,
+        request: tc_ir::Scalar,
+    ) -> tc_error::TCResult<
+        std::pin::Pin<
+            Box<dyn std::future::Future<Output = tc_error::TCResult<()>> + Send + '_>,
+        >,
+    >;
 }
 
-impl TableStatic {
-    /// Build a static router with the given root directory for new tables.
+/// Static route handler for table construction.
+///
+/// Ported from v1 `Static` in `table/public.rs`:
+/// - `GET /state/collection/table` → [`CreateHandler`] (create a new table)
+/// - `POST /state/collection/table/copy_from` → [`CopyHandler`]
+pub struct Static {
+    root: DirLock<PersistentFile>,
+}
+
+impl Static {
     pub fn new(root: DirLock<PersistentFile>) -> Self {
-        Self {
-            create: TableStaticRoute::Create { root: root.clone() },
-            copy_from: TableStaticRoute::CopyFrom { root },
-        }
+        Self { root }
     }
-}
 
-impl fmt::Debug for TableStatic {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TableStatic")
-            .field("create", &self.create)
-            .field("copy_from", &self.copy_from)
-            .finish()
-    }
-}
-
-impl Route for TableStatic {
-    type Handler = TableStaticRoute;
-
-    fn route<'a>(&'a self, path: &'a [PathSegment]) -> Option<&'a Self::Handler> {
+    /// Construct the appropriate static handler for the given path.
+    ///
+    /// | Path | Handler |
+    /// |------|---------|
+    /// | `[]` | [`CreateHandler`] |
+    /// | `["copy_from"]` | [`CopyHandler`] |
+    pub fn route<Resp>(
+        &self,
+        path: &[pathlink::PathSegment],
+    ) -> Option<Box<dyn StaticRouteHandler<Resp> + '_>>
+    where
+        Resp: From<crate::Collection> + Clone + Send + 'static,
+    {
         if path.is_empty() {
-            Some(&self.create)
+            Some(Box::new(CreateHandler::new(self.root.clone())))
         } else if path.len() == 1 && path[0].as_str() == "copy_from" {
-            Some(&self.copy_from)
+            Some(Box::new(CopyHandler::new(self.root.clone())))
         } else {
             None
         }
     }
+}
+
+pub trait StaticRouteHandler<Resp>: Send + Sync {
+    fn get(
+        &self,
+        txn: &dyn tc_ir::Transaction,
+        request: tc_ir::Scalar,
+    ) -> tc_error::TCResult<
+        std::pin::Pin<
+            Box<dyn std::future::Future<Output = tc_error::TCResult<Resp>> + Send + '_>,
+        >,
+    >;
+
+    fn post(
+        &self,
+        txn: &dyn tc_ir::Transaction,
+        request: tc_ir::Map<tc_ir::Scalar>,
+    ) -> tc_error::TCResult<
+        std::pin::Pin<
+            Box<dyn std::future::Future<Output = tc_error::TCResult<Resp>> + Send + '_>,
+        >,
+    >;
 }
 
 #[cfg(test)]
