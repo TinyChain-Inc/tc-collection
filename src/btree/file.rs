@@ -343,14 +343,21 @@ impl BTree {
     }
 
     pub async fn finalized_key_stream(&self) -> std::io::Result<b_tree::Keys<Value>> {
+        self.finalized_key_stream_in((Bound::Unbounded, Bound::Unbounded), false)
+            .await
+    }
+
+    pub async fn finalized_key_stream_in(
+        &self,
+        bounds: (Bound<Value>, Bound<Value>),
+        reverse: bool,
+    ) -> std::io::Result<b_tree::Keys<Value>> {
         let persistent = {
             let state = self.state.read().expect("state read lock");
             state.persistent.clone()
         };
 
-        persistent
-            .key_stream_in((Bound::Unbounded, Bound::Unbounded), false)
-            .await
+        persistent.key_stream_in(bounds, reverse).await
     }
 
     pub fn slice<R>(&self, range: R, reverse: bool) -> BTreeSlice
@@ -363,6 +370,19 @@ impl BTree {
             upper: Self::clone_bound(range.end_bound()),
             reverse,
         }
+    }
+
+    pub async fn load_literal_rows(&self, rows: impl IntoIterator<Item = Vec<Value>>) -> std::io::Result<()> {
+        let persistent = {
+            let state = self.state.read().expect("state read lock");
+            state.persistent.clone()
+        };
+
+        for row in rows {
+            persistent.insert_key(row).await?;
+        }
+
+        Ok(())
     }
 
     pub async fn insert_row(&self, txn_id: TxnId, key: Vec<Value>) -> Result<(), txn_lock::Error> {
