@@ -8,7 +8,7 @@ mod file;
 pub use codec::{
     BTreeColumnSchema, BTreeDecodeContext, DecodedBTreePayload,
 };
-pub use file::{BTree, BTreeSlice, StorageConfig};
+pub use file::{BTree, BTreeSchema, BTreeSlice, StorageConfig};
 pub use crate::PersistentFile;
 
 #[cfg(test)]

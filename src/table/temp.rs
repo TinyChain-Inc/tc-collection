@@ -36,10 +36,7 @@ impl fmt::Debug for TempTable {
 
 impl TempTable {
     /// Create a new temporary table with the given schema.
-    pub fn create(
-        schema: TableSchema,
-        dir: DirLock<PersistentFile>,
-    ) -> std::io::Result<Self> {
+    pub fn create(schema: TableSchema, dir: DirLock<PersistentFile>) -> std::io::Result<Self> {
         let collator = Collator::<Value>::default();
         let table = TableLock::create(schema, collator, dir)?;
         Ok(Self { table })

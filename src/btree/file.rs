@@ -61,18 +61,14 @@ impl Default for StorageConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct KeySchema {
+pub struct BTreeSchema {
     storage: StorageConfig,
     key_arity: usize,
     key_types: Option<Vec<ValueType>>,
 }
 
-impl KeySchema {
-    fn new(
-        storage: StorageConfig,
-        key_arity: usize,
-        key_types: Option<Vec<ValueType>>,
-    ) -> Self {
+impl BTreeSchema {
+    pub fn new(storage: StorageConfig, key_arity: usize, key_types: Option<Vec<ValueType>>) -> Self {
         assert!(key_arity > 0, "BTree key arity must be >= 1");
         if let Some(types) = &key_types {
             assert!(
@@ -89,15 +85,55 @@ impl KeySchema {
             key_types,
         }
     }
+
+    pub fn from_key_types(key_types: Vec<ValueType>) -> Self {
+        let key_arity = key_types.len();
+        Self::new(StorageConfig::default(), key_arity, Some(key_types))
+    }
+
+    pub fn try_from_key_types(key_types: Vec<ValueType>) -> Result<Self, TCError> {
+        if key_types.is_empty() {
+            return Err(tc_error::bad_request!(
+                "BTree schema must have at least one column"
+            ));
+        }
+
+        Ok(Self::from_key_types(key_types))
+    }
+
+    fn normalize_row(&self, row: Value) -> Result<Vec<Value>, TCError> {
+        let key = if self.key_arity == UNARY_KEY_ARITY {
+            vec![row]
+        } else {
+            match row {
+                Value::Tuple(values) if values.len() == self.key_arity => values,
+                Value::Tuple(values) => {
+                    return Err(tc_error::bad_request!(
+                        "tc-collection BTree key arity {} does not match schema arity {}",
+                        values.len(),
+                        self.key_arity
+                    ));
+                }
+                value => {
+                    return Err(tc_error::bad_request!(
+                        "tc-collection BTree key must be a tuple of length {} but got {value:?}",
+                        self.key_arity
+                    ));
+                }
+            }
+        };
+
+        self.validate_key(key)
+    }
 }
 
-impl Default for KeySchema {
+impl Default for BTreeSchema {
     fn default() -> Self {
         Self::new(StorageConfig::default(), UNARY_KEY_ARITY, None)
     }
 }
 
-impl Schema for KeySchema {
+impl Schema for BTreeSchema {
     type Error = TCError;
     type Value = Value;
 
@@ -140,32 +176,15 @@ impl Schema for KeySchema {
 
 #[derive(Clone)]
 struct PersistentStore {
-    tree: BTreeLock<KeySchema, b_tree::collate::Collator<Value>, PersistentFile>,
+    tree: BTreeLock<BTreeSchema, b_tree::collate::Collator<Value>, PersistentFile>,
 }
 
 impl PersistentStore {
-    fn key_schema(&self) -> KeySchema {
+    fn key_schema(&self) -> BTreeSchema {
         self.tree.schema().clone()
     }
 
-    fn from_dir(
-        dir: DirLock<PersistentFile>,
-        storage: StorageConfig,
-        key_arity: usize,
-        key_types: Option<Vec<ValueType>>,
-    ) -> std::io::Result<Self> {
-        match &key_types {
-            Some(types) if types.len() != key_arity => {
-                return Err(invalid_input_error(format!(
-                    "BTree key type list length {} must match key arity {}",
-                    types.len(),
-                    key_arity
-                )));
-            }
-            _ => {}
-        }
-
-        let schema = KeySchema::new(storage, key_arity, key_types);
+    fn from_dir(dir: DirLock<PersistentFile>, schema: BTreeSchema) -> std::io::Result<Self> {
         let tree = BTreeLock::load(schema, b_tree::collate::Collator::default(), dir)?;
         Ok(Self { tree })
     }
@@ -292,38 +311,19 @@ impl fmt::Debug for BTree {
 impl BTree {
     /// Construct a transactional BTree with default unary-key schema.
     pub fn new(persistent_dir: DirLock<PersistentFile>, txn_root: DirLock<PersistentFile>) -> Self {
-        Self::with_storage_and_key_types(
+        Self::with_schema(
             persistent_dir,
             txn_root,
-            StorageConfig::default(),
-            UNARY_KEY_ARITY,
-            None,
+            BTreeSchema::default(),
         )
     }
 
-    pub fn with_key_types(
+    pub fn with_schema(
         persistent_dir: DirLock<PersistentFile>,
         txn_root: DirLock<PersistentFile>,
-        key_types: Vec<ValueType>,
+        schema: BTreeSchema,
     ) -> Self {
-        let key_arity = key_types.len();
-        Self::with_storage_and_key_types(
-            persistent_dir,
-            txn_root,
-            StorageConfig::default(),
-            key_arity,
-            Some(key_types),
-        )
-    }
-
-    pub fn with_storage_and_key_types(
-        persistent_dir: DirLock<PersistentFile>,
-        txn_root: DirLock<PersistentFile>,
-        storage: StorageConfig,
-        key_arity: usize,
-        key_types: Option<Vec<ValueType>>,
-    ) -> Self {
-        let persistent = Self::load_store(persistent_dir, storage, key_arity, key_types);
+        let persistent = Self::load_store(persistent_dir, schema);
 
         let state = State {
             persistent,
@@ -373,17 +373,17 @@ impl BTree {
         }
     }
 
-    pub async fn load_literal_rows(&self, rows: impl IntoIterator<Item = Vec<Value>>) -> std::io::Result<()> {
+    pub async fn load_literal_row(&self, row: Value) -> std::io::Result<()> {
         let persistent = {
             let state = self.state.read().expect("state read lock");
             state.persistent.clone()
         };
 
-        for row in rows {
-            persistent.insert_key(row).await?;
-        }
-
-        Ok(())
+        let row = persistent
+            .key_schema()
+            .normalize_row(row)
+            .map_err(invalid_input_error)?;
+        persistent.insert_key(row).await
     }
 
     pub async fn insert_row(&self, txn_id: TxnId, key: Vec<Value>) -> Result<(), txn_lock::Error> {
@@ -755,13 +755,8 @@ impl BTree {
         Ok(())
     }
 
-    fn load_store(
-        persistent_dir: DirLock<PersistentFile>,
-        storage: StorageConfig,
-        key_arity: usize,
-        key_types: Option<Vec<ValueType>>,
-    ) -> PersistentStore {
-        PersistentStore::from_dir(persistent_dir, storage, key_arity, key_types)
+    fn load_store(persistent_dir: DirLock<PersistentFile>, schema: BTreeSchema) -> PersistentStore {
+        PersistentStore::from_dir(persistent_dir, schema)
             .expect("load persistent BTree store")
     }
 
@@ -802,19 +797,9 @@ impl BTree {
         };
 
         let delta = Delta {
-            inserts: PersistentStore::from_dir(
-                inserts,
-                key_schema.storage,
-                key_schema.key_arity,
-                key_schema.key_types.clone(),
-            )
+            inserts: PersistentStore::from_dir(inserts, key_schema.clone())
             .map_err(background_error)?,
-            deletes: PersistentStore::from_dir(
-                deletes,
-                key_schema.storage,
-                key_schema.key_arity,
-                key_schema.key_types,
-            )
+            deletes: PersistentStore::from_dir(deletes, key_schema)
             .map_err(background_error)?,
         };
 

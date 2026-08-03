@@ -861,12 +861,10 @@ fn multi_column_partial_overlap_blocking_behavior() {
         Box::pin(async {
             let root = init_root("multi-column-overlap").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::with_storage_and_key_types(
+            let btree = BTree::with_schema(
                 persistent,
                 txn,
-                super::StorageConfig::default(),
-                2,
-                None,
+                super::BTreeSchema::new(super::StorageConfig::default(), 2, None),
             );
 
             btree

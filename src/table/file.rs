@@ -3,8 +3,8 @@ use std::fmt;
 use std::sync::{Arc, RwLock};
 
 use b_table::{Range, Row, TableLock};
-use collate::{try_diff, try_merge, Collate, Collator as TxnCollator};
 use collate::Collator;
+use collate::{Collate, Collator as TxnCollator, try_diff, try_merge};
 use freqfs::DirLock;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
@@ -14,8 +14,8 @@ use tc_value::Value;
 use super::schema::{TableIndexSchema, TableSchema};
 use super::stream::Rows;
 use super::view::{Limited, Selection, TableSlice};
-use crate::btree::StorageConfig;
 use crate::PersistentFile;
+use crate::btree::StorageConfig;
 
 fn background_error(err: impl fmt::Display) -> txn_lock::Error {
     txn_lock::Error::Background(err.to_string())
@@ -76,11 +76,7 @@ impl Collate for RowCollator {
                 break;
             }
         }
-        if self.reverse {
-            ord.reverse()
-        } else {
-            ord
-        }
+        if self.reverse { ord.reverse() } else { ord }
     }
 }
 
@@ -123,9 +119,9 @@ impl TableStore {
 
     async fn get_row(&self, key: &[Value]) -> std::io::Result<Option<Row<Value>>> {
         let schema = self.schema().clone();
-        let range = schema.range_from_key(key).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-        })?;
+        let range = schema
+            .range_from_key(key)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let view = self.table.read().await;
         let mut rows = view.rows(range, &[], false, None).await?;
         rows.try_next().await
@@ -343,23 +339,23 @@ impl PersistentTable {
         values: Vec<Value>,
     ) -> Result<(), txn_lock::Error> {
         let key = b_table::Schema::validate_key(&self.schema, key).map_err(background_error)?;
-        let values = b_table::Schema::validate_values(&self.schema, values).map_err(background_error)?;
+        let values =
+            b_table::Schema::validate_values(&self.schema, values).map_err(background_error)?;
 
         let _permit = self
             .semaphore
             .try_write(txn_id, txn_lock::set::Range::One(Arc::new(key.clone())))?;
 
         let pending = self.pending_delta_for_txn(txn_id).await?;
-        pending.upsert(key, values).await.map_err(background_error)?;
+        pending
+            .upsert(key, values)
+            .await
+            .map_err(background_error)?;
 
         Ok(())
     }
 
-    pub async fn delete_row(
-        &self,
-        txn_id: TxnId,
-        key: Vec<Value>,
-    ) -> Result<(), txn_lock::Error> {
+    pub async fn delete_row(&self, txn_id: TxnId, key: Vec<Value>) -> Result<(), txn_lock::Error> {
         let key = b_table::Schema::validate_key(&self.schema, key).map_err(background_error)?;
 
         let _permit = self
@@ -368,18 +364,28 @@ impl PersistentTable {
 
         let pending = self.pending_delta_for_txn(txn_id).await?;
 
-        if pending.already_deleted(&key).await.map_err(background_error)? {
+        if pending
+            .already_deleted(&key)
+            .await
+            .map_err(background_error)?
+        {
             return Ok(());
         }
 
-        let mut row = pending.get_inserted_row(&key).await.map_err(background_error)?;
+        let mut row = pending
+            .get_inserted_row(&key)
+            .await
+            .map_err(background_error)?;
 
         if row.is_none() {
             let snapshot = self.visible_snapshot(txn_id);
             row = self.resolve_row(&snapshot, &key).await;
         }
 
-        pending.delete_from_inserts(&key).await.map_err(background_error)?;
+        pending
+            .delete_from_inserts(&key)
+            .await
+            .map_err(background_error)?;
 
         if let Some(mut row) = row {
             let key_len = self.schema.key().len();
@@ -421,9 +427,7 @@ impl PersistentTable {
     }
 
     pub async fn is_empty(&self, txn_id: TxnId) -> bool {
-        !self
-            .any_row_in(txn_id, Range::default(), &[], false)
-            .await
+        !self.any_row_in(txn_id, Range::default(), &[], false).await
     }
 
     pub async fn for_each_row_in_order<F>(
@@ -449,11 +453,7 @@ impl PersistentTable {
         .await;
     }
 
-    pub async fn count_in(
-        &self,
-        txn_id: TxnId,
-        range: Range<tc_ir::Id, Value>,
-    ) -> u64 {
+    pub async fn count_in(&self, txn_id: TxnId, range: Range<tc_ir::Id, Value>) -> u64 {
         let mut count = 0_u64;
         self.for_each_row_in_order(txn_id, range, &[], false, |_| {
             count += 1;
@@ -463,11 +463,7 @@ impl PersistentTable {
     }
 
     /// Return `true` if there are no visible rows in `range` at `txn_id`.
-    pub async fn is_empty_in(
-        &self,
-        txn_id: TxnId,
-        range: Range<tc_ir::Id, Value>,
-    ) -> bool {
+    pub async fn is_empty_in(&self, txn_id: TxnId, range: Range<tc_ir::Id, Value>) -> bool {
         !self.any_row_in(txn_id, range, &[], false).await
     }
 
@@ -503,7 +499,13 @@ impl PersistentTable {
 
         for delta in snapshot.deltas.into_iter() {
             visible = delta
-                .merge_into_owned(visible, range.clone(), order.clone(), reverse, collator.clone())
+                .merge_into_owned(
+                    visible,
+                    range.clone(),
+                    order.clone(),
+                    reverse,
+                    collator.clone(),
+                )
                 .await;
         }
 
@@ -515,12 +517,7 @@ impl PersistentTable {
     ///
     /// The view is structural — it holds no row data. Row streaming, count,
     /// and containment checks delegate to this table with the view's bounds.
-    pub fn slice(
-        &self,
-        range: Range<Id, Value>,
-        order: &[Id],
-        reverse: bool,
-    ) -> TableSlice {
+    pub fn slice(&self, range: Range<Id, Value>, order: &[Id], reverse: bool) -> TableSlice {
         TableSlice::new(self.clone(), range, order.to_vec(), reverse)
     }
 
@@ -562,9 +559,7 @@ impl PersistentTable {
         let value_columns = self.schema.values();
         for name in values.keys() {
             if !value_columns.contains(name) {
-                return Err(background_error(format!(
-                    "cannot update key column {name}"
-                )));
+                return Err(background_error(format!("cannot update key column {name}")));
             }
         }
 
@@ -603,7 +598,10 @@ impl PersistentTable {
             let key: Vec<Value> = row[..key_len].to_vec();
             let updated_values: Vec<Value> = row[key_len..].to_vec();
 
-            pending.upsert(key, updated_values).await.map_err(background_error)?;
+            pending
+                .upsert(key, updated_values)
+                .await
+                .map_err(background_error)?;
         }
 
         Ok(())
@@ -640,7 +638,10 @@ impl PersistentTable {
             let row_vec = row.into_vec();
             let key: Vec<Value> = row_vec[..key_len].to_vec();
             let values: Vec<Value> = row_vec[key_len..].to_vec();
-            pending.upsert(key, values).await.map_err(background_error)?;
+            pending
+                .upsert(key, values)
+                .await
+                .map_err(background_error)?;
         }
 
         Ok(())
@@ -793,11 +794,7 @@ impl PersistentTable {
         self.semaphore.finalize(&txn_id, true);
     }
 
-    async fn resolve_row(
-        &self,
-        snapshot: &VisibleSnapshot,
-        key: &[Value],
-    ) -> Option<Row<Value>> {
+    async fn resolve_row(&self, snapshot: &VisibleSnapshot, key: &[Value]) -> Option<Row<Value>> {
         let mut row = snapshot
             .persistent
             .get_row(key)
@@ -844,13 +841,9 @@ impl PersistentTable {
         Ok(())
     }
 
-    fn load_store(
-        persistent_dir: DirLock<PersistentFile>,
-        schema: TableSchema,
-    ) -> TableStore {
+    fn load_store(persistent_dir: DirLock<PersistentFile>, schema: TableSchema) -> TableStore {
         let storage = *schema.storage();
-        TableStore::from_dir(persistent_dir, schema, storage)
-            .expect("load persistent Table store")
+        TableStore::from_dir(persistent_dir, schema, storage).expect("load persistent Table store")
     }
 
     async fn pending_delta_for_txn(&self, txn_id: TxnId) -> Result<Delta, txn_lock::Error> {

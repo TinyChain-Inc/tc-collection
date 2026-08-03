@@ -13,12 +13,12 @@ use std::pin::Pin;
 
 use b_table::Range;
 use safecast::{CastFrom, Match, TryCastInto};
-use tc_error::{bad_request, TCError, TCResult};
+use tc_error::{TCError, TCResult, bad_request};
 use tc_ir::{Id, Map, Scalar, Transaction, TxnId};
 use tc_value::Value;
 
-use super::selector::{cast_into_range, KeyOrRange};
 use super::RouteHandler;
+use super::selector::{KeyOrRange, cast_into_range};
 use crate::table::{PersistentTable, TableSchema, TempTable};
 
 // ─── SchemaHandler ─────────────────────────────────────────────────────
@@ -214,14 +214,11 @@ impl<State> RouteHandler<State> for TableHandler
 where
     State: From<crate::Collection> + From<tc_value::Value> + Clone + Send + 'static,
 {
-    fn get(
-        &self,
-        txn: &dyn Transaction,
-        request: Scalar,
-    ) -> TCResult<GetFut<'_, State>> {
+    fn get(&self, txn: &dyn Transaction, request: Scalar) -> TCResult<GetFut<'_, State>> {
         let txn_id = txn.id();
         let table = self.table.clone();
-        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+        let value: Value =
+            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
             let kor = KeyOrRange::try_from_value(&table, value)?;
             match kor {
@@ -243,15 +240,13 @@ where
         }))
     }
 
-    fn put(
-        &self,
-        txn: &dyn Transaction,
-        request: Map<Scalar>,
-    ) -> TCResult<PutFut<'_>> {
+    fn put(&self, txn: &dyn Transaction, request: Map<Scalar>) -> TCResult<PutFut<'_>> {
         let txn_id = txn.id();
         let table = self.table.clone();
         let mut params = request;
-        let key_value: Value = params.require("key")?.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+        let key_value: Value = params
+            .require("key")?
+            .try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         let value_scalar = params.require("value")?;
 
         Ok(Box::pin(async move {
@@ -266,28 +261,32 @@ where
                 }
                 KeyOrRange::Range(range) => {
                     let values = update_values(value_scalar)?;
-                    table.update(txn_id, range, values).await.map_err(TCError::from)
+                    table
+                        .update(txn_id, range, values)
+                        .await
+                        .map_err(TCError::from)
                 }
                 KeyOrRange::Key(key) => {
-                    let value: Value = value_scalar.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+                    let value: Value = value_scalar
+                        .try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
                     let values = if let Value::Tuple(tuple) = value {
                         tuple
                     } else {
                         vec![value]
                     };
-                    table.upsert_row(txn_id, key, values).await.map_err(TCError::from)
+                    table
+                        .upsert_row(txn_id, key, values)
+                        .await
+                        .map_err(TCError::from)
                 }
             }
         }))
     }
 
-    fn post(
-        &self,
-        _txn: &dyn Transaction,
-        request: Scalar,
-    ) -> TCResult<GetFut<'_, State>> {
+    fn post(&self, _txn: &dyn Transaction, request: Scalar) -> TCResult<GetFut<'_, State>> {
         let table = self.table.clone();
-        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+        let value: Value =
+            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
             let range = cast_into_range(&table, value)?;
             let slice = table.slice(range, &[], false);
@@ -297,26 +296,19 @@ where
         }))
     }
 
-    fn delete(
-        &self,
-        txn: &dyn Transaction,
-        request: Scalar,
-    ) -> TCResult<PutFut<'_>> {
+    fn delete(&self, txn: &dyn Transaction, request: Scalar) -> TCResult<PutFut<'_>> {
         let txn_id = txn.id();
         let table = self.table.clone();
-        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+        let value: Value =
+            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
             let kor = KeyOrRange::try_from_value(&table, value)?;
             match kor {
-                KeyOrRange::All => {
-                    table
-                        .truncate(txn_id, Range::default())
-                        .await
-                        .map_err(TCError::from)
-                }
-                KeyOrRange::Key(key) => {
-                    table.delete_row(txn_id, key).await.map_err(TCError::from)
-                }
+                KeyOrRange::All => table
+                    .truncate(txn_id, Range::default())
+                    .await
+                    .map_err(TCError::from),
+                KeyOrRange::Key(key) => table.delete_row(txn_id, key).await.map_err(TCError::from),
                 KeyOrRange::Range(range) => {
                     table.truncate(txn_id, range).await.map_err(TCError::from)
                 }
@@ -329,14 +321,11 @@ impl<State> RouteHandler<State> for ContainsHandler
 where
     State: From<tc_value::Value> + Clone + Send + 'static,
 {
-    fn get(
-        &self,
-        txn: &dyn Transaction,
-        request: Scalar,
-    ) -> TCResult<GetFut<'_, State>> {
+    fn get(&self, txn: &dyn Transaction, request: Scalar) -> TCResult<GetFut<'_, State>> {
         let txn_id = txn.id();
         let table = self.table.clone();
-        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+        let value: Value =
+            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
             let kor = KeyOrRange::try_from_value(&table, value)?;
             let filled = match kor {
@@ -351,33 +340,15 @@ where
         }))
     }
 
-    fn put(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Map<Scalar>,
-    ) -> TCResult<PutFut<'_>> {
-        Err(TCError::method_not_allowed(
-            tc_ir::Method::Put,
-            "contains",
-        ))
+    fn put(&self, _txn: &dyn Transaction, _request: Map<Scalar>) -> TCResult<PutFut<'_>> {
+        Err(TCError::method_not_allowed(tc_ir::Method::Put, "contains"))
     }
 
-    fn post(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Scalar,
-    ) -> TCResult<GetFut<'_, State>> {
-        Err(TCError::method_not_allowed(
-            tc_ir::Method::Post,
-            "contains",
-        ))
+    fn post(&self, _txn: &dyn Transaction, _request: Scalar) -> TCResult<GetFut<'_, State>> {
+        Err(TCError::method_not_allowed(tc_ir::Method::Post, "contains"))
     }
 
-    fn delete(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Scalar,
-    ) -> TCResult<PutFut<'_>> {
+    fn delete(&self, _txn: &dyn Transaction, _request: Scalar) -> TCResult<PutFut<'_>> {
         Err(TCError::method_not_allowed(
             tc_ir::Method::Delete,
             "contains",
@@ -389,14 +360,11 @@ impl<State> RouteHandler<State> for CountHandler
 where
     State: From<u64> + Clone + Send + 'static,
 {
-    fn get(
-        &self,
-        txn: &dyn Transaction,
-        request: Scalar,
-    ) -> TCResult<GetFut<'_, State>> {
+    fn get(&self, txn: &dyn Transaction, request: Scalar) -> TCResult<GetFut<'_, State>> {
         let txn_id = txn.id();
         let table = self.table.clone();
-        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+        let value: Value =
+            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
             let kor = KeyOrRange::try_from_value(&table, value)?;
             let count: u64 = match kor {
@@ -417,27 +385,15 @@ where
         }))
     }
 
-    fn put(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Map<Scalar>,
-    ) -> TCResult<PutFut<'_>> {
+    fn put(&self, _txn: &dyn Transaction, _request: Map<Scalar>) -> TCResult<PutFut<'_>> {
         Err(TCError::method_not_allowed(tc_ir::Method::Put, "count"))
     }
 
-    fn post(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Scalar,
-    ) -> TCResult<GetFut<'_, State>> {
+    fn post(&self, _txn: &dyn Transaction, _request: Scalar) -> TCResult<GetFut<'_, State>> {
         Err(TCError::method_not_allowed(tc_ir::Method::Post, "count"))
     }
 
-    fn delete(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Scalar,
-    ) -> TCResult<PutFut<'_>> {
+    fn delete(&self, _txn: &dyn Transaction, _request: Scalar) -> TCResult<PutFut<'_>> {
         Err(TCError::method_not_allowed(tc_ir::Method::Delete, "count"))
     }
 }
@@ -446,20 +402,17 @@ impl<State> RouteHandler<State> for LimitHandler
 where
     State: From<crate::Collection> + Clone + Send + 'static,
 {
-    fn get(
-        &self,
-        _txn: &dyn Transaction,
-        request: Scalar,
-    ) -> TCResult<GetFut<'_, State>> {
+    fn get(&self, _txn: &dyn Transaction, request: Scalar) -> TCResult<GetFut<'_, State>> {
         let table = self.table.clone();
-        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+        let value: Value =
+            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
             let limit = match value {
                 Value::Number(n) => u64::cast_from(n),
                 other => {
                     return Err(bad_request!(
                         "limit must be a positive integer, not {other:?}"
-                    ))
+                    ));
                 }
             };
             let limited = table.limit(limit);
@@ -469,27 +422,15 @@ where
         }))
     }
 
-    fn put(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Map<Scalar>,
-    ) -> TCResult<PutFut<'_>> {
+    fn put(&self, _txn: &dyn Transaction, _request: Map<Scalar>) -> TCResult<PutFut<'_>> {
         Err(TCError::method_not_allowed(tc_ir::Method::Put, "limit"))
     }
 
-    fn post(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Scalar,
-    ) -> TCResult<GetFut<'_, State>> {
+    fn post(&self, _txn: &dyn Transaction, _request: Scalar) -> TCResult<GetFut<'_, State>> {
         Err(TCError::method_not_allowed(tc_ir::Method::Post, "limit"))
     }
 
-    fn delete(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Scalar,
-    ) -> TCResult<PutFut<'_>> {
+    fn delete(&self, _txn: &dyn Transaction, _request: Scalar) -> TCResult<PutFut<'_>> {
         Err(TCError::method_not_allowed(tc_ir::Method::Delete, "limit"))
     }
 }
@@ -498,18 +439,16 @@ impl<State> RouteHandler<State> for OrderHandler
 where
     State: From<crate::Collection> + Clone + Send + 'static,
 {
-    fn get(
-        &self,
-        _txn: &dyn Transaction,
-        request: Scalar,
-    ) -> TCResult<GetFut<'_, State>> {
+    fn get(&self, _txn: &dyn Transaction, request: Scalar) -> TCResult<GetFut<'_, State>> {
         let table = self.table.clone();
-        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+        let value: Value =
+            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
             let (columns, reverse): (Vec<Id>, bool) = if value.matches::<(Vec<Id>, bool)>() {
                 value.try_cast_into(|v| bad_request!("invalid order request: {v:?}"))?
             } else {
-                let columns: Vec<Id> = value.try_cast_into(|v| bad_request!("invalid column list: {v:?}"))?;
+                let columns: Vec<Id> =
+                    value.try_cast_into(|v| bad_request!("invalid column list: {v:?}"))?;
                 (columns, false)
             };
             let slice = table.order_by(&columns, reverse);
@@ -519,27 +458,15 @@ where
         }))
     }
 
-    fn put(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Map<Scalar>,
-    ) -> TCResult<PutFut<'_>> {
+    fn put(&self, _txn: &dyn Transaction, _request: Map<Scalar>) -> TCResult<PutFut<'_>> {
         Err(TCError::method_not_allowed(tc_ir::Method::Put, "order"))
     }
 
-    fn post(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Scalar,
-    ) -> TCResult<GetFut<'_, State>> {
+    fn post(&self, _txn: &dyn Transaction, _request: Scalar) -> TCResult<GetFut<'_, State>> {
         Err(TCError::method_not_allowed(tc_ir::Method::Post, "order"))
     }
 
-    fn delete(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Scalar,
-    ) -> TCResult<PutFut<'_>> {
+    fn delete(&self, _txn: &dyn Transaction, _request: Scalar) -> TCResult<PutFut<'_>> {
         Err(TCError::method_not_allowed(tc_ir::Method::Delete, "order"))
     }
 }
@@ -548,15 +475,13 @@ impl<State> RouteHandler<State> for SelectHandler
 where
     State: From<crate::Collection> + Clone + Send + 'static,
 {
-    fn get(
-        &self,
-        _txn: &dyn Transaction,
-        request: Scalar,
-    ) -> TCResult<GetFut<'_, State>> {
+    fn get(&self, _txn: &dyn Transaction, request: Scalar) -> TCResult<GetFut<'_, State>> {
         let table = self.table.clone();
-        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+        let value: Value =
+            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
-            let columns: Vec<Id> = value.try_cast_into(|v| bad_request!("invalid column list: {v:?}"))?;
+            let columns: Vec<Id> =
+                value.try_cast_into(|v| bad_request!("invalid column list: {v:?}"))?;
             let selection = table.select(&columns);
             Ok(State::from(crate::Collection::from(
                 crate::table::Table::from(selection),
@@ -564,27 +489,15 @@ where
         }))
     }
 
-    fn put(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Map<Scalar>,
-    ) -> TCResult<PutFut<'_>> {
+    fn put(&self, _txn: &dyn Transaction, _request: Map<Scalar>) -> TCResult<PutFut<'_>> {
         Err(TCError::method_not_allowed(tc_ir::Method::Put, "select"))
     }
 
-    fn post(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Scalar,
-    ) -> TCResult<GetFut<'_, State>> {
+    fn post(&self, _txn: &dyn Transaction, _request: Scalar) -> TCResult<GetFut<'_, State>> {
         Err(TCError::method_not_allowed(tc_ir::Method::Post, "select"))
     }
 
-    fn delete(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Scalar,
-    ) -> TCResult<PutFut<'_>> {
+    fn delete(&self, _txn: &dyn Transaction, _request: Scalar) -> TCResult<PutFut<'_>> {
         Err(TCError::method_not_allowed(tc_ir::Method::Delete, "select"))
     }
 }
@@ -593,43 +506,26 @@ impl<State> RouteHandler<State> for SchemaHandler
 where
     State: From<tc_value::Value> + Clone + Send + 'static,
 {
-    fn get(
-        &self,
-        _txn: &dyn Transaction,
-        request: Scalar,
-    ) -> TCResult<GetFut<'_, State>> {
-        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+    fn get(&self, _txn: &dyn Transaction, request: Scalar) -> TCResult<GetFut<'_, State>> {
+        let value: Value =
+            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         if value != Value::None {
             return Err(bad_request!("this route takes no parameters"));
         }
         let table = self.table.clone();
         let schema_fn = self.schema_fn;
-        Ok(Box::pin(async move {
-            Ok(State::from(schema_fn(&table)))
-        }))
+        Ok(Box::pin(async move { Ok(State::from(schema_fn(&table))) }))
     }
 
-    fn put(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Map<Scalar>,
-    ) -> TCResult<PutFut<'_>> {
+    fn put(&self, _txn: &dyn Transaction, _request: Map<Scalar>) -> TCResult<PutFut<'_>> {
         Err(TCError::method_not_allowed(tc_ir::Method::Put, "schema"))
     }
 
-    fn post(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Scalar,
-    ) -> TCResult<GetFut<'_, State>> {
+    fn post(&self, _txn: &dyn Transaction, _request: Scalar) -> TCResult<GetFut<'_, State>> {
         Err(TCError::method_not_allowed(tc_ir::Method::Post, "schema"))
     }
 
-    fn delete(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Scalar,
-    ) -> TCResult<PutFut<'_>> {
+    fn delete(&self, _txn: &dyn Transaction, _request: Scalar) -> TCResult<PutFut<'_>> {
         Err(TCError::method_not_allowed(tc_ir::Method::Delete, "schema"))
     }
 }
@@ -640,30 +536,21 @@ impl<State> super::StaticRouteHandler<State> for CreateHandler
 where
     State: From<crate::Collection> + Clone + Send + 'static,
 {
-    fn get(
-        &self,
-        txn: &dyn Transaction,
-        request: Scalar,
-    ) -> TCResult<GetFut<'_, State>> {
+    fn get(&self, txn: &dyn Transaction, request: Scalar) -> TCResult<GetFut<'_, State>> {
         let txn_id = txn.id();
         let root = self.root.clone();
-        let value: Value = request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+        let value: Value =
+            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
-            let schema: TableSchema = value.try_cast_into(|v| bad_request!("invalid table schema: {v:?}"))?;
+            let schema: TableSchema =
+                value.try_cast_into(|v| bad_request!("invalid table schema: {v:?}"))?;
             let table = create_table(&root, txn_id, schema).await?;
             Ok(State::from(crate::Collection::from(table)))
         }))
     }
 
-    fn post(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Map<Scalar>,
-    ) -> TCResult<GetFut<'_, State>> {
-        Err(TCError::method_not_allowed(
-            tc_ir::Method::Post,
-            "create",
-        ))
+    fn post(&self, _txn: &dyn Transaction, _request: Map<Scalar>) -> TCResult<GetFut<'_, State>> {
+        Err(TCError::method_not_allowed(tc_ir::Method::Post, "create"))
     }
 }
 
@@ -671,31 +558,27 @@ impl<State> super::StaticRouteHandler<State> for CopyHandler
 where
     State: From<crate::Collection> + Clone + Send + 'static,
 {
-    fn get(
-        &self,
-        _txn: &dyn Transaction,
-        _request: Scalar,
-    ) -> TCResult<GetFut<'_, State>> {
+    fn get(&self, _txn: &dyn Transaction, _request: Scalar) -> TCResult<GetFut<'_, State>> {
         Err(TCError::method_not_allowed(tc_ir::Method::Get, "copy_from"))
     }
 
-    fn post(
-        &self,
-        txn: &dyn Transaction,
-        mut request: Map<Scalar>,
-    ) -> TCResult<GetFut<'_, State>> {
+    fn post(&self, txn: &dyn Transaction, mut request: Map<Scalar>) -> TCResult<GetFut<'_, State>> {
         let txn_id = txn.id();
         let root = self.root.clone();
-        let schema_value: Value = request.require("schema")?.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+        let schema_value: Value = request
+            .require("schema")?
+            .try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         let source_value = request.optional("source")?;
         request.expect_empty()?;
 
         Ok(Box::pin(async move {
-            let schema: TableSchema = schema_value.try_cast_into(|v| bad_request!("invalid table schema: {v:?}"))?;
+            let schema: TableSchema =
+                schema_value.try_cast_into(|v| bad_request!("invalid table schema: {v:?}"))?;
             let table = create_table(&root, txn_id, schema).await?;
 
             if let Some(source_scalar) = source_value {
-                let source_value = source_scalar.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+                let source_value =
+                    source_scalar.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
                 copy_inline_rows(&table, source_value).await?;
             }
 
@@ -728,17 +611,14 @@ async fn create_table(
 }
 
 /// Copy inline row data into a new table.
-async fn copy_inline_rows(
-    table: &TempTable,
-    source: Value,
-) -> TCResult<()> {
+async fn copy_inline_rows(table: &TempTable, source: Value) -> TCResult<()> {
     let rows = match source {
         Value::Tuple(rows) => rows,
         Value::None => return Ok(()),
         other => {
             return Err(bad_request!(
                 "copy_from source must be a tuple of rows, got {other:?}"
-            ))
+            ));
         }
     };
 
@@ -751,7 +631,7 @@ async fn copy_inline_rows(
             other => {
                 return Err(bad_request!(
                     "each source row must be a tuple, got {other:?}"
-                ))
+                ));
             }
         };
 
