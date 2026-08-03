@@ -694,7 +694,7 @@ fn static_copy_from_inline_rows() {
 
             match resp {
                 State::Collection(Collection::Table(table)) => {
-                    if let crate::table::Table::Temp(table) = table {
+                    if let crate::table::Table::Temp(table) = *table {
                         assert_eq!(table.count().await, 2);
                         let row = table.read_row(&[Value::from(10_u64)]).await;
                         assert!(row.is_some());

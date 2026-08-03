@@ -195,6 +195,21 @@ impl CopyHandler {
 type GetFut<'a, State> = Pin<Box<dyn Future<Output = TCResult<State>> + Send + 'a>>;
 type PutFut<'a> = Pin<Box<dyn Future<Output = TCResult<()>> + Send + 'a>>;
 
+fn update_values(value: Scalar) -> TCResult<Map<Value>> {
+    let Scalar::Map(values) = value else {
+        return Err(bad_request!("invalid update values: expected a map"));
+    };
+
+    values
+        .into_iter()
+        .map(|(name, value)| {
+            value
+                .try_cast_into(|value| bad_request!("invalid update value for {name}: {value:?}"))
+                .map(|value| (name, value))
+        })
+        .collect()
+}
+
 impl<State> RouteHandler<State> for TableHandler
 where
     State: From<crate::Collection> + From<tc_value::Value> + Clone + Send + 'static,
@@ -243,14 +258,14 @@ where
             let kor = KeyOrRange::try_from_value(&table, key_value)?;
             match kor {
                 KeyOrRange::All => {
-                    let values: tc_ir::Map<Value> = value_scalar.try_cast_into(|v| bad_request!("invalid update values: {v:?}"))?;
+                    let values = update_values(value_scalar)?;
                     table
                         .update(txn_id, Range::default(), values)
                         .await
                         .map_err(TCError::from)
                 }
                 KeyOrRange::Range(range) => {
-                    let values: tc_ir::Map<Value> = value_scalar.try_cast_into(|v| bad_request!("invalid update values: {v:?}"))?;
+                    let values = update_values(value_scalar)?;
                     table.update(txn_id, range, values).await.map_err(TCError::from)
                 }
                 KeyOrRange::Key(key) => {

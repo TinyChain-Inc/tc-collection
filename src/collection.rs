@@ -6,7 +6,7 @@ use crate::table::{PersistentTable, Table};
 #[derive(Debug, Clone)]
 pub enum Collection {
     BTree(BTree),
-    Table(Table),
+    Table(Box<Table>),
 }
 
 impl From<BTree> for Collection {
@@ -17,13 +17,13 @@ impl From<BTree> for Collection {
 
 impl From<PersistentTable> for Collection {
     fn from(table: PersistentTable) -> Self {
-        Self::Table(table.into())
+        Self::Table(Box::new(table.into()))
     }
 }
 
 impl From<Table> for Collection {
     fn from(table: Table) -> Self {
-        Self::Table(table)
+        Self::Table(Box::new(table))
     }
 }
 
@@ -51,7 +51,7 @@ impl Collection {
 
     pub fn into_table(self) -> Table {
         match self {
-            Self::Table(table) => table,
+            Self::Table(table) => *table,
             _ => panic!("Collection is not a Table"),
         }
     }
@@ -63,10 +63,11 @@ impl Transact for Collection {
     async fn commit(&self, txn_id: TxnId) -> Self::Commit {
         match self {
             Self::BTree(btree) => Transact::commit(btree, txn_id).await,
-            Self::Table(table) => match table {
-                Table::File(t) => Transact::commit(t, txn_id).await,
-                _ => {}
-            },
+            Self::Table(table) => {
+                if let Table::File(t) = table.as_ref() {
+                    Transact::commit(t, txn_id).await;
+                }
+            }
         }
     }
 
@@ -75,8 +76,11 @@ impl Transact for Collection {
         async move {
             match &self {
                 Self::BTree(btree) => Transact::rollback(btree, &txn_id).await,
-                Self::Table(Table::File(t)) => Transact::rollback(t, &txn_id).await,
-                _ => {}
+                Self::Table(table) => {
+                    if let Table::File(t) = table.as_ref() {
+                        Transact::rollback(t, &txn_id).await;
+                    }
+                }
             }
         }
     }
@@ -86,8 +90,11 @@ impl Transact for Collection {
         async move {
             match &self {
                 Self::BTree(btree) => Transact::finalize(btree, &txn_id).await,
-                Self::Table(Table::File(t)) => Transact::finalize(t, &txn_id).await,
-                _ => {}
+                Self::Table(table) => {
+                    if let Table::File(t) = table.as_ref() {
+                        Transact::finalize(t, &txn_id).await;
+                    }
+                }
             }
         }
     }

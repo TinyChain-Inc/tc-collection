@@ -135,7 +135,7 @@ impl TableStore {
         let mut view = self.table.write().await;
         view.upsert(key, values)
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         Ok(())
     }
 
@@ -848,7 +848,7 @@ impl PersistentTable {
         persistent_dir: DirLock<PersistentFile>,
         schema: TableSchema,
     ) -> TableStore {
-        let storage = schema.storage().clone();
+        let storage = *schema.storage();
         TableStore::from_dir(persistent_dir, schema, storage)
             .expect("load persistent Table store")
     }
@@ -865,7 +865,7 @@ impl PersistentTable {
             (
                 state.txn_root.clone(),
                 state.persistent.schema().clone(),
-                state.persistent.schema().storage().clone(),
+                *state.persistent.schema().storage(),
             )
         };
 
@@ -894,7 +894,7 @@ impl PersistentTable {
         };
 
         let delta = Delta {
-            inserts: TableStore::from_dir(inserts_dir, schema.clone(), storage.clone())
+            inserts: TableStore::from_dir(inserts_dir, schema.clone(), storage)
                 .map_err(background_error)?,
             deletes: TableStore::from_dir(deletes_dir, schema, storage)
                 .map_err(background_error)?,

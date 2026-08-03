@@ -154,14 +154,15 @@ impl PersistentStore {
         key_arity: usize,
         key_types: Option<Vec<ValueType>>,
     ) -> std::io::Result<Self> {
-        if let Some(types) = &key_types {
-            if types.len() != key_arity {
+        match &key_types {
+            Some(types) if types.len() != key_arity => {
                 return Err(invalid_input_error(format!(
                     "BTree key type list length {} must match key arity {}",
                     types.len(),
                     key_arity
                 )));
             }
+            _ => {}
         }
 
         let schema = KeySchema::new(storage, key_arity, key_types);
