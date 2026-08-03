@@ -1,16 +1,16 @@
 //! Route-level tests for table public API handlers.
 
-use super::{route, Static};
 use super::selector::KeyOrRange;
-use crate::btree::StorageConfig;
-use crate::PersistentFile;
-use crate::table::{Column, PersistentTable, TableSchema};
+use super::{Static, route};
 use crate::Collection;
+use crate::PersistentFile;
+use crate::btree::StorageConfig;
+use crate::table::{Column, PersistentTable, TableSchema};
 use freqfs::Cache;
+use safecast::TryCastInto;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use safecast::TryCastInto;
 use tc_ir::{Claim, Map, NetworkTime, Scalar, Transaction, TxnId};
 use tc_value::ValueType;
 use umask::Mode;
@@ -95,8 +95,8 @@ impl Transaction for MockTxn {
 fn run_async_test(
     name: &str,
     test_fn: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-        + Send
-        + 'static,
+    + Send
+    + 'static,
 ) {
     std::thread::Builder::new()
         .name(name.to_string())
@@ -135,12 +135,17 @@ async fn init_root(name: &str) -> PathBuf {
 
 fn load_roots(
     root: &std::path::Path,
-) -> (freqfs::DirLock<PersistentFile>, freqfs::DirLock<PersistentFile>) {
+) -> (
+    freqfs::DirLock<PersistentFile>,
+    freqfs::DirLock<PersistentFile>,
+) {
     let cache = Cache::<PersistentFile>::new(16 * 1024 * 1024, None);
     let persistent = Arc::clone(&cache)
         .load(root.join("persistent"))
         .expect("load persistent root");
-    let txn = Arc::clone(&cache).load(root.join("txn")).expect("load txn root");
+    let txn = Arc::clone(&cache)
+        .load(root.join("txn"))
+        .expect("load txn root");
     (persistent, txn)
 }
 
@@ -153,8 +158,7 @@ fn simple_schema() -> TableSchema {
         name: "label".parse().expect("Id"),
         dtype: ValueType::String,
     }];
-    TableSchema::new(key, values, Vec::new(), StorageConfig::default())
-        .expect("create test schema")
+    TableSchema::new(key, values, Vec::new(), StorageConfig::default()).expect("create test schema")
 }
 
 fn schema_value() -> tc_value::Value {
@@ -211,7 +215,9 @@ fn route_resolves_all_paths() {
 fn schema_roundtrip() {
     let original = simple_schema();
     let encoded: tc_value::Value = safecast::CastFrom::cast_from(original.clone());
-    let decoded: TableSchema = encoded.try_cast_into(|v| tc_error::bad_request!("invalid schema: {v:?}")).expect("decode schema");
+    let decoded: TableSchema = encoded
+        .try_cast_into(|v| tc_error::bad_request!("invalid schema: {v:?}"))
+        .expect("decode schema");
     assert_eq!(original.key(), decoded.key());
     assert_eq!(original.values(), decoded.values());
 }
@@ -263,9 +269,7 @@ fn get_columns() {
             let table = make_table_with_data().await;
             let handler = route::<State>(&table, &[segment("columns")]).expect("columns");
             let txn = MockTxn::new(20);
-            let fut = handler
-                .get(&txn, Scalar::Value(Value::None))
-                .expect("get");
+            let fut = handler.get(&txn, Scalar::Value(Value::None)).expect("get");
             let resp = fut.await.expect("response");
             match resp {
                 State::Value(Value::Tuple(cols)) => {
@@ -375,9 +379,7 @@ fn get_key_columns() {
             let table = make_table_with_data().await;
             let handler = route::<State>(&table, &[segment("key_columns")]).expect("key_columns");
             let txn = MockTxn::new(20);
-            let fut = handler
-                .get(&txn, Scalar::Value(Value::None))
-                .expect("get");
+            let fut = handler.get(&txn, Scalar::Value(Value::None)).expect("get");
             let resp = fut.await.expect("response");
             match resp {
                 State::Value(Value::Tuple(cols)) => {
@@ -484,7 +486,10 @@ fn put_update_all() {
             let txn = MockTxn::new(30);
 
             let mut value_map = Map::new();
-            value_map.insert("label".parse().expect("Id"), Scalar::Value(Value::from("updated")));
+            value_map.insert(
+                "label".parse().expect("Id"),
+                Scalar::Value(Value::from("updated")),
+            );
 
             let mut params = Map::new();
             params.insert("key".parse().expect("Id"), Scalar::Value(Value::None));
@@ -514,15 +519,16 @@ fn put_update_range() {
             let handler = route::<State>(&table, &[]).expect("root");
             let txn = MockTxn::new(30);
 
-            let key_selector = Value::Tuple(vec![
-                Value::Tuple(vec![
-                    Value::from("id"),
-                    Value::Tuple(vec![Value::from(1_u64), Value::from(2_u64)]),
-                ]),
-            ]);
+            let key_selector = Value::Tuple(vec![Value::Tuple(vec![
+                Value::from("id"),
+                Value::Tuple(vec![Value::from(1_u64), Value::from(2_u64)]),
+            ])]);
 
             let mut value_map = Map::new();
-            value_map.insert("label".parse().expect("Id"), Scalar::Value(Value::from("range_updated")));
+            value_map.insert(
+                "label".parse().expect("Id"),
+                Scalar::Value(Value::from("range_updated")),
+            );
 
             let mut params = Map::new();
             params.insert("key".parse().expect("Id"), Scalar::Value(key_selector));
@@ -589,12 +595,10 @@ fn post_slice() {
             let handler = route::<State>(&table, &[]).expect("root");
             let txn = MockTxn::new(20);
 
-            let req = Scalar::Value(Value::Tuple(vec![
-                Value::Tuple(vec![
-                    Value::from("id"),
-                    Value::Tuple(vec![Value::from(1_u64), Value::from(2_u64)]),
-                ]),
-            ]));
+            let req = Scalar::Value(Value::Tuple(vec![Value::Tuple(vec![
+                Value::from("id"),
+                Value::Tuple(vec![Value::from(1_u64), Value::from(2_u64)]),
+            ])]));
 
             let fut = handler.post(&txn, req).expect("post");
             let resp = fut.await.expect("response");
@@ -694,7 +698,7 @@ fn static_copy_from_inline_rows() {
 
             match resp {
                 State::Collection(Collection::Table(table)) => {
-                    if let crate::table::Table::Temp(table) = table {
+                    if let crate::table::Table::Temp(table) = *table {
                         assert_eq!(table.count().await, 2);
                         let row = table.read_row(&[Value::from(10_u64)]).await;
                         assert!(row.is_some());
@@ -722,10 +726,12 @@ fn copy_from_direct_method() {
             let root = init_root("copy-direct").await;
             std::fs::create_dir_all(root.join("temp")).expect("create temp dir");
             let cache = Cache::<PersistentFile>::new(16 * 1024 * 1024, None);
-            let dir = Arc::clone(&cache).load(root.join("temp")).expect("load temp dir");
+            let dir = Arc::clone(&cache)
+                .load(root.join("temp"))
+                .expect("load temp dir");
 
-            let dest = crate::table::TempTable::create(simple_schema(), dir)
-                .expect("create temp table");
+            let dest =
+                crate::table::TempTable::create(simple_schema(), dir).expect("create temp table");
 
             dest.copy_from(tx(10), &source).await.expect("copy");
 
@@ -776,12 +782,10 @@ fn key_or_range_range() {
         Box::pin(async {
             use tc_value::Value;
             let table = make_table_with_data().await;
-            let selector = Value::Tuple(vec![
-                Value::Tuple(vec![
-                    Value::from("id"),
-                    Value::Tuple(vec![Value::from(1_u64), Value::from(2_u64)]),
-                ]),
-            ]);
+            let selector = Value::Tuple(vec![Value::Tuple(vec![
+                Value::from("id"),
+                Value::Tuple(vec![Value::from(1_u64), Value::from(2_u64)]),
+            ])]);
             let kor = KeyOrRange::try_from_value(&table, selector).expect("parse range");
             assert!(matches!(kor, KeyOrRange::Range(_)));
         })

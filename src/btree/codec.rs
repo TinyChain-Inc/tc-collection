@@ -3,11 +3,11 @@ use destream::{
     en::{self, EncodeSeq},
 };
 use number_general::Number;
-use tc_error::TCError;
-use tc_ir::{NativeClass, TxnId};
+use safecast::TryCastFrom;
+use tc_ir::NativeClass;
 use tc_value::{Value, ValueType};
 
-use super::{BTree, PersistentFile};
+use super::{BTree, BTreeSchema, PersistentFile};
 
 #[derive(Clone, Debug)]
 pub struct BTreeColumnSchema {
@@ -88,23 +88,36 @@ impl de::FromStream for BTreeColumnSchema {
     }
 }
 
+impl TryCastFrom<Vec<BTreeColumnSchema>> for BTreeSchema {
+    fn can_cast_from(columns: &Vec<BTreeColumnSchema>) -> bool {
+        !columns.is_empty()
+    }
+
+    fn opt_cast_from(columns: Vec<BTreeColumnSchema>) -> Option<Self> {
+        if columns.is_empty() {
+            return None;
+        }
+
+        Some(Self::from_key_types(
+            columns.into_iter().map(|column| column.dtype).collect(),
+        ))
+    }
+}
+
 #[derive(Clone)]
 pub struct BTreeDecodeContext {
     persistent_dir: freqfs::DirLock<PersistentFile>,
     txn_root: freqfs::DirLock<PersistentFile>,
-    txn_id: TxnId,
 }
 
 impl BTreeDecodeContext {
     pub fn new(
         persistent_dir: freqfs::DirLock<PersistentFile>,
         txn_root: freqfs::DirLock<PersistentFile>,
-        txn_id: TxnId,
     ) -> Self {
         Self {
             persistent_dir,
             txn_root,
-            txn_id,
         }
     }
 }
@@ -115,7 +128,9 @@ pub struct DecodedBTreePayload {
     pub btree: BTree,
 }
 
-struct BTreeRows {
+struct BTreeRows;
+
+struct BTreeRowsContext {
     btree: BTree,
 }
 
@@ -123,58 +138,8 @@ fn decode_err(action: &str, err: impl std::fmt::Display) -> String {
     format!("{action}: {err}")
 }
 
-fn btree_schema_value_types(schema: &[BTreeColumnSchema]) -> Result<Vec<ValueType>, TCError> {
-    if schema.is_empty() {
-        return Err(tc_error::bad_request!(
-            "BTree schema must have at least one column"
-        ));
-    }
-
-    Ok(schema.iter().map(|column| column.dtype.clone()).collect())
-}
-
-fn normalize_btree_row(row: Value, key_types: &[ValueType]) -> Result<Vec<Value>, TCError> {
-    let key_arity = key_types.len();
-
-    let values = if key_arity == 1 {
-        vec![row]
-    } else {
-        match row {
-            Value::Tuple(items) => {
-                if items.len() == key_arity {
-                    items
-                } else {
-                    Err(tc_error::bad_request!(
-                        "BTree row arity {} does not match schema arity {}",
-                        items.len(),
-                        key_arity
-                    ))?
-                }
-            }
-            other => Err(tc_error::bad_request!(
-                "BTree row must be a tuple of length {} but got {:?}",
-                key_arity,
-                other
-            ))?,
-        }
-    };
-
-    for (i, (value, expected)) in values.iter().zip(key_types.iter()).enumerate() {
-        let actual = value.class();
-        if &actual != expected {
-            return Err(tc_error::bad_request!(
-                "BTree row column {i} expected {:?} but got {:?}",
-                expected,
-                actual
-            ));
-        }
-    }
-
-    Ok(values)
-}
-
 impl de::FromStream for BTreeRows {
-    type Context = (BTree, TxnId, Vec<ValueType>);
+    type Context = BTreeRowsContext;
 
     async fn from_stream<D: de::Decoder>(
         context: Self::Context,
@@ -182,8 +147,6 @@ impl de::FromStream for BTreeRows {
     ) -> Result<Self, D::Error> {
         struct RowsVisitor {
             btree: BTree,
-            txn_id: TxnId,
-            key_types: Vec<ValueType>,
         }
 
         impl de::Visitor for RowsVisitor {
@@ -197,28 +160,19 @@ impl de::FromStream for BTreeRows {
                 self,
                 mut seq: A,
             ) -> Result<Self::Value, A::Error> {
-                let btree = self.btree;
-                let txn_id = self.txn_id;
-                let key_types = self.key_types;
-
                 while let Some(row_value) = seq.next_element::<Value>(()).await? {
-                    let row =
-                        normalize_btree_row(row_value, &key_types).map_err(de::Error::custom)?;
-                    btree.insert_row(txn_id, row).await.map_err(|err| {
-                        de::Error::custom(decode_err("failed to insert BTree row", err))
+                    self.btree.load_literal_row(row_value).await.map_err(|err| {
+                        de::Error::custom(decode_err("failed to load BTree literal row", err))
                     })?;
                 }
 
-                Ok(BTreeRows { btree })
+                Ok(BTreeRows)
             }
         }
 
-        let (btree, txn_id, key_types) = context;
         decoder
             .decode_seq(RowsVisitor {
-                btree,
-                txn_id,
-                key_types,
+                btree: context.btree,
             })
             .await
     }
@@ -234,7 +188,6 @@ impl de::FromStream for DecodedBTreePayload {
         struct PayloadVisitor {
             persistent_dir: freqfs::DirLock<PersistentFile>,
             txn_root: freqfs::DirLock<PersistentFile>,
-            txn_id: TxnId,
         }
 
         impl de::Visitor for PayloadVisitor {
@@ -253,30 +206,21 @@ impl de::FromStream for DecodedBTreePayload {
                     .await?
                     .ok_or_else(|| de::Error::custom("missing BTree schema"))?;
 
-                let key_types = btree_schema_value_types(&schema).map_err(de::Error::custom)?;
-
-                let btree =
-                    BTree::with_key_types(self.persistent_dir, self.txn_root, key_types.clone());
-                let rows = seq
-                    .next_element::<BTreeRows>((btree.clone(), self.txn_id, key_types))
-                    .await?
-                    .ok_or_else(|| de::Error::custom("missing BTree rows"))?;
+                let btree_schema = BTreeSchema::try_cast_from(schema.clone(), |schema| {
+                    de::Error::custom(format!("invalid BTree schema: {schema:?}"))
+                })?;
+                let btree = BTree::with_schema(self.persistent_dir, self.txn_root, btree_schema);
+                seq.next_element::<BTreeRows>(BTreeRowsContext {
+                    btree: btree.clone(),
+                })
+                .await?
+                .ok_or_else(|| de::Error::custom("missing BTree rows"))?;
 
                 if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
                     return Err(de::Error::custom("BTree payload must be [schema, rows]"));
                 }
 
-                rows.btree.commit(self.txn_id).map_err(|err| {
-                    de::Error::custom(decode_err("failed to commit decoded BTree payload", err))
-                })?;
-                rows.btree.finalize(self.txn_id).await.map_err(|err| {
-                    de::Error::custom(decode_err("failed to finalize decoded BTree payload", err))
-                })?;
-
-                Ok(DecodedBTreePayload {
-                    schema,
-                    btree: rows.btree,
-                })
+                Ok(DecodedBTreePayload { schema, btree })
             }
         }
 
@@ -284,9 +228,7 @@ impl de::FromStream for DecodedBTreePayload {
             .decode_seq(PayloadVisitor {
                 persistent_dir: context.persistent_dir,
                 txn_root: context.txn_root,
-                txn_id: context.txn_id,
             })
             .await
     }
 }
-

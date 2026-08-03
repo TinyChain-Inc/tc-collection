@@ -36,10 +36,7 @@ impl fmt::Debug for TempTable {
 
 impl TempTable {
     /// Create a new temporary table with the given schema.
-    pub fn create(
-        schema: TableSchema,
-        dir: DirLock<PersistentFile>,
-    ) -> std::io::Result<Self> {
+    pub fn create(schema: TableSchema, dir: DirLock<PersistentFile>) -> std::io::Result<Self> {
         let collator = Collator::<Value>::default();
         let table = TableLock::create(schema, collator, dir)?;
         Ok(Self { table })
@@ -81,7 +78,7 @@ impl TempTable {
         view.upsert(key, values)
             .await
             .map(|_| ())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .map_err(std::io::Error::other)
     }
 
     /// Delete a row by key.
@@ -100,7 +97,7 @@ impl TempTable {
         let mut rows = source
             .rows(txn_id, Range::default(), Vec::new(), false)
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
 
         while let Some(row) = rows.try_next().await? {
             let row_vec = row.into_vec();
@@ -115,6 +112,6 @@ impl TempTable {
 
 impl From<TempTable> for crate::Collection {
     fn from(table: TempTable) -> Self {
-        Self::Table(super::Table::from(table))
+        Self::Table(Box::new(super::Table::from(table)))
     }
 }
