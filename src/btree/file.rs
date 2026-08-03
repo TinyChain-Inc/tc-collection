@@ -86,19 +86,9 @@ impl BTreeSchema {
         }
     }
 
-    pub fn from_key_types(key_types: Vec<ValueType>) -> Self {
+    pub(crate) fn from_key_types(key_types: Vec<ValueType>) -> Self {
         let key_arity = key_types.len();
         Self::new(StorageConfig::default(), key_arity, Some(key_types))
-    }
-
-    pub fn try_from_key_types(key_types: Vec<ValueType>) -> Result<Self, TCError> {
-        if key_types.is_empty() {
-            return Err(tc_error::bad_request!(
-                "BTree schema must have at least one column"
-            ));
-        }
-
-        Ok(Self::from_key_types(key_types))
     }
 
     fn normalize_row(&self, row: Value) -> Result<Vec<Value>, TCError> {

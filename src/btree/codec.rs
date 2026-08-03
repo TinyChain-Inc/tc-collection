@@ -3,6 +3,7 @@ use destream::{
     en::{self, EncodeSeq},
 };
 use number_general::Number;
+use safecast::TryCastFrom;
 use tc_ir::NativeClass;
 use tc_value::{Value, ValueType};
 
@@ -84,6 +85,22 @@ impl de::FromStream for BTreeColumnSchema {
         }
 
         decoder.decode_seq(ColumnVisitor).await
+    }
+}
+
+impl TryCastFrom<Vec<BTreeColumnSchema>> for BTreeSchema {
+    fn can_cast_from(columns: &Vec<BTreeColumnSchema>) -> bool {
+        !columns.is_empty()
+    }
+
+    fn opt_cast_from(columns: Vec<BTreeColumnSchema>) -> Option<Self> {
+        if columns.is_empty() {
+            return None;
+        }
+
+        Some(Self::from_key_types(
+            columns.into_iter().map(|column| column.dtype).collect(),
+        ))
     }
 }
 
@@ -189,10 +206,9 @@ impl de::FromStream for DecodedBTreePayload {
                     .await?
                     .ok_or_else(|| de::Error::custom("missing BTree schema"))?;
 
-                let btree_schema = BTreeSchema::try_from_key_types(
-                    schema.iter().map(|column| column.dtype.clone()).collect(),
-                )
-                .map_err(de::Error::custom)?;
+                let btree_schema = BTreeSchema::try_cast_from(schema.clone(), |schema| {
+                    de::Error::custom(format!("invalid BTree schema: {schema:?}"))
+                })?;
                 let btree = BTree::with_schema(self.persistent_dir, self.txn_root, btree_schema);
                 seq.next_element::<BTreeRows>(BTreeRowsContext {
                     btree: btree.clone(),
