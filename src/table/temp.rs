@@ -13,7 +13,7 @@ use std::fmt;
 use b_table::{Range, Row, TableLock};
 use collate::Collator;
 use freqfs::DirLock;
-use futures::TryStreamExt;
+use futures::{stream::BoxStream, TryStreamExt};
 use tc_value::Value;
 
 use super::schema::{TableIndexSchema, TableSchema};
@@ -70,6 +70,13 @@ impl TempTable {
     pub async fn is_empty(&self) -> bool {
         let view = self.table.read().await;
         view.is_empty(Range::default()).await.unwrap_or(true)
+    }
+
+    /// Stream all rows without materializing the table.
+    pub async fn row_stream(
+        &self,
+    ) -> std::io::Result<BoxStream<'static, Result<Row<Value>, std::io::Error>>> {
+        self.table.clone().into_read().await.into_rows().await
     }
 
     /// Insert or update a row.
