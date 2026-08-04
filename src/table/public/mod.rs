@@ -3,9 +3,8 @@
 //! Ports the v1 `table/public.rs` routing logic.  Each route is a separate
 //! handler **struct** (not an enum variant) with a `From` impl, following
 //! the v1 pattern.  Handlers are generic over the response type `State`,
-//! which must support `From<Collection>` and `From<Value>` (and `From<u64>`
-//! for `CountHandler`) — this mirrors v1's `State: From<Collection> + From<Value>
-//! + From<u64>` bounds.
+//! which must support `From<Table>` and `From<Value>` (and `From<u64>` for
+//! `CountHandler`). Table handlers only produce their owned `Table` type.
 //!
 //! The host calls [`route`] to construct the appropriate handler for a given
 //! path, then invokes the verb trait method.  No `Route` trait impl or router
@@ -23,7 +22,7 @@ pub mod selector;
 use freqfs::DirLock;
 
 use crate::PersistentFile;
-use crate::table::PersistentTable;
+use crate::table::{PersistentTable, Table};
 
 pub use handler::{
     ContainsHandler, CopyHandler, CountHandler, CreateHandler, LimitHandler, OrderHandler,
@@ -47,7 +46,6 @@ pub use handler::{
 /// | `["contains"]` | [`ContainsHandler`] |
 /// | `["count"]` | [`CountHandler`] |
 /// | `["key_columns"]` | [`handler::SchemaHandler`] (key column ids) |
-/// | `["key_names"]` | [`handler::SchemaHandler`] (key column ids) |
 /// | `["limit"]` | [`LimitHandler`] |
 /// | `["order"]` | [`OrderHandler`] |
 /// | `["select"]` | [`SelectHandler`] |
@@ -56,7 +54,7 @@ pub fn route<'a, State>(
     path: &[pathlink::PathSegment],
 ) -> Option<Box<dyn RouteHandler<State> + 'a>>
 where
-    State: From<crate::Collection> + From<tc_value::Value> + From<u64> + Clone + Send + 'static,
+    State: From<Table> + From<tc_value::Value> + From<u64> + Clone + Send + 'static,
 {
     if path.is_empty() {
         Some(Box::new(TableHandler::from(table.clone())))
@@ -71,10 +69,6 @@ where
             "key_columns" => Some(Box::new(handler::SchemaHandler::new(
                 table.clone(),
                 handler::key_columns,
-            ))),
-            "key_names" => Some(Box::new(handler::SchemaHandler::new(
-                table.clone(),
-                handler::key_names,
             ))),
             "limit" => Some(Box::new(LimitHandler::from(table.clone()))),
             "order" => Some(Box::new(OrderHandler::from(table.clone()))),
@@ -99,9 +93,7 @@ pub trait RouteHandler<State>: Send + Sync {
         txn: &dyn tc_ir::Transaction,
         request: tc_ir::Scalar,
     ) -> tc_error::TCResult<
-        std::pin::Pin<
-            Box<dyn std::future::Future<Output = tc_error::TCResult<State>> + Send + '_>,
-        >,
+        std::pin::Pin<Box<dyn std::future::Future<Output = tc_error::TCResult<State>> + Send + '_>>,
     >;
 
     fn put(
@@ -109,19 +101,15 @@ pub trait RouteHandler<State>: Send + Sync {
         txn: &dyn tc_ir::Transaction,
         request: tc_ir::Map<tc_ir::Scalar>,
     ) -> tc_error::TCResult<
-        std::pin::Pin<
-            Box<dyn std::future::Future<Output = tc_error::TCResult<()>> + Send + '_>,
-        >,
+        std::pin::Pin<Box<dyn std::future::Future<Output = tc_error::TCResult<()>> + Send + '_>>,
     >;
 
     fn post(
         &self,
         txn: &dyn tc_ir::Transaction,
-        request: tc_ir::Scalar,
+        request: tc_ir::Map<tc_ir::Scalar>,
     ) -> tc_error::TCResult<
-        std::pin::Pin<
-            Box<dyn std::future::Future<Output = tc_error::TCResult<State>> + Send + '_>,
-        >,
+        std::pin::Pin<Box<dyn std::future::Future<Output = tc_error::TCResult<State>> + Send + '_>>,
     >;
 
     fn delete(
@@ -129,9 +117,7 @@ pub trait RouteHandler<State>: Send + Sync {
         txn: &dyn tc_ir::Transaction,
         request: tc_ir::Scalar,
     ) -> tc_error::TCResult<
-        std::pin::Pin<
-            Box<dyn std::future::Future<Output = tc_error::TCResult<()>> + Send + '_>,
-        >,
+        std::pin::Pin<Box<dyn std::future::Future<Output = tc_error::TCResult<()>> + Send + '_>>,
     >;
 }
 
@@ -160,7 +146,7 @@ impl Static {
         path: &[pathlink::PathSegment],
     ) -> Option<Box<dyn StaticRouteHandler<State> + '_>>
     where
-        State: From<crate::Collection> + Clone + Send + 'static,
+        State: From<Table> + Clone + Send + 'static,
     {
         if path.is_empty() {
             Some(Box::new(CreateHandler::new(self.root.clone())))
@@ -178,9 +164,7 @@ pub trait StaticRouteHandler<State>: Send + Sync {
         txn: &dyn tc_ir::Transaction,
         request: tc_ir::Scalar,
     ) -> tc_error::TCResult<
-        std::pin::Pin<
-            Box<dyn std::future::Future<Output = tc_error::TCResult<State>> + Send + '_>,
-        >,
+        std::pin::Pin<Box<dyn std::future::Future<Output = tc_error::TCResult<State>> + Send + '_>>,
     >;
 
     fn post(
@@ -188,9 +172,7 @@ pub trait StaticRouteHandler<State>: Send + Sync {
         txn: &dyn tc_ir::Transaction,
         request: tc_ir::Map<tc_ir::Scalar>,
     ) -> tc_error::TCResult<
-        std::pin::Pin<
-            Box<dyn std::future::Future<Output = tc_error::TCResult<State>> + Send + '_>,
-        >,
+        std::pin::Pin<Box<dyn std::future::Future<Output = tc_error::TCResult<State>> + Send + '_>>,
     >;
 }
 

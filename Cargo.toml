@@ -10,6 +10,7 @@ collate = { path = "../deps/collate", features = ["stream"] }
 destream = { path = "../deps/destream", version = "0.10.1" }
 freqfs = { path = "../deps/freqfs", version = "0.13", features = ["stream"] }
 fensor = { path = "../deps/fensor" }
+ha-ndarray = { path = "../deps/ha-ndarray" }
 futures = "0.3"
 number-general = { path = "../deps/number-general" }
 safecast = "0.2"

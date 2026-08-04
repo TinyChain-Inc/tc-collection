@@ -2,10 +2,9 @@
 
 use super::selector::KeyOrRange;
 use super::{Static, route};
-use crate::Collection;
 use crate::PersistentFile;
 use crate::btree::StorageConfig;
-use crate::table::{Column, PersistentTable, TableSchema};
+use crate::table::{Column, PersistentTable, Table, TableSchema};
 use freqfs::Cache;
 use safecast::TryCastInto;
 use std::path::PathBuf;
@@ -23,11 +22,10 @@ fn tx(nonce: u16) -> TxnId {
     TxnId::from_parts(NetworkTime::from_nanos(1), nonce)
 }
 
-/// Test response type — mirrors v1's `State: From<Collection> + From<Value>
-/// + From<u64>`.
+/// Test response type for table handlers.
 #[derive(Clone, Debug)]
 enum State {
-    Collection(Collection),
+    Collection(Table),
     Value(tc_value::Value),
     Count(u64),
 }
@@ -38,16 +36,16 @@ impl PartialEq for State {
             (Self::Count(a), Self::Count(b)) => a == b,
             (Self::Value(a), Self::Value(b)) => a == b,
             (Self::Collection(a), Self::Collection(b)) => {
-                matches!(a, Collection::Table(_)) && matches!(b, Collection::Table(_))
+                matches!(a, Table::File(_)) && matches!(b, Table::File(_))
             }
             _ => false,
         }
     }
 }
 
-impl From<Collection> for State {
-    fn from(c: Collection) -> Self {
-        Self::Collection(c)
+impl From<Table> for State {
+    fn from(table: Table) -> Self {
+        Self::Collection(table)
     }
 }
 
@@ -199,7 +197,6 @@ fn route_resolves_all_paths() {
             assert!(route::<State>(&table, &[segment("contains")]).is_some());
             assert!(route::<State>(&table, &[segment("count")]).is_some());
             assert!(route::<State>(&table, &[segment("key_columns")]).is_some());
-            assert!(route::<State>(&table, &[segment("key_names")]).is_some());
             assert!(route::<State>(&table, &[segment("limit")]).is_some());
             assert!(route::<State>(&table, &[segment("order")]).is_some());
             assert!(route::<State>(&table, &[segment("select")]).is_some());
@@ -595,10 +592,11 @@ fn post_slice() {
             let handler = route::<State>(&table, &[]).expect("root");
             let txn = MockTxn::new(20);
 
-            let req = Scalar::Value(Value::Tuple(vec![Value::Tuple(vec![
-                Value::from("id"),
-                Value::Tuple(vec![Value::from(1_u64), Value::from(2_u64)]),
-            ])]));
+            let mut req = Map::new();
+            req.insert(
+                "id".parse().expect("id"),
+                Scalar::Value(Value::Tuple(vec![Value::from(1_u64), Value::from(2_u64)])),
+            );
 
             let fut = handler.post(&txn, req).expect("post");
             let resp = fut.await.expect("response");
@@ -697,18 +695,14 @@ fn static_copy_from_inline_rows() {
             let resp = fut.await.expect("response");
 
             match resp {
-                State::Collection(Collection::Table(table)) => {
-                    if let crate::table::Table::Temp(table) = *table {
-                        assert_eq!(table.count().await, 2);
-                        let row = table.read_row(&[Value::from(10_u64)]).await;
-                        assert!(row.is_some());
-                        assert_eq!(
-                            row.unwrap().as_ref(),
-                            &[Value::from(10_u64), Value::from("row1")]
-                        );
-                    } else {
-                        panic!("expected Temp table");
-                    }
+                State::Collection(Table::Temp(table)) => {
+                    assert_eq!(table.count().await, 2);
+                    let row = table.read_row(&[Value::from(10_u64)]).await;
+                    assert!(row.is_some());
+                    assert_eq!(
+                        row.unwrap().as_ref(),
+                        &[Value::from(10_u64), Value::from("row1")]
+                    );
                 }
                 other => panic!("expected collection, got {other:?}"),
             }

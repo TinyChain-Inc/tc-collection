@@ -38,7 +38,7 @@ The `table/` module decomposes into six files:
 | `table/stream.rs` | `Rows<'a>` (a read-permit-bound row stream) and `TableView<'en>` (`IntoView` encoder). `Rows::limit` / `Rows::select` are lazy row transforms applied while streaming. |
 | `table/view.rs` | Lazy view structs: `Limited<T>` (row cap), `Selection<T>` (column projection), and `TableSlice<Txn, FE>` (range + order + reverse). Each re-implements the trait surface by delegating to its source. |
 | `table/file.rs` | `TableFile<Txn, FE>`: the transactional engine. Owns the canonical version, committed deltas, pending deltas, the finalize frontier, and a range semaphore. Implements `Transact` (commit/rollback/finalize), `Persist`, `CopyFrom`, `Restore`, and `de::FromStream`. |
-| `table/public.rs` | Route handlers and the `Route` impls for `Table` / `TableFile` / `Static`: `create`, `copy_from`, row read/slice/upsert/update/truncate/delete, `columns`, `key_columns`, `key_names`, `contains`, `count`, `limit`, `order`, `select`. |
+| `table/public.rs` | Route handlers and the `Route` impls for `Table` / `TableFile` / `Static`: `create`, `copy_from`, row read/slice/upsert/update/truncate/delete, `columns`, `key_columns`, `contains`, `count`, `limit`, `order`, `select`. |
 
 ## 2. Boundary decisions
 
@@ -170,7 +170,6 @@ envelopes rather than adapter-specific shapes.
 | `<table>/contains` | GET | `ContainsHandler` (All/Key/Range) | port: `is_empty` / `read` / slice `is_empty` | `bad_request` on invalid selector |
 | `<table>/count` | GET | `CountHandler` (All/Key/Range) | port: `count` / read-presence (0/1) / slice `count` | `bad_request` on invalid selector |
 | `<table>/key_columns` | GET | `SchemaHandler` (`key_columns`) | port: return key column ids | — |
-| `<table>/key_names` | GET | `SchemaHandler` (`key_names`) | port: return key column ids | — |
 | `<table>/limit` | GET | `LimitHandler` | port: `limit(n)` → `Limited` view | `bad_request` if limit too large |
 | `<table>/order` | GET | `OrderHandler` (`(cols, rev)` or `cols`) | port: `order_by(cols, rev)` → `TableSlice` | `bad_request` on invalid column list |
 | `<table>/select` | GET | `SelectHandler` | port: `select(cols)` → `Selection` view | `bad_request` if column absent |
@@ -391,7 +390,7 @@ issues satisfy the green-test items.)
       - `static_route.rs` — `TableStaticRoute` for `create`/`copy_from`
       - `tests.rs` — route-level test coverage
 - [x] `TableRouter` implements `tc_ir::Route` for per-instance table routes
-      (`columns`, `contains`, `count`, `key_columns`, `key_names`, `limit`,
+      (`columns`, `contains`, `count`, `key_columns`, `limit`,
       `order`, `select`, root read/slice/upsert/update/truncate/delete).
 - [x] `TableStatic` implements `tc_ir::Route` for class-level routes (`create`,
       `copy_from`).

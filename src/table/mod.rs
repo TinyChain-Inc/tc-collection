@@ -20,6 +20,10 @@ pub use temp::TempTable;
 pub use view::{Limited, Selection, TableSlice};
 
 pub use b_table::{ColumnRange, Range, Row};
+use futures::{StreamExt, stream::BoxStream};
+use tc_error::TCResult;
+use tc_ir::TxnId;
+use tc_value::Value;
 
 /// A relational database table, or a view of one.
 ///
@@ -73,6 +77,38 @@ impl Table {
             Self::Limited(t) => t.schema(),
             Self::Selection(t) => t.schema(),
         }
+    }
+
+    /// Return a lazy row stream for this table or view at `txn_id`.
+    pub async fn row_stream(
+        &self,
+        txn_id: TxnId,
+    ) -> TCResult<BoxStream<'static, Result<Row<Value>, std::io::Error>>> {
+        let rows = match self {
+            Self::File(table) => table
+                .rows(txn_id, Range::default(), Vec::new(), false)
+                .await
+                .map_err(tc_error::TCError::from)?
+                .boxed(),
+            Self::Temp(table) => table.row_stream(),
+            Self::Slice(table) => table
+                .rows(txn_id)
+                .await
+                .map_err(tc_error::TCError::from)?
+                .boxed(),
+            Self::Limited(table) => table
+                .rows(txn_id)
+                .await
+                .map_err(tc_error::TCError::from)?
+                .boxed(),
+            Self::Selection(table) => table
+                .rows(txn_id)
+                .await
+                .map_err(tc_error::TCError::from)?
+                .boxed(),
+        };
+
+        Ok(rows)
     }
 }
 

@@ -13,7 +13,7 @@ use std::fmt;
 use b_table::{Range, Row, TableLock};
 use collate::Collator;
 use freqfs::DirLock;
-use futures::TryStreamExt;
+use futures::{SinkExt, StreamExt, TryStreamExt, channel::mpsc, stream::BoxStream};
 use tc_value::Value;
 
 use super::schema::{TableIndexSchema, TableSchema};
@@ -70,6 +70,44 @@ impl TempTable {
     pub async fn is_empty(&self) -> bool {
         let view = self.table.read().await;
         view.is_empty(Range::default()).await.unwrap_or(true)
+    }
+
+    /// Stream all rows without materializing the table.
+    ///
+    /// The read guard must remain alive for the stream's lifetime. A bounded
+    /// channel keeps that guard inside one producer task while applying
+    /// backpressure to the consumer after a single row.
+    pub fn row_stream(&self) -> BoxStream<'static, Result<Row<Value>, std::io::Error>> {
+        let table = self.table.clone();
+        let (mut sender, receiver) = mpsc::channel(1);
+
+        tokio::spawn(async move {
+            let view = table.into_read().await;
+            let mut rows = match view.rows(Range::default(), &[], false, None).await {
+                Ok(rows) => rows,
+                Err(err) => {
+                    let _ = sender.send(Err(err)).await;
+                    return;
+                }
+            };
+
+            loop {
+                match rows.try_next().await {
+                    Ok(Some(row)) => {
+                        if sender.send(Ok(row)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(err) => {
+                        let _ = sender.send(Err(err)).await;
+                        return;
+                    }
+                }
+            }
+        });
+
+        receiver.boxed()
     }
 
     /// Insert or update a row.

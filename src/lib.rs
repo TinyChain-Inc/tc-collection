@@ -8,6 +8,7 @@ pub use persistent_file::PersistentFile;
 pub mod btree;
 pub mod collection;
 pub mod table;
+pub mod tensor;
 
 pub use collection::Collection;
 pub use table::Table;

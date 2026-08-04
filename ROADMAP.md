@@ -44,12 +44,20 @@
        - v1 parity port rules in `TRANSACTIONAL_COLLECTION_CONTRACT.md` are satisfied and any intentional divergence is documented.
        - parity matrix is documented and green for required v1 behaviors.
        - performance and reliability regression gates pass against v1 baselines.
+    - **Operation/stream ownership:** expose BTree and Table route behavior through the universal
+      `State` operation and async stream contracts. Collection implementations own validation,
+      projection, range scans, and incremental output; neither `tc-server`'s executor nor its
+      HTTP/PyO3 codecs may match on BTree or Table. A projected slice must stream only the
+      selected data and never materialize the enclosing collection.
+    - **Table POST contract:** retain v1's map-shaped selector as a shared State/IR form. The
+      Table route must not invent an arbitrary parameter wrapper or depend on a `tc-server`
+      conversion; complete the shared representation first, then adapt the collection handler.
 
 5. **fensor extraction and integration plan.**
-   - Treat `fensor` as a managed dependency under `deps/fensor` and keep `tc-collection` as a thin facade/re-export during migration.
+   - Treat `fensor` as a managed dependency under `deps/fensor`. It replaces the current in-memory `ha-ndarray` storage shim behind the existing `tc-collection::tensor::Tensor` type; it must not introduce a second public Tensor type or route family.
    - Own transaction lifecycle orchestration in `tc-collection` (pending/committed deltas plus commit/rollback/finalize) while treating `fensor` as a non-transactional storage primitive.
    - Track storage/index maturation in `deps/fensor/ROADMAP.md` and wire completion milestones back into collection delivery gates.
-   - Define the cutover plan from transitional in-memory tensors to `freqfs`-backed `fensor` tensors across `tc-state` and host lifecycle paths.
+   - Define the storage cutover from in-memory tensors to `freqfs`-backed `fensor` tensors inside `tc-collection`, without changes to `tc-state`, `tc-server`, client URIs, or adapter behavior.
    - Enforce `fensor` fail-closed integrity semantics: corruption in metadata/data must be surfaced as errors, with no auto-recovery in `fensor`; operational recovery is handled above the storage layer.
 
 6. **Transactional tensor orchestration over `fensor`.**
@@ -60,24 +68,21 @@
    - Chain variants remain authoritative for replay-log durability and canonical ordering; Tensor structures apply chain events and fail closed on ambiguity.
    - Exit criteria: commit/rollback/finalize visibility tests and restart recovery tests pass.
    - Exit criteria: transactional contract checklist in `TRANSACTIONAL_COLLECTION_CONTRACT.md` is green for Tensor.
+   - Cutover sequence:
+     1. Complete fensor dense metadata/block/view operations and streaming reads.
+     2. Adapt the existing Tensor implementation to a storage trait implemented by fensor, without exposing that trait at the public API.
+     3. Add transactional pending/committed delta handling around fensor roots in `tc-collection` and prove restart/finalize behavior.
+     4. Switch the sole Tensor implementation to fensor storage and delete the in-memory `ha-ndarray` storage shim in the same change.
+     5. Retain `ha-ndarray` only where fensor explicitly delegates execution; do not retain it as an alternate Tensor persistence or route implementation.
 
-7. **Canonical Tensor API and routing ownership (v1 alignment).**
-    - Define `tc-collection` as the sole owner of transactional Tensor API
-       semantics and route-facing operation behavior.
-    - Provide one canonical Tensor interface consumed by `tc-server` resolver
-       paths for metadata/view ops (`dtype`, `shape`, `size`, `reshape`,
-       `broadcast`, `expand_dims`, `transpose`, `slice`) and math/reduction ops.
-    - Treat `tc-state` Tensor methods as transitional compatibility only during
-       migration; do not add new canonical Tensor route semantics there.
-    - Add parity tests proving `tc-server` Tensor routing behavior is driven by
-       `tc-collection` APIs, not duplicated host logic.
-    - Exit criteria:
-         - `tc-server` depends on `tc-collection` for authoritative Tensor routing
-            behavior.
-         - transactional Tensor type + route semantics are co-located in
-            `tc-collection`.
-         - redundant Tensor route logic in `tc-state` is removed or reduced to
-            compatibility scaffolding.
+7. **Canonical Tensor API and routing ownership (complete).**
+    - `tc-collection` owns Tensor representation, validation, wire encoding,
+      metadata/view operations, and numerical/reduction operations.
+    - `tc-state` delegates through the universal State operation surface; it
+      does not duplicate Tensor semantics.
+    - `tc-server` has no Tensor-specific resolver, codec, or PyO3 branch.
+    - Tensor uses the same State operation and stream contracts as BTree and
+      Table.
 
 
 ## Deferred explorations
