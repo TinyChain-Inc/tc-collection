@@ -20,7 +20,7 @@ pub use temp::TempTable;
 pub use view::{Limited, Selection, TableSlice};
 
 pub use b_table::{ColumnRange, Range, Row};
-use futures::{StreamExt, stream::BoxStream};
+use futures::{stream::BoxStream, StreamExt};
 use tc_error::TCResult;
 use tc_ir::TxnId;
 use tc_value::Value;
@@ -87,25 +87,12 @@ impl Table {
         let rows = match self {
             Self::File(table) => table
                 .rows(txn_id, Range::default(), Vec::new(), false)
-                .await
-                .map_err(tc_error::TCError::from)?
+                .await?
                 .boxed(),
-            Self::Temp(table) => table.row_stream(),
-            Self::Slice(table) => table
-                .rows(txn_id)
-                .await
-                .map_err(tc_error::TCError::from)?
-                .boxed(),
-            Self::Limited(table) => table
-                .rows(txn_id)
-                .await
-                .map_err(tc_error::TCError::from)?
-                .boxed(),
-            Self::Selection(table) => table
-                .rows(txn_id)
-                .await
-                .map_err(tc_error::TCError::from)?
-                .boxed(),
+            Self::Temp(table) => table.row_stream().await?,
+            Self::Slice(table) => table.rows(txn_id).await?.boxed(),
+            Self::Limited(table) => table.rows(txn_id).await?.boxed(),
+            Self::Selection(table) => table.rows(txn_id).await?.boxed(),
         };
 
         Ok(rows)
