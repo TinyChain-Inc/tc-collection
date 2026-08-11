@@ -6,10 +6,9 @@
 //! which must support `From<Table>` and `From<Value>` (and `From<u64>` for
 //! `CountHandler`). Table handlers only produce their owned `Table` type.
 //!
-//! The host calls [`route`] to construct the appropriate handler for a given
-//! path, then invokes the verb trait method.  No `Route` trait impl or router
-//! struct is needed — the host owns routing, consistent with `AGENTS.md`
-//! ("keep routing logic shard-local and lean").
+//! [`TableRoutes`] resolves a path to a [`TableRoute`], which implements the
+//! same native [`tc_ir::Handler`] contract as every other collection. Routing
+//! and execution remain table-owned and serialization-free.
 //!
 //! ## Module layout
 //!
@@ -19,161 +18,158 @@
 pub mod handler;
 pub mod selector;
 
-use freqfs::DirLock;
-
-use crate::PersistentFile;
-use crate::table::{PersistentTable, Table};
+use crate::table::PersistentTable;
 
 pub use handler::{
-    ContainsHandler, CopyHandler, CountHandler, CreateHandler, LimitHandler, OrderHandler,
-    SelectHandler, TableHandler,
+    ContainsHandler, CountHandler, LimitHandler, OrderHandler, SelectHandler, TableHandler,
 };
+/// Owned routes for one persistent table.
+#[derive(Clone)]
+pub struct TableRoutes<State: crate::CollectionState> {
+    table: PersistentTable<State::Txn>,
+    state: std::marker::PhantomData<fn() -> State>,
+}
 
-/// Construct the appropriate handler for the given table and path.
-///
-/// Returns `None` if the path does not match any known route.
-///
-/// This is the v2 analogue of v1's `route` function in `table/public.rs`.
-/// The host calls this to obtain a handler, then invokes the verb trait
-/// method (`get`, `put`, `post`, or `delete`).
-///
-/// Route table (parity port §4):
-///
-/// | Path | Handler |
-/// |------|---------|
-/// | `[]` | [`TableHandler`] (read/slice/upsert/update/truncate/delete) |
-/// | `["columns"]` | [`handler::SchemaHandler`] (column names) |
-/// | `["contains"]` | [`ContainsHandler`] |
-/// | `["count"]` | [`CountHandler`] |
-/// | `["key_columns"]` | [`handler::SchemaHandler`] (key column ids) |
-/// | `["limit"]` | [`LimitHandler`] |
-/// | `["order"]` | [`OrderHandler`] |
-/// | `["select"]` | [`SelectHandler`] |
-pub fn route<'a, State>(
-    table: &'a PersistentTable,
-    path: &[pathlink::PathSegment],
-) -> Option<Box<dyn RouteHandler<State> + 'a>>
-where
-    State: From<Table> + From<tc_value::Value> + From<u64> + Clone + Send + 'static,
-{
-    if path.is_empty() {
-        Some(Box::new(TableHandler::from(table.clone())))
-    } else if path.len() == 1 {
-        match path[0].as_str() {
-            "columns" => Some(Box::new(handler::SchemaHandler::new(
-                table.clone(),
-                handler::column_schema,
-            ))),
-            "contains" => Some(Box::new(ContainsHandler::from(table.clone()))),
-            "count" => Some(Box::new(CountHandler::from(table.clone()))),
-            "key_columns" => Some(Box::new(handler::SchemaHandler::new(
-                table.clone(),
-                handler::key_columns,
-            ))),
-            "limit" => Some(Box::new(LimitHandler::from(table.clone()))),
-            "order" => Some(Box::new(OrderHandler::from(table.clone()))),
-            "select" => Some(Box::new(SelectHandler::from(table.clone()))),
-            _ => None,
+impl<State: crate::CollectionState> TableRoutes<State> {
+    pub fn new(table: PersistentTable<State::Txn>) -> Self {
+        Self {
+            table,
+            state: std::marker::PhantomData,
         }
-    } else {
-        None
     }
 }
 
-/// Trait object returned by [`route`].  Each handler struct implements this
-/// via its `HandleGet`/`HandlePut`/`HandlePost`/`HandleDelete` impls.
-///
-/// This is the v2 analogue of v1's `Box<dyn Handler<'a, State> + 'a>`.
-/// Unlike v1, the verb traits have associated types that make them
-/// non-object-safe, so we use a custom dispatch trait that erases the
-/// future types while preserving the request/response types.
-pub trait RouteHandler<State>: Send + Sync {
-    fn get(
-        &self,
-        txn: &dyn tc_ir::Transaction,
-        request: tc_ir::Scalar,
-    ) -> tc_error::TCResult<
-        std::pin::Pin<Box<dyn std::future::Future<Output = tc_error::TCResult<State>> + Send + '_>>,
-    >;
-
-    fn put(
-        &self,
-        txn: &dyn tc_ir::Transaction,
-        request: tc_ir::Map<tc_ir::Scalar>,
-    ) -> tc_error::TCResult<
-        std::pin::Pin<Box<dyn std::future::Future<Output = tc_error::TCResult<()>> + Send + '_>>,
-    >;
-
-    fn post(
-        &self,
-        txn: &dyn tc_ir::Transaction,
-        request: tc_ir::Map<tc_ir::Scalar>,
-    ) -> tc_error::TCResult<
-        std::pin::Pin<Box<dyn std::future::Future<Output = tc_error::TCResult<State>> + Send + '_>>,
-    >;
-
-    fn delete(
-        &self,
-        txn: &dyn tc_ir::Transaction,
-        request: tc_ir::Scalar,
-    ) -> tc_error::TCResult<
-        std::pin::Pin<Box<dyn std::future::Future<Output = tc_error::TCResult<()>> + Send + '_>>,
-    >;
+/// A concrete table route handler.
+pub enum TableRoute<State: crate::CollectionState> {
+    Table(TableHandler<State::Txn>),
+    Columns(handler::SchemaHandler<State::Txn>),
+    Contains(ContainsHandler<State::Txn>),
+    Count(CountHandler<State::Txn>),
+    KeyColumns(handler::SchemaHandler<State::Txn>),
+    Limit(LimitHandler<State::Txn>),
+    Order(OrderHandler<State::Txn>),
+    Select(SelectHandler<State::Txn>),
+    State(std::marker::PhantomData<fn() -> State>),
 }
 
-/// Static route handler for table construction.
-///
-/// Ported from v1 `Static` in `table/public.rs`:
-/// - `GET /state/collection/table` → [`CreateHandler`] (create a new table)
-/// - `POST /state/collection/table/copy_from` → [`CopyHandler`]
-pub struct Static {
-    root: DirLock<PersistentFile>,
-}
+impl<State: crate::CollectionState> tc_ir::Route<State> for TableRoutes<State> {
+    type Handler = TableRoute<State>;
 
-impl Static {
-    pub fn new(root: DirLock<PersistentFile>) -> Self {
-        Self { root }
-    }
-
-    /// Construct the appropriate static handler for the given path.
-    ///
-    /// | Path | Handler |
-    /// |------|---------|
-    /// | `[]` | [`CreateHandler`] |
-    /// | `["copy_from"]` | [`CopyHandler`] |
-    pub fn route<State>(
-        &self,
-        path: &[pathlink::PathSegment],
-    ) -> Option<Box<dyn StaticRouteHandler<State> + '_>>
-    where
-        State: From<Table> + Clone + Send + 'static,
-    {
-        if path.is_empty() {
-            Some(Box::new(CreateHandler::new(self.root.clone())))
-        } else if path.len() == 1 && path[0].as_str() == "copy_from" {
-            Some(Box::new(CopyHandler::new(self.root.clone())))
+    fn route(&self, path: &[pathlink::PathSegment]) -> Option<Self::Handler> {
+        let route = if path.is_empty() {
+            TableRoute::Table(TableHandler::from(self.table.clone()))
+        } else if path.len() == 1 {
+            match path[0].as_str() {
+                "columns" => TableRoute::Columns(handler::SchemaHandler::new(
+                    self.table.clone(),
+                    handler::column_schema,
+                )),
+                "contains" => TableRoute::Contains(ContainsHandler::from(self.table.clone())),
+                "count" => TableRoute::Count(CountHandler::from(self.table.clone())),
+                "key_columns" => TableRoute::KeyColumns(handler::SchemaHandler::new(
+                    self.table.clone(),
+                    handler::key_columns,
+                )),
+                "limit" => TableRoute::Limit(LimitHandler::from(self.table.clone())),
+                "order" => TableRoute::Order(OrderHandler::from(self.table.clone())),
+                "select" => TableRoute::Select(SelectHandler::from(self.table.clone())),
+                _ => return None,
+            }
         } else {
-            None
-        }
+            return None;
+        };
+
+        Some(route)
     }
 }
 
-pub trait StaticRouteHandler<State>: Send + Sync {
-    fn get(
-        &self,
-        txn: &dyn tc_ir::Transaction,
-        request: tc_ir::Scalar,
-    ) -> tc_error::TCResult<
-        std::pin::Pin<Box<dyn std::future::Future<Output = tc_error::TCResult<State>> + Send + '_>>,
-    >;
+/// Resolve a persistent table route for the caller's universal state type.
+pub fn route<State: crate::CollectionState>(
+    table: &PersistentTable<State::Txn>,
+    path: &[pathlink::PathSegment],
+) -> Option<TableRoute<State>> {
+    tc_ir::Route::route(&TableRoutes::new(table.clone()), path)
+}
 
-    fn post(
+impl<State> tc_ir::Handler<State> for TableRoute<State>
+where
+    State: crate::CollectionState,
+{
+    async fn get(&self, txn: &State::Txn, request: tc_ir::Scalar) -> tc_error::TCResult<State> {
+        match self {
+            Self::Table(handler) => handler.get(txn, request)?.await,
+            Self::Columns(handler) | Self::KeyColumns(handler) => handler.get(txn, request)?.await,
+            Self::Contains(handler) => handler.get(txn, request)?.await,
+            Self::Count(handler) => handler.get(txn, request)?.await,
+            Self::Limit(handler) => handler.get(txn, request)?.await,
+            Self::Order(handler) => handler.get(txn, request)?.await,
+            Self::Select(handler) => handler.get(txn, request)?.await,
+            Self::State(_) => unreachable!("route state marker is never constructed"),
+        }
+    }
+
+    async fn put(
         &self,
-        txn: &dyn tc_ir::Transaction,
-        request: tc_ir::Map<tc_ir::Scalar>,
-    ) -> tc_error::TCResult<
-        std::pin::Pin<Box<dyn std::future::Future<Output = tc_error::TCResult<State>> + Send + '_>>,
-    >;
+        txn: &State::Txn,
+        key: tc_ir::Scalar,
+        value: State,
+    ) -> tc_error::TCResult<()> {
+        let request = [
+            ("key".parse().expect("static key id"), key),
+            (
+                "value".parse().expect("static value id"),
+                value.into_scalar()?,
+            ),
+        ]
+        .into_iter()
+        .collect();
+        match self {
+            Self::Table(handler) => handler.put(txn, request)?.await,
+            Self::Columns(handler) | Self::KeyColumns(handler) => handler.put(txn, request)?.await,
+            Self::Contains(handler) => handler.put(txn, request)?.await,
+            Self::Count(handler) => handler.put(txn, request)?.await,
+            Self::Limit(handler) => handler.put(txn, request)?.await,
+            Self::Order(handler) => handler.put(txn, request)?.await,
+            Self::Select(handler) => handler.put(txn, request)?.await,
+            Self::State(_) => unreachable!("route state marker is never constructed"),
+        }
+    }
+
+    async fn post(
+        &self,
+        txn: &State::Txn,
+        request: tc_ir::Map<State>,
+    ) -> tc_error::TCResult<State> {
+        let request = request
+            .into_iter()
+            .map(|(id, value)| value.into_scalar().map(|value| (id, value)))
+            .collect::<tc_error::TCResult<tc_ir::Map<_>>>()?;
+        match self {
+            Self::Table(handler) => handler.post(txn, request)?.await,
+            Self::Columns(handler) | Self::KeyColumns(handler) => handler.post(txn, request)?.await,
+            Self::Contains(handler) => handler.post(txn, request)?.await,
+            Self::Count(handler) => handler.post(txn, request)?.await,
+            Self::Limit(handler) => handler.post(txn, request)?.await,
+            Self::Order(handler) => handler.post(txn, request)?.await,
+            Self::Select(handler) => handler.post(txn, request)?.await,
+            Self::State(_) => unreachable!("route state marker is never constructed"),
+        }
+    }
+
+    async fn delete(&self, txn: &State::Txn, request: tc_ir::Scalar) -> tc_error::TCResult<()> {
+        match self {
+            Self::Table(handler) => handler.delete(txn, request)?.await,
+            Self::Columns(handler) | Self::KeyColumns(handler) => {
+                handler.delete(txn, request)?.await
+            }
+            Self::Contains(handler) => handler.delete(txn, request)?.await,
+            Self::Count(handler) => handler.delete(txn, request)?.await,
+            Self::Limit(handler) => handler.delete(txn, request)?.await,
+            Self::Order(handler) => handler.delete(txn, request)?.await,
+            Self::Select(handler) => handler.delete(txn, request)?.await,
+            Self::State(_) => unreachable!("route state marker is never constructed"),
+        }
+    }
 }
 
 #[cfg(test)]

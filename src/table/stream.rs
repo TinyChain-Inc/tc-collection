@@ -4,8 +4,10 @@
 //! that stays lazy throughout view composition. `limit` and `select` are
 //! applied as stream transforms (`take`, column projection) so no full table
 //! or intermediate result is ever materialized.
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use b_table::Row;
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
@@ -13,8 +15,6 @@ use tc_ir::Id;
 use tc_value::Value;
 
 use super::schema::TableSchema;
-
-type Permit = txn_lock::semaphore::PermitRead<txn_lock::set::Range<Vec<Value>>>;
 
 type RowStream = BoxStream<'static, Result<Row<Value>, std::io::Error>>;
 
@@ -27,15 +27,14 @@ type RowStream = BoxStream<'static, Result<Row<Value>, std::io::Error>>;
 /// Fields are dropped in declaration order (`stream` before `_permit`), so the
 /// stream is released before the permit notifies blocked transactions.
 pub struct Rows {
-    stream: RowStream,
-    _permit: Permit,
+    inner:
+        crate::stream::GuardedStream<Result<Row<Value>, std::io::Error>, crate::stream::ReadPermit>,
 }
 
 impl Rows {
-    pub(crate) fn new(stream: RowStream, permit: Permit) -> Self {
+    pub(crate) fn new(stream: RowStream, permit: crate::stream::ReadPermit) -> Self {
         Self {
-            stream,
-            _permit: permit,
+            inner: crate::stream::GuardedStream::new(stream, permit),
         }
     }
 
@@ -45,8 +44,9 @@ impl Rows {
     /// returned `Rows` is polled.
     pub fn limit(self, n: u64) -> Self {
         let n = n.try_into().unwrap_or(usize::MAX);
-        let stream = self.stream.take(n);
-        Self::new(stream.boxed(), self._permit)
+        Self {
+            inner: self.inner.transform(|stream| stream.take(n).boxed()),
+        }
     }
 
     /// Project only the given `columns` from each row.
@@ -56,12 +56,18 @@ impl Rows {
     /// consumed until the returned `Rows` is polled.
     pub fn select(self, schema: &TableSchema, columns: &[Id]) -> Self {
         let indices = Self::column_indices(schema, columns);
-        let stream = self.stream.map_ok(move |row| {
-            let projected: Row<Value> =
-                indices.iter().filter_map(|&i| row.get(i).cloned()).collect();
-            projected
-        });
-        Self::new(stream.boxed(), self._permit)
+        Self {
+            inner: self.inner.transform(|stream| {
+                stream
+                    .map_ok(move |row| {
+                        indices
+                            .iter()
+                            .filter_map(|&i| row.get(i).cloned())
+                            .collect::<Row<Value>>()
+                    })
+                    .boxed()
+            }),
+        }
     }
 
     fn column_indices(schema: &TableSchema, columns: &[Id]) -> Vec<usize> {
@@ -83,6 +89,6 @@ impl futures::Stream for Rows {
     type Item = Result<Row<Value>, std::io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.stream.as_mut().poll_next(cx)
+        Pin::new(&mut self.inner).poll_next(cx)
     }
 }

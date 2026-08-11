@@ -13,6 +13,7 @@ mod broadcast_reduce;
 mod core;
 mod dtype;
 mod matmul;
+pub(crate) mod route;
 mod transpose;
 mod wire;
 
@@ -148,4 +149,5 @@ pub use add::{broadcast_add, exact_shape_add};
 pub use broadcast_reduce::broadcast_reduce_sum;
 pub use dtype::{TensorDtypeGuard, TensorOpError, tensor_op_result};
 pub use matmul::batched_matmul;
+pub use route::{TensorRoute, TensorRoutes};
 pub use transpose::{tensor_transpose, transpose_output_shape};

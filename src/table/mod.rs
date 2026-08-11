@@ -3,24 +3,23 @@
 //! - `file`: runtime behavior, transaction state, and query/mutation logic.
 //! - `stream`: permit-bound row stream with lazy `limit`/`select` transforms.
 //! - `view`: lazy view structs (`TableSlice`, `Limited`, `Selection`).
-//! - `temp`: temporary non-transactional `TempTable` backed by `b-table`.
 //! - `public`: public API route handlers (ports v1 `public.rs`).
 //! - `tests`: behavioral regression coverage for transactional visibility semantics.
+mod codec;
 mod file;
 pub mod public;
 mod schema;
 mod stream;
-mod temp;
 mod view;
 
+pub use codec::DecodedTablePayload;
 pub use file::PersistentTable;
 pub use schema::{Column, TableIndexSchema, TableSchema};
 pub use stream::Rows;
-pub use temp::TempTable;
 pub use view::{Limited, Selection, TableSlice};
 
 pub use b_table::{ColumnRange, Range, Row};
-use futures::{stream::BoxStream, StreamExt};
+use futures::{StreamExt, stream::BoxStream};
 use tc_error::TCResult;
 use tc_ir::TxnId;
 use tc_value::Value;
@@ -30,49 +29,41 @@ use tc_value::Value;
 /// Ported from v1 `Table<Txn, FE>` enum.  All view types convert into this
 /// via `From`, and this converts into [`crate::Collection`] via `From`.
 #[derive(Clone, Debug)]
-pub enum Table {
-    File(PersistentTable),
-    Temp(TempTable),
-    Slice(TableSlice),
-    Limited(Limited),
-    Selection(Selection),
+pub enum Table<Txn = ()> {
+    File(PersistentTable<Txn>),
+    Slice(TableSlice<Txn>),
+    Limited(Limited<Txn>),
+    Selection(Selection<Txn>),
 }
 
-impl From<PersistentTable> for Table {
-    fn from(table: PersistentTable) -> Self {
+impl<Txn> From<PersistentTable<Txn>> for Table<Txn> {
+    fn from(table: PersistentTable<Txn>) -> Self {
         Self::File(table)
     }
 }
 
-impl From<TempTable> for Table {
-    fn from(table: TempTable) -> Self {
-        Self::Temp(table)
-    }
-}
-
-impl From<TableSlice> for Table {
-    fn from(slice: TableSlice) -> Self {
+impl<Txn> From<TableSlice<Txn>> for Table<Txn> {
+    fn from(slice: TableSlice<Txn>) -> Self {
         Self::Slice(slice)
     }
 }
 
-impl From<Limited> for Table {
-    fn from(limited: Limited) -> Self {
+impl<Txn> From<Limited<Txn>> for Table<Txn> {
+    fn from(limited: Limited<Txn>) -> Self {
         Self::Limited(limited)
     }
 }
 
-impl From<Selection> for Table {
-    fn from(selection: Selection) -> Self {
+impl<Txn> From<Selection<Txn>> for Table<Txn> {
+    fn from(selection: Selection<Txn>) -> Self {
         Self::Selection(selection)
     }
 }
 
-impl Table {
+impl<Txn> Table<Txn> {
     pub fn schema(&self) -> &TableSchema {
         match self {
             Self::File(t) => t.schema(),
-            Self::Temp(t) => t.schema(),
             Self::Slice(t) => t.schema(),
             Self::Limited(t) => t.schema(),
             Self::Selection(t) => t.schema(),
@@ -89,7 +80,6 @@ impl Table {
                 .rows(txn_id, Range::default(), Vec::new(), false)
                 .await?
                 .boxed(),
-            Self::Temp(table) => table.row_stream().await?,
             Self::Slice(table) => table.rows(txn_id).await?.boxed(),
             Self::Limited(table) => table.rows(txn_id).await?.boxed(),
             Self::Selection(table) => table.rows(txn_id).await?.boxed(),

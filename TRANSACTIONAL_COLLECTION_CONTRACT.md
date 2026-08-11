@@ -153,23 +153,8 @@ The following parity checklist items have no test coverage in this crate yet:
 2. Corruption/malformed persisted state tests failing closed with structured
    errors.
  3. Read/write/range/scan benchmarks with regression budgets vs v1 baselines.
- 4. Tensor lifecycle parity (see `ROADMAP.md` items 5-6); `Collection`
-    currently has the `BTree` and `Table` variants.
-
-## Table v1 parity port
-
-The transactional `Table` variant has a dedicated parity/port spec that is the
-required gate for every Table implementation slice:
-
-- **[`TABLE_PARITY_PORT.md`](TABLE_PARITY_PORT.md)** — v1 inventory (pinned to
-  tinychain commit `17ef342e8f7026e4c4a60d2044de9aeb1b145b91`), the
-  `b-table`/`tc-collection` authority boundary, no-materialization rules, the
-  canonical-plus-delta merge model, the file/module migration map, the
-  route/API matrix, the test matrix, fixture datasets, and explicit blockers.
-
-Table implementation work must land the [§7 test
-matrix](TABLE_PARITY_PORT.md#7-test-matrix) cases and satisfy the §9 acceptance
-criteria before the Table variant is promotable.
+ 4. Persistent Tensor lifecycle parity remains part of the `fensor` migration;
+    the current `Collection::Tensor` variant is in-memory.
 
 ## Table v1 parity matrix (current verified coverage)
 
@@ -233,8 +218,8 @@ Table port. Each row maps to executable tests in `src/table/tests.rs`.
    errors. **Open.**
 3. Read/write/range/scan benchmarks with regression budgets vs v1 baselines.
    **Open.**
-4. `update(range, values)` via temp scratch index. **Open** (truncate is
-   implemented; update is a follow-up).
+4. `update(range, values)` streams rows through a transaction-local scratch
+   index and is covered by all/range update regressions. **Complete.**
 
 ## Migration policy
 

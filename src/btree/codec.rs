@@ -104,53 +104,35 @@ impl TryCastFrom<Vec<BTreeColumnSchema>> for BTreeSchema {
     }
 }
 
-#[derive(Clone)]
-pub struct BTreeDecodeContext {
-    persistent_dir: freqfs::DirLock<PersistentFile>,
-    txn_root: freqfs::DirLock<PersistentFile>,
-}
-
-impl BTreeDecodeContext {
-    pub fn new(
-        persistent_dir: freqfs::DirLock<PersistentFile>,
-        txn_root: freqfs::DirLock<PersistentFile>,
-    ) -> Self {
-        Self {
-            persistent_dir,
-            txn_root,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
-pub struct DecodedBTreePayload {
+pub struct DecodedBTreePayload<Txn> {
     pub schema: Vec<BTreeColumnSchema>,
-    pub btree: BTree,
+    pub btree: BTree<Txn>,
 }
 
-struct BTreeRows;
+struct BTreeRows<Txn>(std::marker::PhantomData<fn() -> Txn>);
 
-struct BTreeRowsContext {
-    btree: BTree,
+struct BTreeRowsContext<Txn> {
+    btree: BTree<Txn>,
 }
 
 fn decode_err(action: &str, err: impl std::fmt::Display) -> String {
     format!("{action}: {err}")
 }
 
-impl de::FromStream for BTreeRows {
-    type Context = BTreeRowsContext;
+impl<Txn> de::FromStream for BTreeRows<Txn> {
+    type Context = BTreeRowsContext<Txn>;
 
     async fn from_stream<D: de::Decoder>(
         context: Self::Context,
         decoder: &mut D,
     ) -> Result<Self, D::Error> {
-        struct RowsVisitor {
-            btree: BTree,
+        struct RowsVisitor<Txn> {
+            btree: BTree<Txn>,
         }
 
-        impl de::Visitor for RowsVisitor {
-            type Value = BTreeRows;
+        impl<Txn> de::Visitor for RowsVisitor<Txn> {
+            type Value = BTreeRows<Txn>;
 
             fn expecting() -> &'static str {
                 "a list of BTree rows"
@@ -161,12 +143,15 @@ impl de::FromStream for BTreeRows {
                 mut seq: A,
             ) -> Result<Self::Value, A::Error> {
                 while let Some(row_value) = seq.next_element::<Value>(()).await? {
-                    self.btree.load_literal_row(row_value).await.map_err(|err| {
-                        de::Error::custom(decode_err("failed to load BTree literal row", err))
-                    })?;
+                    self.btree
+                        .load_literal_row(row_value)
+                        .await
+                        .map_err(|err| {
+                            de::Error::custom(decode_err("failed to load BTree literal row", err))
+                        })?;
                 }
 
-                Ok(BTreeRows)
+                Ok(BTreeRows(std::marker::PhantomData))
             }
         }
 
@@ -178,20 +163,25 @@ impl de::FromStream for BTreeRows {
     }
 }
 
-impl de::FromStream for DecodedBTreePayload {
-    type Context = BTreeDecodeContext;
+impl<Txn: crate::StorageContext> de::FromStream for DecodedBTreePayload<Txn> {
+    type Context = Txn;
 
     async fn from_stream<D: de::Decoder>(
         context: Self::Context,
         decoder: &mut D,
     ) -> Result<Self, D::Error> {
-        struct PayloadVisitor {
+        let txn = context.subcontext_unique();
+        let persistent_dir = txn.context().await.map_err(|err| {
+            de::Error::custom(decode_err("failed to allocate BTree literal", err))
+        })?;
+
+        struct PayloadVisitor<Txn> {
             persistent_dir: freqfs::DirLock<PersistentFile>,
-            txn_root: freqfs::DirLock<PersistentFile>,
+            txn: std::marker::PhantomData<fn() -> Txn>,
         }
 
-        impl de::Visitor for PayloadVisitor {
-            type Value = DecodedBTreePayload;
+        impl<Txn> de::Visitor for PayloadVisitor<Txn> {
+            type Value = DecodedBTreePayload<Txn>;
 
             fn expecting() -> &'static str {
                 "a BTree payload [schema, rows]"
@@ -209,8 +199,8 @@ impl de::FromStream for DecodedBTreePayload {
                 let btree_schema = BTreeSchema::try_cast_from(schema.clone(), |schema| {
                     de::Error::custom(format!("invalid BTree schema: {schema:?}"))
                 })?;
-                let btree = BTree::with_schema(self.persistent_dir, self.txn_root, btree_schema);
-                seq.next_element::<BTreeRows>(BTreeRowsContext {
+                let btree = BTree::literal(self.persistent_dir, btree_schema);
+                seq.next_element::<BTreeRows<Txn>>(BTreeRowsContext {
                     btree: btree.clone(),
                 })
                 .await?
@@ -226,8 +216,8 @@ impl de::FromStream for DecodedBTreePayload {
 
         decoder
             .decode_seq(PayloadVisitor {
-                persistent_dir: context.persistent_dir,
-                txn_root: context.txn_root,
+                persistent_dir,
+                txn: std::marker::PhantomData,
             })
             .await
     }

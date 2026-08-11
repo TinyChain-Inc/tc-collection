@@ -11,7 +11,7 @@ use std::ops::Bound;
 
 use b_table::{ColumnRange, IndexSchema, Range};
 use safecast::TryCastInto;
-use tc_error::{bad_request, not_found, TCResult};
+use tc_error::{TCResult, bad_request, not_found};
 use tc_ir::Id;
 use tc_value::Value;
 
@@ -36,8 +36,8 @@ impl KeyOrRange {
     ///
     /// Matches v1 parse order: range check (all elements are column-bound
     /// pairs) comes before the key-arity check.
-    pub(crate) fn try_from_value(
-        table: &PersistentTable,
+    pub(crate) fn try_from_value<Txn>(
+        table: &PersistentTable<Txn>,
         value: Value,
     ) -> TCResult<Self> {
         let columns = table.schema().primary().columns();
@@ -48,9 +48,7 @@ impl KeyOrRange {
             Value::Tuple(tuple)
                 if tuple.iter().all(|v| match v {
                     Value::Tuple(pair) if pair.len() == 2 => match &pair[0] {
-                        Value::String(name) => {
-                            columns.iter().any(|c| c.as_str() == name.as_str())
-                        }
+                        Value::String(name) => columns.iter().any(|c| c.as_str() == name.as_str()),
                         _ => false,
                     },
                     _ => false,
@@ -71,8 +69,8 @@ impl KeyOrRange {
 /// `(column_name, bound)` pairs.  If a bound is itself a 2-tuple it is
 /// interpreted as `(lower, upper)` inclusive/excluded bounds; otherwise it
 /// is an equality match.
-pub(crate) fn cast_into_range(
-    table: &PersistentTable,
+pub(crate) fn cast_into_range<Txn>(
+    table: &PersistentTable<Txn>,
     value: Value,
 ) -> TCResult<Range<Id, Value>> {
     let tuple = match value {
@@ -91,9 +89,9 @@ pub(crate) fn cast_into_range(
         };
 
         let col_name = match &pair[0] {
-            Value::String(s) => s.parse::<Id>().map_err(|e| {
-                bad_request!("invalid column name {s:?}: {e}")
-            })?,
+            Value::String(s) => s
+                .parse::<Id>()
+                .map_err(|e| bad_request!("invalid column name {s:?}: {e}"))?,
             other => return Err(bad_request!("column name must be a string, got {other:?}")),
         };
 
@@ -103,8 +101,14 @@ pub(crate) fn cast_into_range(
 
         let col_range = match &pair[1] {
             Value::Tuple(bounds) if bounds.len() == 2 => {
-                let lower: Bound<Value> = bounds[0].clone().try_cast_into(|_| ()).unwrap_or(Bound::Unbounded);
-                let upper: Bound<Value> = bounds[1].clone().try_cast_into(|_| ()).unwrap_or(Bound::Unbounded);
+                let lower: Bound<Value> = bounds[0]
+                    .clone()
+                    .try_cast_into(|_| ())
+                    .unwrap_or(Bound::Unbounded);
+                let upper: Bound<Value> = bounds[1]
+                    .clone()
+                    .try_cast_into(|_| ())
+                    .unwrap_or(Bound::Unbounded);
                 ColumnRange::In((lower, upper))
             }
             _ => ColumnRange::Eq(pair[1].clone()),

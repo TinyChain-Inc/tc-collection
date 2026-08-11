@@ -19,15 +19,25 @@ use super::stream::Rows;
 /// Constructed via [`PersistentTable::slice`] or [`PersistentTable::order_by`].
 /// All operations delegate to the source table with the stored range, order,
 /// and direction applied. The view is structural — it holds no row data.
-#[derive(Clone)]
-pub struct TableSlice {
-    table: PersistentTable,
+pub struct TableSlice<Txn = ()> {
+    table: PersistentTable<Txn>,
     range: Range<Id, Value>,
     order: Vec<Id>,
     reverse: bool,
 }
 
-impl fmt::Debug for TableSlice {
+impl<Txn> Clone for TableSlice<Txn> {
+    fn clone(&self) -> Self {
+        Self {
+            table: self.table.clone(),
+            range: self.range.clone(),
+            order: self.order.clone(),
+            reverse: self.reverse,
+        }
+    }
+}
+
+impl<Txn> fmt::Debug for TableSlice<Txn> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TableSlice")
             .field("range", &self.range)
@@ -37,9 +47,9 @@ impl fmt::Debug for TableSlice {
     }
 }
 
-impl TableSlice {
+impl<Txn> TableSlice<Txn> {
     pub(crate) fn new(
-        table: PersistentTable,
+        table: PersistentTable<Txn>,
         range: Range<Id, Value>,
         order: Vec<Id>,
         reverse: bool,
@@ -104,7 +114,7 @@ impl TableSlice {
     }
 
     /// Cap this slice to at most `n` rows.
-    pub fn limit(&self, n: u64) -> Limited {
+    pub fn limit(&self, n: u64) -> Limited<Txn> {
         Limited {
             source: self.clone(),
             limit: n,
@@ -112,7 +122,7 @@ impl TableSlice {
     }
 
     /// Project only the given `columns` from each row in this slice.
-    pub fn select(&self, columns: Vec<Id>) -> Selection {
+    pub fn select(&self, columns: Vec<Id>) -> Selection<Txn> {
         Selection {
             source: self.clone(),
             columns,
@@ -124,7 +134,7 @@ impl TableSlice {
     ///
     /// The sub-range columns are merged with this slice's range (the sub-range
     /// takes precedence for shared columns).
-    pub fn slice(&self, sub_range: Range<Id, Value>) -> TableSlice {
+    pub fn slice(&self, sub_range: Range<Id, Value>) -> TableSlice<Txn> {
         let mut combined = self.range.inner().clone();
         for (name, bound) in sub_range.into_inner() {
             combined.insert(name, bound);
@@ -143,12 +153,12 @@ impl TableSlice {
 /// Constructed via [`TableSlice::limit`] or [`PersistentTable::limit`].
 /// `count` streams rows and stops at the cap — no full materialization.
 #[derive(Clone)]
-pub struct Limited {
-    source: TableSlice,
+pub struct Limited<Txn = ()> {
+    source: TableSlice<Txn>,
     limit: u64,
 }
 
-impl fmt::Debug for Limited {
+impl<Txn> fmt::Debug for Limited<Txn> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Limited")
             .field("limit", &self.limit)
@@ -156,7 +166,7 @@ impl fmt::Debug for Limited {
     }
 }
 
-impl Limited {
+impl<Txn> Limited<Txn> {
     pub fn schema(&self) -> &TableSchema {
         self.source.schema()
     }
@@ -215,7 +225,7 @@ impl Limited {
 
     /// Project only the given `columns` from each row, preserving this
     /// view's row cap.
-    pub fn select(&self, columns: Vec<Id>) -> Selection {
+    pub fn select(&self, columns: Vec<Id>) -> Selection<Txn> {
         Selection {
             source: self.source.clone(),
             columns,
@@ -230,13 +240,13 @@ impl Limited {
 /// The projection is applied lazily during streaming — no rows are copied
 /// until the stream is polled.
 #[derive(Clone)]
-pub struct Selection {
-    source: TableSlice,
+pub struct Selection<Txn = ()> {
+    source: TableSlice<Txn>,
     columns: Vec<Id>,
     limit: Option<u64>,
 }
 
-impl fmt::Debug for Selection {
+impl<Txn> fmt::Debug for Selection<Txn> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Selection")
             .field("columns", &self.columns)
@@ -244,7 +254,7 @@ impl fmt::Debug for Selection {
     }
 }
 
-impl Selection {
+impl<Txn> Selection<Txn> {
     pub fn schema(&self) -> &TableSchema {
         self.source.schema()
     }
@@ -285,8 +295,10 @@ impl Selection {
         let indices = Self::column_indices(self.schema(), &self.columns);
         self.source
             .for_each_row_in_order(txn_id, |row| {
-                let projected: Row<Value> =
-                    indices.iter().filter_map(|&i| row.get(i).cloned()).collect();
+                let projected: Row<Value> = indices
+                    .iter()
+                    .filter_map(|&i| row.get(i).cloned())
+                    .collect();
                 on_row(projected);
             })
             .await;

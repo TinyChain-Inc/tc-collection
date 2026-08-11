@@ -1,20 +1,93 @@
 //! Transactional visibility and ordering regression tests for `PersistentTable`.
-use super::{Column, ColumnRange, Limited, PersistentTable, Range, Rows, Selection, TableSchema, TableSlice};
-use crate::btree::StorageConfig;
+use super::{
+    Column, ColumnRange, Limited, PersistentTable, Range, Rows, Selection, TableSchema, TableSlice,
+};
 use crate::PersistentFile;
+use crate::btree::StorageConfig;
+use crate::test::run_async_test;
 use freqfs::Cache;
-use futures::{future::join_all, TryStreamExt};
+use futures::{TryStreamExt, future::join_all};
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tc_ir::{NetworkTime, TxnId};
+use tc_ir::{Claim, NetworkTime, Transaction, TxnId};
 use tc_value::{Value, ValueType};
 use tokio::sync::Barrier;
 use tokio::time::{Duration, sleep, timeout};
 
 fn tx(nonce: u16) -> TxnId {
     TxnId::from_parts(NetworkTime::from_nanos(1), nonce)
+}
+
+#[derive(Clone)]
+struct TestTxn {
+    id: TxnId,
+    claim: Claim,
+    root: freqfs::DirLock<PersistentFile>,
+    path: Vec<String>,
+}
+
+impl TestTxn {
+    fn new(id: TxnId, root: freqfs::DirLock<PersistentFile>) -> Self {
+        Self {
+            id,
+            claim: Claim::new("/test".parse().expect("test claim"), umask::Mode::all()),
+            root,
+            path: Vec::new(),
+        }
+    }
+}
+
+impl Transaction for TestTxn {
+    fn id(&self) -> TxnId {
+        self.id
+    }
+
+    fn timestamp(&self) -> NetworkTime {
+        self.id.timestamp()
+    }
+
+    fn claim(&self) -> &Claim {
+        &self.claim
+    }
+}
+
+impl crate::StorageContext for TestTxn {
+    fn context(
+        &self,
+    ) -> impl std::future::Future<Output = tc_error::TCResult<freqfs::DirLock<PersistentFile>>> + Send
+    {
+        let root = self.root.clone();
+        let mut path = vec![self.id.to_string()];
+        path.extend(self.path.clone());
+        async move {
+            let mut current = root;
+            for name in path {
+                let next = {
+                    let mut dir = current.write().await;
+                    dir.get_or_create_dir(name)
+                        .map_err(tc_error::TCError::internal)?
+                };
+                current = next;
+            }
+            Ok(current)
+        }
+    }
+
+    fn subcontext(&self, name: impl Into<String>) -> Self {
+        let mut txn = self.clone();
+        txn.path.push(name.into());
+        txn
+    }
+
+    fn subcontext_unique(&self) -> Self {
+        self.subcontext(format!("literal-{}", self.id))
+    }
+
+    fn materialized_tensor_bytes(&self) -> usize {
+        256 * 1024 * 1024
+    }
 }
 
 fn test_root(name: &str) -> PathBuf {
@@ -36,37 +109,14 @@ async fn init_root(name: &str) -> PathBuf {
     root
 }
 
-fn run_async_test(
-    name: &str,
-    test_fn: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-    + Send
-    + 'static,
-) {
-    std::thread::Builder::new()
-        .name(name.to_string())
-        .stack_size(16 * 1024 * 1024)
-        .spawn(|| {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .thread_stack_size(16 * 1024 * 1024)
-                .enable_all()
-                .build()
-                .expect("create test runtime");
-
-            runtime.block_on(test_fn());
-        })
-        .expect("spawn test thread")
-        .join()
-        .expect("join test thread");
-}
-
 fn load_roots(
     root: &Path,
 ) -> (
     freqfs::DirLock<PersistentFile>,
     freqfs::DirLock<PersistentFile>,
 ) {
-    let cache = Cache::<PersistentFile>::new(16 * 1024 * 1024, None);
+    let cache =
+        Cache::<PersistentFile>::new(16 * 1024 * 1024, None, 0, std::time::Duration::from_secs(3));
     let persistent = Arc::clone(&cache)
         .load(root.join("persistent"))
         .expect("load persistent root");
@@ -85,8 +135,7 @@ fn simple_schema() -> TableSchema {
         name: "label".parse().expect("Id"),
         dtype: ValueType::String,
     }];
-    TableSchema::new(key, values, Vec::new(), StorageConfig::default())
-        .expect("create test schema")
+    TableSchema::new(key, values, Vec::new(), StorageConfig::default()).expect("create test schema")
 }
 
 fn composite_schema() -> TableSchema {
@@ -100,12 +149,10 @@ fn composite_schema() -> TableSchema {
             dtype: ValueType::Number,
         },
     ];
-    let values = vec![
-        Column {
-            name: "val1".parse().expect("Id"),
-            dtype: ValueType::String,
-        },
-    ];
+    let values = vec![Column {
+        name: "val1".parse().expect("Id"),
+        dtype: ValueType::String,
+    }];
     TableSchema::new(key, values, Vec::new(), StorageConfig::default())
         .expect("create composite key schema")
 }
@@ -125,10 +172,7 @@ fn schema_with_index() -> TableSchema {
             dtype: ValueType::String,
         },
     ];
-    let indices = vec![(
-        "by_ref".to_string(),
-        vec!["ref_id".parse().expect("Id")],
-    )];
+    let indices = vec![("by_ref".to_string(), vec!["ref_id".parse().expect("Id")])];
     TableSchema::new(key, values, indices, StorageConfig::default())
         .expect("create schema with index")
 }
@@ -139,20 +183,18 @@ fn upsert_inserts_and_updates_pending_row() {
         Box::pin(async {
             let root = init_root("upsert-pending").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("alpha")],
                 )
                 .await
                 .expect("upsert row");
 
-            let row = table
-                .read_row(tx(10), &[Value::from(1_u64)])
-                .await;
+            let row = table.read_row(tx(10), &[Value::from(1_u64)]).await;
             assert!(row.is_some());
             assert_eq!(
                 row.unwrap().as_ref(),
@@ -161,16 +203,14 @@ fn upsert_inserts_and_updates_pending_row() {
 
             table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("beta")],
                 )
                 .await
                 .expect("update row");
 
-            let row = table
-                .read_row(tx(10), &[Value::from(1_u64)])
-                .await;
+            let row = table.read_row(tx(10), &[Value::from(1_u64)]).await;
             assert_eq!(
                 row.unwrap().as_ref(),
                 &[Value::from(1_u64), Value::from("beta")]
@@ -185,11 +225,11 @@ fn delete_moves_row_to_pending_deletes() {
         Box::pin(async {
             let root = init_root("delete-pending").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("alpha")],
                 )
@@ -199,7 +239,7 @@ fn delete_moves_row_to_pending_deletes() {
             table.finalize(tx(10)).await.expect("finalize");
 
             table
-                .delete_row(tx(11), vec![Value::from(1_u64)])
+                .delete_row(&TestTxn::new(tx(11), txn.clone()), vec![Value::from(1_u64)])
                 .await
                 .expect("delete row");
 
@@ -220,11 +260,11 @@ fn commit_promotes_pending_to_committed() {
         Box::pin(async {
             let root = init_root("commit-promotes").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("alpha")],
                 )
@@ -236,18 +276,27 @@ fn commit_promotes_pending_to_committed() {
                 "committed row should not be visible to earlier txn"
             );
             assert!(
-                table.read_row(tx(10), &[Value::from(1_u64)]).await.is_some(),
+                table
+                    .read_row(tx(10), &[Value::from(1_u64)])
+                    .await
+                    .is_some(),
                 "pending row should be visible to own txn"
             );
 
             table.commit(tx(10)).expect("commit");
 
             assert!(
-                table.read_row(tx(10), &[Value::from(1_u64)]).await.is_some(),
+                table
+                    .read_row(tx(10), &[Value::from(1_u64)])
+                    .await
+                    .is_some(),
                 "committed row should be visible at commit txn"
             );
             assert!(
-                table.read_row(tx(11), &[Value::from(1_u64)]).await.is_some(),
+                table
+                    .read_row(tx(11), &[Value::from(1_u64)])
+                    .await
+                    .is_some(),
                 "committed delta should be visible to later txn (committed <= T)"
             );
         })
@@ -260,11 +309,11 @@ fn rollback_discards_pending_and_unblocks() {
         Box::pin(async {
             let root = init_root("rollback-discards").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("alpha")],
                 )
@@ -301,11 +350,11 @@ fn finalize_merges_committed_into_canon() {
         Box::pin(async {
             let root = init_root("finalize-merges").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("alpha")],
                 )
@@ -332,11 +381,11 @@ fn duplicate_commit_is_idempotent_table() {
         Box::pin(async {
             let root = init_root("duplicate-commit-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(42_u64)],
                     vec![Value::from("x")],
                 )
@@ -364,11 +413,11 @@ fn stale_finalize_is_noop_table() {
         Box::pin(async {
             let root = init_root("stale-finalize-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("x")],
                 )
@@ -377,10 +426,7 @@ fn stale_finalize_is_noop_table() {
             table.commit(tx(10)).expect("commit");
             table.finalize(tx(10)).await.expect("finalize");
 
-            table
-                .finalize(tx(9))
-                .await
-                .expect("stale finalize no-op");
+            table.finalize(tx(9)).await.expect("stale finalize no-op");
 
             assert_eq!(table.finalized(), Some(tx(10)));
             assert!(
@@ -400,11 +446,11 @@ fn cannot_write_after_commit_or_finalize_table() {
         Box::pin(async {
             let root = init_root("write-after-finalize-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("a")],
                 )
@@ -415,7 +461,7 @@ fn cannot_write_after_commit_or_finalize_table() {
             assert_eq!(
                 table
                     .upsert_row(
-                        tx(10),
+                        &TestTxn::new(tx(10), txn.clone()),
                         vec![Value::from(1_u64)],
                         vec![Value::from("b")]
                     )
@@ -427,7 +473,7 @@ fn cannot_write_after_commit_or_finalize_table() {
             assert_eq!(
                 table
                     .upsert_row(
-                        tx(10),
+                        &TestTxn::new(tx(10), txn.clone()),
                         vec![Value::from(1_u64)],
                         vec![Value::from("c")]
                     )
@@ -444,11 +490,11 @@ fn pending_is_visible_only_to_its_txn_table() {
         Box::pin(async {
             let root = init_root("pending-visible-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("alpha")],
                 )
@@ -463,10 +509,7 @@ fn pending_is_visible_only_to_its_txn_table() {
                 "pending row should be visible to own txn"
             );
             assert!(
-                table
-                    .read_row(tx(9), &[Value::from(1_u64)])
-                    .await
-                    .is_none(),
+                table.read_row(tx(9), &[Value::from(1_u64)]).await.is_none(),
                 "pending row should not be visible to earlier txn"
             );
 
@@ -501,11 +544,11 @@ fn committed_is_visible_in_txn_order_table() {
         Box::pin(async {
             let root = init_root("committed-visible-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("alpha")],
                 )
@@ -514,10 +557,7 @@ fn committed_is_visible_in_txn_order_table() {
             table.commit(tx(10)).expect("commit");
 
             assert!(
-                table
-                    .read_row(tx(9), &[Value::from(1_u64)])
-                    .await
-                    .is_none(),
+                table.read_row(tx(9), &[Value::from(1_u64)]).await.is_none(),
                 "committed row should not be visible to earlier txn"
             );
             assert!(
@@ -545,11 +585,11 @@ fn no_pending_leakage_across_txns_table() {
         Box::pin(async {
             let root = init_root("no-leakage-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("a")],
                 )
@@ -558,7 +598,7 @@ fn no_pending_leakage_across_txns_table() {
 
             table
                 .upsert_row(
-                    tx(12),
+                    &TestTxn::new(tx(12), txn.clone()),
                     vec![Value::from(2_u64)],
                     vec![Value::from("b")],
                 )
@@ -566,7 +606,10 @@ fn no_pending_leakage_across_txns_table() {
                 .expect("txn 12 insert");
 
             assert!(
-                table.read_row(tx(10), &[Value::from(1_u64)]).await.is_some(),
+                table
+                    .read_row(tx(10), &[Value::from(1_u64)])
+                    .await
+                    .is_some(),
                 "txn 10 should see its own pending write"
             );
 
@@ -576,7 +619,10 @@ fn no_pending_leakage_across_txns_table() {
             );
 
             assert!(
-                table.read_row(tx(10), &[Value::from(2_u64)]).await.is_none(),
+                table
+                    .read_row(tx(10), &[Value::from(2_u64)])
+                    .await
+                    .is_none(),
                 "txn 10 should not see txn 12's pending write"
             );
 
@@ -599,11 +645,11 @@ fn read_resolves_delta_stack_table() {
         Box::pin(async {
             let root = init_root("delta-stack-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("original")],
                 )
@@ -614,7 +660,7 @@ fn read_resolves_delta_stack_table() {
 
             table
                 .upsert_row(
-                    tx(11),
+                    &TestTxn::new(tx(11), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("updated")],
                 )
@@ -640,12 +686,12 @@ fn streamed_rows_match_materialized_table() {
         Box::pin(async {
             let root = init_root("streamed-materialized-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             for i in 1..=5u64 {
                 table
                     .upsert_row(
-                        tx(10),
+                        &TestTxn::new(tx(10), txn.clone()),
                         vec![Value::from(i)],
                         vec![Value::from(format!("label{i}"))],
                     )
@@ -654,35 +700,29 @@ fn streamed_rows_match_materialized_table() {
             }
 
             table
-                .delete_row(tx(10), vec![Value::from(2_u64)])
+                .delete_row(&TestTxn::new(tx(10), txn.clone()), vec![Value::from(2_u64)])
                 .await
                 .expect("delete row");
             table.commit(tx(10)).expect("commit");
 
             table
                 .upsert_row(
-                    tx(11),
+                    &TestTxn::new(tx(11), txn.clone()),
                     vec![Value::from(7_u64)],
                     vec![Value::from("label7")],
                 )
                 .await
                 .expect("insert key 7");
             table
-                .delete_row(tx(11), vec![Value::from(3_u64)])
+                .delete_row(&TestTxn::new(tx(11), txn.clone()), vec![Value::from(3_u64)])
                 .await
                 .expect("delete key 3");
 
             let mut streamed = Vec::new();
             table
-                .for_each_row_in_order(
-                    tx(11),
-                    super::Range::default(),
-                    &[],
-                    false,
-                    |row| {
-                        streamed.push(row.into_vec());
-                    },
-                )
+                .for_each_row_in_order(tx(11), super::Range::default(), &[], false, |row| {
+                    streamed.push(row.into_vec());
+                })
                 .await;
 
             assert_eq!(
@@ -704,12 +744,12 @@ fn count_matches_streamed_fold_table() {
         Box::pin(async {
             let root = init_root("count-fold-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             for i in 1..=10u64 {
                 table
                     .upsert_row(
-                        tx(10),
+                        &TestTxn::new(tx(10), txn.clone()),
                         vec![Value::from(i)],
                         vec![Value::from(format!("v{i}"))],
                     )
@@ -721,7 +761,7 @@ fn count_matches_streamed_fold_table() {
 
             for i in (1..=10u64).step_by(2) {
                 table
-                    .delete_row(tx(11), vec![Value::from(i)])
+                    .delete_row(&TestTxn::new(tx(11), txn.clone()), vec![Value::from(i)])
                     .await
                     .expect("delete odd row");
             }
@@ -737,12 +777,12 @@ fn contains_all_key_range_table() {
         Box::pin(async {
             let root = init_root("contains-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             for i in 1..=5u64 {
                 table
                     .upsert_row(
-                        tx(10),
+                        &TestTxn::new(tx(10), txn.clone()),
                         vec![Value::from(i)],
                         vec![Value::from(format!("v{i}"))],
                     )
@@ -764,8 +804,8 @@ fn empty_table_semantics_across_lifecycle_table() {
     run_async_test("empty_table_semantics_across_lifecycle_table", || {
         Box::pin(async {
             let root = init_root("empty-table-lifecycle-table").await;
-            let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let (persistent, _) = load_roots(&root);
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             assert!(table.is_empty(tx(95)).await);
             assert_eq!(table.count(tx(95)).await, 0);
@@ -777,10 +817,7 @@ fn empty_table_semantics_across_lifecycle_table() {
             );
 
             table.commit(tx(95)).expect("commit");
-            table
-                .finalize(tx(95))
-                .await
-                .expect("finalize");
+            table.finalize(tx(95)).await.expect("finalize");
 
             assert!(table.is_empty(tx(96)).await);
             assert_eq!(table.count(tx(96)).await, 0);
@@ -794,11 +831,11 @@ fn invalid_key_arity_fails_closed_table() {
         Box::pin(async {
             let root = init_root("invalid-arity-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             let err = table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64), Value::from(2_u64)],
                     vec![Value::from("a")],
                 )
@@ -809,7 +846,7 @@ fn invalid_key_arity_fails_closed_table() {
 
             let err = table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("a"), Value::from("b")],
                 )
@@ -827,11 +864,11 @@ fn invalid_key_type_fails_closed_table() {
         Box::pin(async {
             let root = init_root("invalid-key-type-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             let err = table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from("not_a_number")],
                     vec![Value::from("a")],
                 )
@@ -849,11 +886,11 @@ fn composite_key_upsert_and_read() {
         Box::pin(async {
             let root = init_root("composite-key-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, composite_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, composite_schema());
 
             table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64), Value::from(2_u64)],
                     vec![Value::from("alpha")],
                 )
@@ -875,13 +912,9 @@ fn composite_key_upsert_and_read() {
 
             let mut streamed = Vec::new();
             table
-                .for_each_row_in_order(
-                    tx(11),
-                    super::Range::default(),
-                    &[],
-                    false,
-                    |row| streamed.push(row.into_vec()),
-                )
+                .for_each_row_in_order(tx(11), super::Range::default(), &[], false, |row| {
+                    streamed.push(row.into_vec())
+                })
                 .await;
 
             assert_eq!(streamed.len(), 1);
@@ -899,12 +932,12 @@ fn table_with_auxiliary_index() {
         Box::pin(async {
             let root = init_root("aux-index-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, schema_with_index());
+            let table = PersistentTable::<TestTxn>::new(persistent, schema_with_index());
 
             for i in 1..=5u64 {
                 table
                     .upsert_row(
-                        tx(10),
+                        &TestTxn::new(tx(10), txn.clone()),
                         vec![Value::from(i)],
                         vec![Value::from(i * 10), Value::from(format!("item{i}"))],
                     )
@@ -940,12 +973,12 @@ fn large_scan_completes_under_timeout_table() {
         Box::pin(async {
             let root = init_root("large-scan-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             for i in 0_u64..2_000_u64 {
                 table
                     .upsert_row(
-                        tx(20),
+                        &TestTxn::new(tx(20), txn.clone()),
                         vec![Value::from(i)],
                         vec![Value::from(format!("v{i}"))],
                     )
@@ -959,15 +992,9 @@ fn large_scan_completes_under_timeout_table() {
             let mut seen = 0_u64;
             timeout(Duration::from_secs(10), async {
                 table
-                    .for_each_row_in_order(
-                        tx(21),
-                        super::Range::default(),
-                        &[],
-                        false,
-                        |_| {
-                            seen += 1;
-                        },
-                    )
+                    .for_each_row_in_order(tx(21), super::Range::default(), &[], false, |_| {
+                        seen += 1;
+                    })
                     .await;
             })
             .await
@@ -984,11 +1011,11 @@ fn same_txn_read_your_own_write_is_non_blocking_table() {
         Box::pin(async {
             let root = init_root("same-txn-rw-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
                 .upsert_row(
-                    tx(90),
+                    &TestTxn::new(tx(90), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("own")],
                 )
@@ -1009,88 +1036,91 @@ fn same_txn_read_your_own_write_is_non_blocking_table() {
 
 #[test]
 fn same_txn_read_your_own_delete_is_non_blocking_table() {
-    run_async_test("same_txn_read_your_own_delete_is_non_blocking_table", || {
-        Box::pin(async {
-            let root = init_root("same-txn-del-table").await;
-            let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+    run_async_test(
+        "same_txn_read_your_own_delete_is_non_blocking_table",
+        || {
+            Box::pin(async {
+                let root = init_root("same-txn-del-table").await;
+                let (persistent, txn) = load_roots(&root);
+                let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
-            table
-                .upsert_row(
-                    tx(91),
-                    vec![Value::from(1_u64)],
-                    vec![Value::from("gone")],
+                table
+                    .upsert_row(
+                        &TestTxn::new(tx(91), txn.clone()),
+                        vec![Value::from(1_u64)],
+                        vec![Value::from("gone")],
+                    )
+                    .await
+                    .expect("insert key");
+                table
+                    .delete_row(&TestTxn::new(tx(91), txn.clone()), vec![Value::from(1_u64)])
+                    .await
+                    .expect("delete key in same txn");
+
+                let row = timeout(
+                    Duration::from_millis(200),
+                    table.read_row(tx(91), &[Value::from(1_u64)]),
                 )
                 .await
-                .expect("insert key");
-            table
-                .delete_row(tx(91), vec![Value::from(1_u64)])
-                .await
-                .expect("delete key in same txn");
+                .expect("same-txn read-your-own-delete should not block");
 
-            let row = timeout(
-                Duration::from_millis(200),
-                table.read_row(tx(91), &[Value::from(1_u64)]),
-            )
-            .await
-            .expect("same-txn read-your-own-delete should not block");
-
-            assert!(row.is_none());
-        })
-    });
+                assert!(row.is_none());
+            })
+        },
+    );
 }
 
 #[test]
 fn repeated_rollback_and_finalize_are_idempotent_table() {
-    run_async_test("repeated_rollback_and_finalize_are_idempotent_table", || {
-        Box::pin(async {
-            let root = init_root("repeated-lifecycle-table").await;
-            let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+    run_async_test(
+        "repeated_rollback_and_finalize_are_idempotent_table",
+        || {
+            Box::pin(async {
+                let root = init_root("repeated-lifecycle-table").await;
+                let (persistent, txn) = load_roots(&root);
+                let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
-            table
-                .upsert_row(
-                    tx(92),
-                    vec![Value::from(1_u64)],
-                    vec![Value::from("rollback")],
-                )
-                .await
-                .expect("insert key for rollback");
-
-            table.rollback(tx(92)).expect("rollback");
-            table.rollback(tx(92)).expect("second rollback no-op");
-
-            table
-                .upsert_row(
-                    tx(93),
-                    vec![Value::from(2_u64)],
-                    vec![Value::from("finalize")],
-                )
-                .await
-                .expect("insert key for finalize");
-            table.commit(tx(93)).expect("commit");
-
-            table.finalize(tx(93)).await.expect("finalize");
-            table
-                .finalize(tx(93))
-                .await
-                .expect("second finalize no-op");
-
-            assert_eq!(table.finalized(), Some(tx(93)));
-            assert!(
                 table
-                    .read_row(tx(94), &[Value::from(2_u64)])
+                    .upsert_row(
+                        &TestTxn::new(tx(92), txn.clone()),
+                        vec![Value::from(1_u64)],
+                        vec![Value::from("rollback")],
+                    )
                     .await
-                    .is_some()
-            );
-            assert!(
+                    .expect("insert key for rollback");
+
+                table.rollback(tx(92)).expect("rollback");
+                table.rollback(tx(92)).expect("second rollback no-op");
+
                 table
-                    .read_row(tx(94), &[Value::from(1_u64)])
+                    .upsert_row(
+                        &TestTxn::new(tx(93), txn.clone()),
+                        vec![Value::from(2_u64)],
+                        vec![Value::from("finalize")],
+                    )
                     .await
-                    .is_none()
-            );
-        })
-    });
+                    .expect("insert key for finalize");
+                table.commit(tx(93)).expect("commit");
+
+                table.finalize(tx(93)).await.expect("finalize");
+                table.finalize(tx(93)).await.expect("second finalize no-op");
+
+                assert_eq!(table.finalized(), Some(tx(93)));
+                assert!(
+                    table
+                        .read_row(tx(94), &[Value::from(2_u64)])
+                        .await
+                        .is_some()
+                );
+                assert!(
+                    table
+                        .read_row(tx(94), &[Value::from(1_u64)])
+                        .await
+                        .is_none()
+                );
+            })
+        },
+    );
 }
 
 #[test]
@@ -1108,11 +1138,11 @@ fn overlapping_write_in_past_txn_fails_closed_table() {
         Box::pin(async {
             let root = init_root("overlapping-write-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
                 .upsert_row(
-                    tx(2),
+                    &TestTxn::new(tx(2), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("first")],
                 )
@@ -1121,7 +1151,7 @@ fn overlapping_write_in_past_txn_fails_closed_table() {
 
             let err = table
                 .upsert_row(
-                    tx(1),
+                    &TestTxn::new(tx(1), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("second")],
                 )
@@ -1135,43 +1165,46 @@ fn overlapping_write_in_past_txn_fails_closed_table() {
 
 #[test]
 fn rollback_unblocks_later_read_and_discards_pending_table() {
-    run_async_test("rollback_unblocks_later_read_and_discards_pending_table", || {
-        Box::pin(async {
-            let root = init_root("rollback-unblock-table").await;
-            let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+    run_async_test(
+        "rollback_unblocks_later_read_and_discards_pending_table",
+        || {
+            Box::pin(async {
+                let root = init_root("rollback-unblock-table").await;
+                let (persistent, txn) = load_roots(&root);
+                let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
-            table
-                .upsert_row(
-                    tx(10),
-                    vec![Value::from(1_u64)],
-                    vec![Value::from("hot")],
+                table
+                    .upsert_row(
+                        &TestTxn::new(tx(10), txn.clone()),
+                        vec![Value::from(1_u64)],
+                        vec![Value::from("hot")],
+                    )
+                    .await
+                    .expect("insert pending key");
+
+                assert!(
+                    timeout(
+                        Duration::from_millis(50),
+                        table.read_row(tx(11), &[Value::from(1_u64)])
+                    )
+                    .await
+                    .is_err(),
+                    "later txn read should block while earlier overlapping write is pending"
+                );
+
+                table.rollback(tx(10)).expect("rollback");
+
+                let row = timeout(
+                    Duration::from_secs(1),
+                    table.read_row(tx(11), &[Value::from(1_u64)]),
                 )
                 .await
-                .expect("insert pending key");
+                .expect("later txn read should complete after rollback");
 
-            assert!(
-                timeout(
-                    Duration::from_millis(50),
-                    table.read_row(tx(11), &[Value::from(1_u64)])
-                )
-                .await
-                .is_err(),
-                "later txn read should block while earlier overlapping write is pending"
-            );
-
-            table.rollback(tx(10)).expect("rollback");
-
-            let row = timeout(
-                Duration::from_secs(1),
-                table.read_row(tx(11), &[Value::from(1_u64)]),
-            )
-            .await
-            .expect("later txn read should complete after rollback");
-
-            assert!(row.is_none(), "rolled-back key must not be visible");
-        })
-    });
+                assert!(row.is_none(), "rolled-back key must not be visible");
+            })
+        },
+    );
 }
 
 fn id(name: &str) -> tc_ir::Id {
@@ -1212,18 +1245,26 @@ fn slice_returns_in_range_rows_table() {
         Box::pin(async {
             let root = init_root("slice-in-range").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             for i in 1..=5u64 {
                 table
-                    .upsert_row(tx(10), vec![Value::from(i)], vec![Value::from(format!("v{i}"))])
+                    .upsert_row(
+                        &TestTxn::new(tx(10), txn.clone()),
+                        vec![Value::from(i)],
+                        vec![Value::from(format!("v{i}"))],
+                    )
                     .await
                     .expect("insert");
             }
             table.commit(tx(10)).expect("commit");
             table.finalize(tx(10)).await.expect("finalize");
 
-            let slice = table.slice(range_in("id", Value::from(2_u64), Value::from(5_u64)), &[], false);
+            let slice = table.slice(
+                range_in("id", Value::from(2_u64), Value::from(5_u64)),
+                &[],
+                false,
+            );
             let rows = slice.rows(tx(11)).await.expect("slice rows");
             let collected = collect_rows(rows).await;
 
@@ -1246,14 +1287,22 @@ fn select_projects_columns_table() {
         Box::pin(async {
             let root = init_root("select-projects").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
-                .upsert_row(tx(10), vec![Value::from(1_u64)], vec![Value::from("alpha")])
+                .upsert_row(
+                    &TestTxn::new(tx(10), txn.clone()),
+                    vec![Value::from(1_u64)],
+                    vec![Value::from("alpha")],
+                )
                 .await
                 .expect("insert");
             table
-                .upsert_row(tx(10), vec![Value::from(2_u64)], vec![Value::from("beta")])
+                .upsert_row(
+                    &TestTxn::new(tx(10), txn.clone()),
+                    vec![Value::from(2_u64)],
+                    vec![Value::from("beta")],
+                )
                 .await
                 .expect("insert");
             table.commit(tx(10)).expect("commit");
@@ -1264,8 +1313,16 @@ fn select_projects_columns_table() {
             let collected = collect_rows(rows).await;
 
             assert_eq!(collected.len(), 2, "should have 2 projected rows");
-            assert_eq!(collected[0], vec![Value::from("alpha")], "first row should project label only");
-            assert_eq!(collected[1], vec![Value::from("beta")], "second row should project label only");
+            assert_eq!(
+                collected[0],
+                vec![Value::from("alpha")],
+                "first row should project label only"
+            );
+            assert_eq!(
+                collected[1],
+                vec![Value::from("beta")],
+                "second row should project label only"
+            );
 
             assert_eq!(selection.count(tx(11)).await, 2);
             assert!(!selection.is_empty(tx(11)).await);
@@ -1279,11 +1336,15 @@ fn limit_caps_row_stream_table() {
         Box::pin(async {
             let root = init_root("limit-caps").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             for i in 1..=10u64 {
                 table
-                    .upsert_row(tx(10), vec![Value::from(i)], vec![Value::from(format!("v{i}"))])
+                    .upsert_row(
+                        &TestTxn::new(tx(10), txn.clone()),
+                        vec![Value::from(i)],
+                        vec![Value::from(format!("v{i}"))],
+                    )
                     .await
                     .expect("insert");
             }
@@ -1291,7 +1352,11 @@ fn limit_caps_row_stream_table() {
             table.finalize(tx(10)).await.expect("finalize");
 
             let limited = table.limit(3);
-            assert_eq!(limited.count(tx(11)).await, 3, "count should be capped at 3");
+            assert_eq!(
+                limited.count(tx(11)).await,
+                3,
+                "count should be capped at 3"
+            );
 
             let rows = limited.rows(tx(11)).await.expect("limited rows");
             let collected = collect_rows(rows).await;
@@ -1302,7 +1367,11 @@ fn limit_caps_row_stream_table() {
             assert!(limited_zero.is_empty(tx(11)).await);
 
             let limited_large = table.limit(100);
-            assert_eq!(limited_large.count(tx(11)).await, 10, "limit larger than table should return all");
+            assert_eq!(
+                limited_large.count(tx(11)).await,
+                10,
+                "limit larger than table should return all"
+            );
         })
     });
 }
@@ -1313,21 +1382,19 @@ fn order_by_uses_supporting_index_table() {
         Box::pin(async {
             let root = init_root("order-by-index").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, schema_with_index());
+            let table = PersistentTable::<TestTxn>::new(persistent, schema_with_index());
 
-            // Use ref_ids where textual and numeric ordering coincide
-            // (tc_value::Value compares numbers by their string representation).
             let data = [
-                (1u64, 30u64, "a"),
-                (2u64, 10u64, "b"),
-                (3u64, 50u64, "c"),
-                (4u64, 20u64, "d"),
-                (5u64, 40u64, "e"),
+                (1u64, 11_000u64, "a"),
+                (2u64, 9_000u64, "b"),
+                (3u64, 20_000u64, "c"),
+                (4u64, 10_000u64, "d"),
+                (5u64, 12_000u64, "e"),
             ];
             for (id_val, ref_id, label) in data {
                 table
                     .upsert_row(
-                        tx(10),
+                        &TestTxn::new(tx(10), txn.clone()),
                         vec![Value::from(id_val)],
                         vec![Value::from(ref_id), Value::from(label)],
                     )
@@ -1345,28 +1412,31 @@ fn order_by_uses_supporting_index_table() {
             assert_eq!(
                 ref_ids,
                 vec![
-                    Value::from(10_u64),
-                    Value::from(20_u64),
-                    Value::from(30_u64),
-                    Value::from(40_u64),
-                    Value::from(50_u64),
+                    Value::from(9_000_u64),
+                    Value::from(10_000_u64),
+                    Value::from(11_000_u64),
+                    Value::from(12_000_u64),
+                    Value::from(20_000_u64),
                 ],
                 "rows should be ordered by ref_id ascending"
             );
 
             // Verify reverse ordering
             let ordered_rev = table.order_by(&[id("ref_id")], true);
-            let rows = ordered_rev.rows(tx(11)).await.expect("ordered reverse rows");
+            let rows = ordered_rev
+                .rows(tx(11))
+                .await
+                .expect("ordered reverse rows");
             let collected = collect_rows(rows).await;
             let ref_ids_rev: Vec<Value> = collected.iter().map(|r| r[1].clone()).collect();
             assert_eq!(
                 ref_ids_rev,
                 vec![
-                    Value::from(50_u64),
-                    Value::from(40_u64),
-                    Value::from(30_u64),
-                    Value::from(20_u64),
-                    Value::from(10_u64),
+                    Value::from(20_000_u64),
+                    Value::from(12_000_u64),
+                    Value::from(11_000_u64),
+                    Value::from(10_000_u64),
+                    Value::from(9_000_u64),
                 ],
                 "reverse order_by should flip iteration"
             );
@@ -1380,11 +1450,15 @@ fn reverse_flips_order_table() {
         Box::pin(async {
             let root = init_root("reverse-flips").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             for i in 1..=5u64 {
                 table
-                    .upsert_row(tx(10), vec![Value::from(i)], vec![Value::from(format!("v{i}"))])
+                    .upsert_row(
+                        &TestTxn::new(tx(10), txn.clone()),
+                        vec![Value::from(i)],
+                        vec![Value::from(format!("v{i}"))],
+                    )
                     .await
                     .expect("insert");
             }
@@ -1393,18 +1467,38 @@ fn reverse_flips_order_table() {
 
             let forward = table.slice(Range::default(), &[], false);
             let rows = forward.rows(tx(11)).await.expect("forward rows");
-            let forward_ids: Vec<Value> = collect_rows(rows).await.iter().map(|r| r[0].clone()).collect();
+            let forward_ids: Vec<Value> = collect_rows(rows)
+                .await
+                .iter()
+                .map(|r| r[0].clone())
+                .collect();
             assert_eq!(
                 forward_ids,
-                vec![Value::from(1_u64), Value::from(2_u64), Value::from(3_u64), Value::from(4_u64), Value::from(5_u64)],
+                vec![
+                    Value::from(1_u64),
+                    Value::from(2_u64),
+                    Value::from(3_u64),
+                    Value::from(4_u64),
+                    Value::from(5_u64)
+                ],
             );
 
             let reverse = table.slice(Range::default(), &[], true);
             let rows = reverse.rows(tx(11)).await.expect("reverse rows");
-            let reverse_ids: Vec<Value> = collect_rows(rows).await.iter().map(|r| r[0].clone()).collect();
+            let reverse_ids: Vec<Value> = collect_rows(rows)
+                .await
+                .iter()
+                .map(|r| r[0].clone())
+                .collect();
             assert_eq!(
                 reverse_ids,
-                vec![Value::from(5_u64), Value::from(4_u64), Value::from(3_u64), Value::from(2_u64), Value::from(1_u64)],
+                vec![
+                    Value::from(5_u64),
+                    Value::from(4_u64),
+                    Value::from(3_u64),
+                    Value::from(2_u64),
+                    Value::from(1_u64)
+                ],
                 "reverse should flip iteration order"
             );
         })
@@ -1417,10 +1511,14 @@ fn unsupported_range_fails_closed_table() {
         Box::pin(async {
             let root = init_root("unsupported-range").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
-                .upsert_row(tx(10), vec![Value::from(1_u64)], vec![Value::from("alpha")])
+                .upsert_row(
+                    &TestTxn::new(tx(10), txn.clone()),
+                    vec![Value::from(1_u64)],
+                    vec![Value::from("alpha")],
+                )
                 .await
                 .expect("insert");
             table.commit(tx(10)).expect("commit");
@@ -1433,7 +1531,9 @@ fn unsupported_range_fails_closed_table() {
             assert!(result.is_err(), "unsupported range should fail closed");
 
             // Similarly, ordering by a non-existent column must fail closed.
-            let result = table.rows(tx(11), Range::default(), vec![id("nonexistent")], false).await;
+            let result = table
+                .rows(tx(11), Range::default(), vec![id("nonexistent")], false)
+                .await;
             assert!(result.is_err(), "unsupported order should fail closed");
         })
     });
@@ -1449,11 +1549,15 @@ fn truncate_use_scratch_not_buffer_table() {
         Box::pin(async {
             let root = init_root("truncate-scratch").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             for i in 1..=5u64 {
                 table
-                    .upsert_row(tx(10), vec![Value::from(i)], vec![Value::from(format!("v{i}"))])
+                    .upsert_row(
+                        &TestTxn::new(tx(10), txn.clone()),
+                        vec![Value::from(i)],
+                        vec![Value::from(format!("v{i}"))],
+                    )
                     .await
                     .expect("insert");
             }
@@ -1462,23 +1566,64 @@ fn truncate_use_scratch_not_buffer_table() {
 
             // Truncate rows with id in [2, 4)
             table
-                .truncate(tx(11), range_in("id", Value::from(2_u64), Value::from(4_u64)))
+                .truncate(
+                    &TestTxn::new(tx(11), txn.clone()),
+                    range_in("id", Value::from(2_u64), Value::from(4_u64)),
+                )
                 .await
                 .expect("truncate");
 
-            assert!(table.read_row(tx(11), &[Value::from(1_u64)]).await.is_some(), "id 1 should remain");
-            assert!(table.read_row(tx(11), &[Value::from(2_u64)]).await.is_none(), "id 2 should be deleted");
-            assert!(table.read_row(tx(11), &[Value::from(3_u64)]).await.is_none(), "id 3 should be deleted");
-            assert!(table.read_row(tx(11), &[Value::from(4_u64)]).await.is_some(), "id 4 should remain");
-            assert!(table.read_row(tx(11), &[Value::from(5_u64)]).await.is_some(), "id 5 should remain");
+            assert!(
+                table
+                    .read_row(tx(11), &[Value::from(1_u64)])
+                    .await
+                    .is_some(),
+                "id 1 should remain"
+            );
+            assert!(
+                table
+                    .read_row(tx(11), &[Value::from(2_u64)])
+                    .await
+                    .is_none(),
+                "id 2 should be deleted"
+            );
+            assert!(
+                table
+                    .read_row(tx(11), &[Value::from(3_u64)])
+                    .await
+                    .is_none(),
+                "id 3 should be deleted"
+            );
+            assert!(
+                table
+                    .read_row(tx(11), &[Value::from(4_u64)])
+                    .await
+                    .is_some(),
+                "id 4 should remain"
+            );
+            assert!(
+                table
+                    .read_row(tx(11), &[Value::from(5_u64)])
+                    .await
+                    .is_some(),
+                "id 5 should remain"
+            );
 
-            assert_eq!(table.count(tx(11)).await, 3, "3 rows should remain after truncate");
+            assert_eq!(
+                table.count(tx(11)).await,
+                3,
+                "3 rows should remain after truncate"
+            );
 
             // Commit and finalize the truncate
             table.commit(tx(11)).expect("commit");
             table.finalize(tx(11)).await.expect("finalize");
 
-            assert_eq!(table.count(tx(12)).await, 3, "count should persist after finalize");
+            assert_eq!(
+                table.count(tx(12)).await,
+                3,
+                "count should persist after finalize"
+            );
         })
     });
 }
@@ -1489,12 +1634,12 @@ fn view_composition_is_lazy_table() {
         Box::pin(async {
             let root = init_root("view-composition-lazy").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, schema_with_index());
+            let table = PersistentTable::<TestTxn>::new(persistent, schema_with_index());
 
             for i in 1..=8u64 {
                 table
                     .upsert_row(
-                        tx(10),
+                        &TestTxn::new(tx(10), txn.clone()),
                         vec![Value::from(i)],
                         vec![Value::from(i * 10), Value::from(format!("item{i}"))],
                     )
@@ -1505,7 +1650,11 @@ fn view_composition_is_lazy_table() {
             table.finalize(tx(10)).await.expect("finalize");
 
             // Compose: slice [3, 7) -> limit 2 -> select ["label"]
-            let slice = table.slice(range_in("id", Value::from(3_u64), Value::from(7_u64)), &[], false);
+            let slice = table.slice(
+                range_in("id", Value::from(3_u64), Value::from(7_u64)),
+                &[],
+                false,
+            );
             let limited = slice.limit(2);
             let selection = limited.select(vec![id("label")]);
 
@@ -1540,10 +1689,14 @@ fn lifecycle_noop_paths_release_reservations_table() {
         Box::pin(async {
             let root = init_root("lifecycle-noop-reservations").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
-                .upsert_row(tx(10), vec![Value::from(1_u64)], vec![Value::from("a")])
+                .upsert_row(
+                    &TestTxn::new(tx(10), txn.clone()),
+                    vec![Value::from(1_u64)],
+                    vec![Value::from("a")],
+                )
                 .await
                 .expect("insert");
             table.commit(tx(10)).expect("commit");
@@ -1569,7 +1722,11 @@ fn lifecycle_noop_paths_release_reservations_table() {
 
             // Write at a new txn should succeed (no leaked reservations).
             table
-                .upsert_row(tx(12), vec![Value::from(2_u64)], vec![Value::from("b")])
+                .upsert_row(
+                    &TestTxn::new(tx(12), txn.clone()),
+                    vec![Value::from(2_u64)],
+                    vec![Value::from("b")],
+                )
                 .await
                 .expect("write should succeed after no-op paths");
         })
@@ -1582,40 +1739,50 @@ fn lifecycle_noop_paths_release_reservations_table() {
 
 #[test]
 fn overlapping_read_blocks_until_earlier_finalize_table() {
-    run_async_test("overlapping_read_blocks_until_earlier_finalize_table", || {
-        Box::pin(async {
-            let root = init_root("overlapping-read-finalize").await;
-            let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+    run_async_test(
+        "overlapping_read_blocks_until_earlier_finalize_table",
+        || {
+            Box::pin(async {
+                let root = init_root("overlapping-read-finalize").await;
+                let (persistent, txn) = load_roots(&root);
+                let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
-            table
-                .upsert_row(tx(10), vec![Value::from(1_u64)], vec![Value::from("hot")])
-                .await
-                .expect("insert pending");
+                table
+                    .upsert_row(
+                        &TestTxn::new(tx(10), txn.clone()),
+                        vec![Value::from(1_u64)],
+                        vec![Value::from("hot")],
+                    )
+                    .await
+                    .expect("insert pending");
 
-            // Later read should block while earlier pending write is active
-            assert!(
-                timeout(Duration::from_millis(50), table.read_row(tx(11), &[Value::from(1_u64)]))
+                // Later read should block while earlier pending write is active
+                assert!(
+                    timeout(
+                        Duration::from_millis(50),
+                        table.read_row(tx(11), &[Value::from(1_u64)])
+                    )
                     .await
                     .is_err(),
-                "later read should block while earlier pending write is active"
-            );
+                    "later read should block while earlier pending write is active"
+                );
 
-            // Commit + finalize the earlier txn
-            table.commit(tx(10)).expect("commit");
-            table.finalize(tx(10)).await.expect("finalize");
+                // Commit + finalize the earlier txn
+                table.commit(tx(10)).expect("commit");
+                table.finalize(tx(10)).await.expect("finalize");
 
-            // Now the later read should complete
-            let row = timeout(
-                Duration::from_secs(1),
-                table.read_row(tx(11), &[Value::from(1_u64)]),
-            )
-            .await
-            .expect("later read should complete after earlier finalize");
+                // Now the later read should complete
+                let row = timeout(
+                    Duration::from_secs(1),
+                    table.read_row(tx(11), &[Value::from(1_u64)]),
+                )
+                .await
+                .expect("later read should complete after earlier finalize");
 
-            assert!(row.is_some(), "row should be visible after finalize");
-        })
-    });
+                assert!(row.is_some(), "row should be visible after finalize");
+            })
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1628,12 +1795,16 @@ fn concurrent_read_write_finalize_table() {
         Box::pin(async {
             let root = init_root("concurrent-rwf").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             // Seed the table
             for i in 1..=20u64 {
                 table
-                    .upsert_row(tx(1), vec![Value::from(i)], vec![Value::from(format!("v{i}"))])
+                    .upsert_row(
+                        &TestTxn::new(tx(1), txn.clone()),
+                        vec![Value::from(i)],
+                        vec![Value::from(format!("v{i}"))],
+                    )
                     .await
                     .expect("seed insert");
             }
@@ -1655,7 +1826,11 @@ fn concurrent_read_write_finalize_table() {
                 let write_task = tokio::spawn(async move {
                     for i in 1..=10u64 {
                         let _ = t_write
-                            .upsert_row(tx(50), vec![Value::from(i)], vec![Value::from("updated")])
+                            .upsert_row(
+                                &TestTxn::new(tx(50), txn.clone()),
+                                vec![Value::from(i)],
+                                vec![Value::from("updated")],
+                            )
                             .await;
                     }
                     t_write.commit(tx(50)).expect("commit");
@@ -1669,7 +1844,10 @@ fn concurrent_read_write_finalize_table() {
             })
             .await;
 
-            assert!(result.is_ok(), "concurrent read/write/finalize should not deadlock");
+            assert!(
+                result.is_ok(),
+                "concurrent read/write/finalize should not deadlock"
+            );
         })
     });
 }
@@ -1680,11 +1858,15 @@ fn lock_order_no_deadlock_table() {
         Box::pin(async {
             let root = init_root("lock-order-no-deadlock").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             for i in 1..=10u64 {
                 table
-                    .upsert_row(tx(1), vec![Value::from(i)], vec![Value::from(format!("v{i}"))])
+                    .upsert_row(
+                        &TestTxn::new(tx(1), txn.clone()),
+                        vec![Value::from(i)],
+                        vec![Value::from(format!("v{i}"))],
+                    )
                     .await
                     .expect("seed");
             }
@@ -1696,19 +1878,29 @@ fn lock_order_no_deadlock_table() {
             let result = timeout(Duration::from_secs(3), async {
                 let t1 = table.clone();
                 let t2 = table.clone();
+                let txn1 = txn.clone();
+                let txn2 = txn.clone();
 
                 let w1 = tokio::spawn(async move {
-                    t1.upsert_row(tx(10), vec![Value::from(1_u64)], vec![Value::from("w1")])
-                        .await
-                        .expect("w1");
+                    t1.upsert_row(
+                        &TestTxn::new(tx(10), txn1),
+                        vec![Value::from(1_u64)],
+                        vec![Value::from("w1")],
+                    )
+                    .await
+                    .expect("w1");
                     t1.commit(tx(10)).expect("commit");
                     t1.finalize(tx(10)).await.expect("finalize");
                 });
 
                 let w2 = tokio::spawn(async move {
-                    t2.upsert_row(tx(20), vec![Value::from(2_u64)], vec![Value::from("w2")])
-                        .await
-                        .expect("w2");
+                    t2.upsert_row(
+                        &TestTxn::new(tx(20), txn2),
+                        vec![Value::from(2_u64)],
+                        vec![Value::from("w2")],
+                    )
+                    .await
+                    .expect("w2");
                     t2.commit(tx(20)).expect("commit");
                     t2.finalize(tx(20)).await.expect("finalize");
                 });
@@ -1728,7 +1920,7 @@ fn finalize_sync_drops_guard_first_table() {
         Box::pin(async {
             let root = init_root("finalize-drops-guard").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             // Insert rows in multiple txns, then finalize in order.
             // If finalize holds the state guard while applying deltas (which
@@ -1736,7 +1928,11 @@ fn finalize_sync_drops_guard_first_table() {
             // verifies that finalize drops the guard before applying deltas.
             for i in 1..=5u64 {
                 table
-                    .upsert_row(tx(10), vec![Value::from(i)], vec![Value::from(format!("v{i}"))])
+                    .upsert_row(
+                        &TestTxn::new(tx(10), txn.clone()),
+                        vec![Value::from(i)],
+                        vec![Value::from(format!("v{i}"))],
+                    )
                     .await
                     .expect("insert txn 10");
             }
@@ -1744,7 +1940,11 @@ fn finalize_sync_drops_guard_first_table() {
 
             for i in 6..=10u64 {
                 table
-                    .upsert_row(tx(11), vec![Value::from(i)], vec![Value::from(format!("v{i}"))])
+                    .upsert_row(
+                        &TestTxn::new(tx(11), txn.clone()),
+                        vec![Value::from(i)],
+                        vec![Value::from(format!("v{i}"))],
+                    )
                     .await
                     .expect("insert txn 11");
             }
@@ -1756,7 +1956,11 @@ fn finalize_sync_drops_guard_first_table() {
             result.unwrap().expect("finalize should succeed");
 
             // Verify all rows are visible after finalize
-            assert_eq!(table.count(tx(12)).await, 10, "all 10 rows should be visible after finalize");
+            assert_eq!(
+                table.count(tx(12)).await,
+                10,
+                "all 10 rows should be visible after finalize"
+            );
             assert_eq!(table.finalized(), Some(tx(11)));
         })
     });
@@ -1787,11 +1991,11 @@ fn blocked_reader_cancellation_does_not_poison_lock_state_table() {
             Box::pin(async {
                 let root = init_root("blocked-reader-cancel-table").await;
                 let (persistent, txn) = load_roots(&root);
-                let table = PersistentTable::new(persistent, txn, simple_schema());
+                let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
                 table
                     .upsert_row(
-                        tx(60),
+                        &TestTxn::new(tx(60), txn.clone()),
                         vec![Value::from(1_u64)],
                         vec![Value::from("hot")],
                     )
@@ -1801,9 +2005,7 @@ fn blocked_reader_cancellation_does_not_poison_lock_state_table() {
                 let blocked_reader = {
                     let table = table.clone();
                     tokio::spawn(
-                        async move {
-                            table.contains_row(tx(61), &[Value::from(1_u64)]).await
-                        },
+                        async move { table.contains_row(tx(61), &[Value::from(1_u64)]).await },
                     )
                 };
 
@@ -1839,12 +2041,12 @@ fn commit_then_update_same_key_different_txn_table() {
         Box::pin(async {
             let root = init_root("commit-then-update-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             // txn 10: insert, commit (but don't finalize)
             table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("first")],
                 )
@@ -1855,7 +2057,7 @@ fn commit_then_update_same_key_different_txn_table() {
             // txn 11: update same key — should succeed after commit released reservation
             table
                 .upsert_row(
-                    tx(11),
+                    &TestTxn::new(tx(11), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("second")],
                 )
@@ -1867,20 +2069,14 @@ fn commit_then_update_same_key_different_txn_table() {
                 .read_row(tx(11), &[Value::from(1_u64)])
                 .await
                 .expect("read at txn 11");
-            assert_eq!(
-                row.as_ref(),
-                &[Value::from(1_u64), Value::from("second")]
-            );
+            assert_eq!(row.as_ref(), &[Value::from(1_u64), Value::from("second")]);
 
             // Read at txn 10 should see the original committed value
             let row = table
                 .read_row(tx(10), &[Value::from(1_u64)])
                 .await
                 .expect("read at txn 10");
-            assert_eq!(
-                row.as_ref(),
-                &[Value::from(1_u64), Value::from("first")]
-            );
+            assert_eq!(row.as_ref(), &[Value::from(1_u64), Value::from("first")]);
         })
     });
 }
@@ -1891,17 +2087,18 @@ fn concurrent_writer_conflict_matrix_table() {
         Box::pin(async {
             let root = init_root("writer-conflict-matrix-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
             let barrier = Arc::new(Barrier::new(4));
 
             let later_same = {
                 let table = table.clone();
                 let barrier = barrier.clone();
+                let txn = txn.clone();
                 tokio::spawn(async move {
                     barrier.wait().await;
                     table
                         .upsert_row(
-                            tx(20),
+                            &TestTxn::new(tx(20), txn.clone()),
                             vec![Value::from(1_u64)],
                             vec![Value::from("same")],
                         )
@@ -1912,12 +2109,13 @@ fn concurrent_writer_conflict_matrix_table() {
             let earlier_same = {
                 let table = table.clone();
                 let barrier = barrier.clone();
+                let txn = txn.clone();
                 tokio::spawn(async move {
                     barrier.wait().await;
                     sleep(Duration::from_millis(10)).await;
                     table
                         .upsert_row(
-                            tx(19),
+                            &TestTxn::new(tx(19), txn.clone()),
                             vec![Value::from(1_u64)],
                             vec![Value::from("same")],
                         )
@@ -1928,12 +2126,13 @@ fn concurrent_writer_conflict_matrix_table() {
             let earlier_disjoint = {
                 let table = table.clone();
                 let barrier = barrier.clone();
+                let txn = txn.clone();
                 tokio::spawn(async move {
                     barrier.wait().await;
                     sleep(Duration::from_millis(10)).await;
                     table
                         .upsert_row(
-                            tx(19),
+                            &TestTxn::new(tx(19), txn.clone()),
                             vec![Value::from(2_u64)],
                             vec![Value::from("other")],
                         )
@@ -1962,90 +2161,96 @@ fn concurrent_writer_conflict_matrix_table() {
 
 #[test]
 fn delta_stack_overrides_with_later_committed_delta_table() {
-    run_async_test("delta_stack_overrides_with_later_committed_delta_table", || {
-        Box::pin(async {
-            let root = init_root("delta-stack-override-table").await;
-            let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+    run_async_test(
+        "delta_stack_overrides_with_later_committed_delta_table",
+        || {
+            Box::pin(async {
+                let root = init_root("delta-stack-override-table").await;
+                let (persistent, txn) = load_roots(&root);
+                let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
-            // txn 10: insert key=1, value="a", commit (but don't finalize yet)
-            table
-                .upsert_row(
-                    tx(10),
-                    vec![Value::from(1_u64)],
-                    vec![Value::from("a")],
-                )
-                .await
-                .expect("insert at txn 10");
-            table.commit(tx(10)).expect("commit 10");
+                // txn 10: insert key=1, value="a", commit (but don't finalize yet)
+                table
+                    .upsert_row(
+                        &TestTxn::new(tx(10), txn.clone()),
+                        vec![Value::from(1_u64)],
+                        vec![Value::from("a")],
+                    )
+                    .await
+                    .expect("insert at txn 10");
+                table.commit(tx(10)).expect("commit 10");
 
-            // txn 11: update key=1, value="b" — this acquires a write reservation
-            // after txn 10's commit released it.
-            table
-                .upsert_row(
-                    tx(11),
-                    vec![Value::from(1_u64)],
-                    vec![Value::from("b")],
-                )
-                .await
-                .expect("update at txn 11");
-            table.commit(tx(11)).expect("commit 11");
+                // txn 11: update key=1, value="b" — this acquires a write reservation
+                // after txn 10's commit released it.
+                table
+                    .upsert_row(
+                        &TestTxn::new(tx(11), txn.clone()),
+                        vec![Value::from(1_u64)],
+                        vec![Value::from("b")],
+                    )
+                    .await
+                    .expect("update at txn 11");
+                table.commit(tx(11)).expect("commit 11");
 
-            // Reading at txn 11 should see txn 11's value ("b"), not txn 10's ("a").
-            // This tests the resolve_row fix: later deltas override earlier ones.
-            let row = table
-                .read_row(tx(11), &[Value::from(1_u64)])
-                .await
-                .expect("read at txn 11");
+                // Reading at txn 11 should see txn 11's value ("b"), not txn 10's ("a").
+                // This tests the resolve_row fix: later deltas override earlier ones.
+                let row = table
+                    .read_row(tx(11), &[Value::from(1_u64)])
+                    .await
+                    .expect("read at txn 11");
 
-            assert_eq!(
-                row.as_ref(),
-                &[Value::from(1_u64), Value::from("b")],
-                "later committed delta should override earlier committed delta"
-            );
+                assert_eq!(
+                    row.as_ref(),
+                    &[Value::from(1_u64), Value::from("b")],
+                    "later committed delta should override earlier committed delta"
+                );
 
-            // Reading at txn 10 should see txn 10's value ("a").
-            let row = table
-                .read_row(tx(10), &[Value::from(1_u64)])
-                .await
-                .expect("read at txn 10");
+                // Reading at txn 10 should see txn 10's value ("a").
+                let row = table
+                    .read_row(tx(10), &[Value::from(1_u64)])
+                    .await
+                    .expect("read at txn 10");
 
-            assert_eq!(
-                row.as_ref(),
-                &[Value::from(1_u64), Value::from("a")],
-                "earlier txn should see its own committed delta, not later ones"
-            );
-        })
-    });
+                assert_eq!(
+                    row.as_ref(),
+                    &[Value::from(1_u64), Value::from("a")],
+                    "earlier txn should see its own committed delta, not later ones"
+                );
+            })
+        },
+    );
 }
 
 #[test]
 fn empty_commit_then_finalize_allows_future_writes_table() {
-    run_async_test("empty_commit_then_finalize_allows_future_writes_table", || {
-        Box::pin(async {
-            let root = init_root("empty-commit-future-table").await;
-            let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+    run_async_test(
+        "empty_commit_then_finalize_allows_future_writes_table",
+        || {
+            Box::pin(async {
+                let root = init_root("empty-commit-future-table").await;
+                let (persistent, txn) = load_roots(&root);
+                let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
-            // Commit and finalize an empty transaction.
-            table.commit(tx(10)).expect("empty commit");
-            table.finalize(tx(10)).await.expect("empty finalize");
+                // Commit and finalize an empty transaction.
+                table.commit(tx(10)).expect("empty commit");
+                table.finalize(tx(10)).await.expect("empty finalize");
 
-            // Future writes should still work.
-            table
-                .upsert_row(
-                    tx(11),
-                    vec![Value::from(1_u64)],
-                    vec![Value::from("post")],
-                )
-                .await
-                .expect("write after empty finalize");
-            table.commit(tx(11)).expect("commit 11");
-            table.finalize(tx(11)).await.expect("finalize 11");
+                // Future writes should still work.
+                table
+                    .upsert_row(
+                        &TestTxn::new(tx(11), txn.clone()),
+                        vec![Value::from(1_u64)],
+                        vec![Value::from("post")],
+                    )
+                    .await
+                    .expect("write after empty finalize");
+                table.commit(tx(11)).expect("commit 11");
+                table.finalize(tx(11)).await.expect("finalize 11");
 
-            assert!(table.contains_row(tx(12), &[Value::from(1_u64)]).await);
-        })
-    });
+                assert!(table.contains_row(tx(12), &[Value::from(1_u64)]).await);
+            })
+        },
+    );
 }
 
 #[test]
@@ -2054,11 +2259,11 @@ fn finalize_conflicts_with_future_read_table() {
         Box::pin(async {
             let root = init_root("finalize-future-read-conflict-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
                 .upsert_row(
-                    tx(9),
+                    &TestTxn::new(tx(9), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("k")],
                 )
@@ -2091,11 +2296,11 @@ fn invalid_value_arity_fails_closed_table() {
         Box::pin(async {
             let root = init_root("invalid-value-arity-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             let err = table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("a"), Value::from("b")],
                 )
@@ -2113,11 +2318,11 @@ fn many_later_readers_unblock_after_commit_table() {
         Box::pin(async {
             let root = init_root("many-readers-unblock-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
                 .upsert_row(
-                    tx(50),
+                    &TestTxn::new(tx(50), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("hot")],
                 )
@@ -2154,50 +2359,53 @@ fn many_later_readers_unblock_after_commit_table() {
 
 #[test]
 fn multi_column_partial_overlap_blocking_behavior_table() {
-    run_async_test("multi_column_partial_overlap_blocking_behavior_table", || {
-        Box::pin(async {
-            let root = init_root("multi-column-overlap-table").await;
-            let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, composite_schema());
+    run_async_test(
+        "multi_column_partial_overlap_blocking_behavior_table",
+        || {
+            Box::pin(async {
+                let root = init_root("multi-column-overlap-table").await;
+                let (persistent, txn) = load_roots(&root);
+                let table = PersistentTable::<TestTxn>::new(persistent, composite_schema());
 
-            table
-                .upsert_row(
-                    tx(80),
-                    vec![Value::from(1_u64), Value::from(1_u64)],
-                    vec![Value::from("a")],
+                table
+                    .upsert_row(
+                        &TestTxn::new(tx(80), txn.clone()),
+                        vec![Value::from(1_u64), Value::from(1_u64)],
+                        vec![Value::from("a")],
+                    )
+                    .await
+                    .expect("insert pending composite key");
+
+                assert!(
+                    timeout(
+                        Duration::from_millis(50),
+                        table.contains_row(tx(81), &[Value::from(1_u64), Value::from(1_u64)]),
+                    )
+                    .await
+                    .is_err(),
+                    "overlapping composite-key read should block"
+                );
+
+                let disjoint = timeout(
+                    Duration::from_secs(1),
+                    table.contains_row(tx(81), &[Value::from(1_u64), Value::from(2_u64)]),
                 )
                 .await
-                .expect("insert pending composite key");
+                .expect("disjoint composite-key read should not block");
+                assert!(!disjoint);
 
-            assert!(
-                timeout(
-                    Duration::from_millis(50),
-                    table.contains_row(tx(81), &[Value::from(1_u64), Value::from(1_u64)]),
-                )
-                .await
-                .is_err(),
-                "overlapping composite-key read should block"
-            );
+                let err = table
+                    .commit(tx(80))
+                    .expect_err("commit should conflict while future overlapping read is active");
+                assert_eq!(err, txn_lock::Error::Conflict);
 
-            let disjoint = timeout(
-                Duration::from_secs(1),
-                table.contains_row(tx(81), &[Value::from(1_u64), Value::from(2_u64)]),
-            )
-            .await
-            .expect("disjoint composite-key read should not block");
-            assert!(!disjoint);
-
-            let err = table
-                .commit(tx(80))
-                .expect_err("commit should conflict while future overlapping read is active");
-            assert_eq!(err, txn_lock::Error::Conflict);
-
-            let err = table
-                .rollback(tx(80))
-                .expect_err("rollback should also conflict with active future read version");
-            assert_eq!(err, txn_lock::Error::Conflict);
-        })
-    });
+                let err = table
+                    .rollback(tx(80))
+                    .expect_err("rollback should also conflict with active future read version");
+                assert_eq!(err, txn_lock::Error::Conflict);
+            })
+        },
+    );
 }
 
 #[test]
@@ -2206,11 +2414,11 @@ fn restart_drops_uncommitted_pending_table() {
         Box::pin(async {
             let root = init_root("restart-pending-dropped-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("pending")],
                 )
@@ -2220,8 +2428,8 @@ fn restart_drops_uncommitted_pending_table() {
             drop(table);
 
             // Reload — pending delta should be gone (no WAL owned by Table).
-            let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let (persistent, _) = load_roots(&root);
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             assert!(table.is_empty(tx(20)).await);
             assert!(
@@ -2241,12 +2449,12 @@ fn restart_reconstructs_committed_state_table() {
         Box::pin(async {
             let root = init_root("restart-committed-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             for i in 1..=5u64 {
                 table
                     .upsert_row(
-                        tx(10),
+                        &TestTxn::new(tx(10), txn.clone()),
                         vec![Value::from(i)],
                         vec![Value::from(format!("v{i}"))],
                     )
@@ -2254,14 +2462,17 @@ fn restart_reconstructs_committed_state_table() {
                     .expect("insert row");
             }
             table.commit(tx(10)).expect("commit 10");
-            table.finalize(tx(10)).await.expect("finalize 10 — merges into canon");
+            table
+                .finalize(tx(10))
+                .await
+                .expect("finalize 10 — merges into canon");
             table.sync().await.expect("sync canon to disk");
 
             drop(table);
 
             // Reload from the same dirs — canon should have the finalized rows.
-            let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let (persistent, _) = load_roots(&root);
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             assert_eq!(table.count(tx(20)).await, 5);
             assert!(table.contains_row(tx(20), &[Value::from(3_u64)]).await);
@@ -2270,10 +2481,7 @@ fn restart_reconstructs_committed_state_table() {
                 .read_row(tx(20), &[Value::from(2_u64)])
                 .await
                 .expect("read row after restart");
-            assert_eq!(
-                row.as_ref(),
-                &[Value::from(2_u64), Value::from("v2")]
-            );
+            assert_eq!(row.as_ref(), &[Value::from(2_u64), Value::from("v2")]);
         })
     });
 }
@@ -2285,11 +2493,11 @@ fn schema_mismatch_merge_fails_closed_table() {
             let root = init_root("schema-mismatch-table").await;
             let (persistent, txn) = load_roots(&root);
             let schema_a = simple_schema();
-            let table_a = PersistentTable::new(persistent.clone(), txn.clone(), schema_a);
+            let table_a = PersistentTable::<TestTxn>::new(persistent.clone(), schema_a);
 
             table_a
                 .upsert_row(
-                    tx(10),
+                    &TestTxn::new(tx(10), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("alpha")],
                 )
@@ -2319,7 +2527,7 @@ fn schema_mismatch_merge_fails_closed_table() {
             // Loading with a mismatched schema should either fail at load or
             // fail closed on first operation. We test that data written with one
             // schema is not silently accepted under a different schema.
-            let table_b = PersistentTable::new(persistent, txn, mismatched_schema);
+            let table_b = PersistentTable::<TestTxn>::new(persistent, mismatched_schema);
 
             // The mismatched table should fail closed — reading a row written
             // under the original schema must not silently return wrong data.
@@ -2342,79 +2550,82 @@ fn schema_mismatch_merge_fails_closed_table() {
 
 #[test]
 fn snapshot_scan_is_coherent_under_concurrent_commits_table() {
-    run_async_test("snapshot_scan_is_coherent_under_concurrent_commits_table", || {
-        Box::pin(async {
-            let root = init_root("snapshot-coherence-table").await;
-            let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+    run_async_test(
+        "snapshot_scan_is_coherent_under_concurrent_commits_table",
+        || {
+            Box::pin(async {
+                let root = init_root("snapshot-coherence-table").await;
+                let (persistent, txn) = load_roots(&root);
+                let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
-            for i in 0_u64..100_u64 {
-                table
-                    .upsert_row(
-                        tx(30),
-                        vec![Value::from(i)],
-                        vec![Value::from(format!("v{i}"))],
-                    )
-                    .await
-                    .expect("seed baseline key");
-            }
-
-            table.commit(tx(30)).expect("commit 30");
-            table.finalize(tx(30)).await.expect("finalize 30");
-
-            let barrier = Arc::new(Barrier::new(3));
-
-            let scan_task = {
-                let table = table.clone();
-                let barrier = barrier.clone();
-                tokio::spawn(async move {
-                    barrier.wait().await;
-
-                    let mut saw_future_key = false;
-                    table
-                        .for_each_row_in_order(tx(31), Range::default(), &[], false, |row| {
-                            if row.as_ref()[0] == Value::from(100_u64) {
-                                saw_future_key = true;
-                            }
-                        })
-                        .await;
-
-                    saw_future_key
-                })
-            };
-
-            let writer_task = {
-                let table = table.clone();
-                let barrier = barrier.clone();
-                tokio::spawn(async move {
-                    barrier.wait().await;
-                    sleep(Duration::from_millis(10)).await;
-
+                for i in 0_u64..100_u64 {
                     table
                         .upsert_row(
-                            tx(32),
-                            vec![Value::from(100_u64)],
-                            vec![Value::from("future")],
+                            &TestTxn::new(tx(30), txn.clone()),
+                            vec![Value::from(i)],
+                            vec![Value::from(format!("v{i}"))],
                         )
                         .await
-                        .expect("insert future key");
-                    table.commit(tx(32)).expect("commit 32");
-                    table.finalize(tx(32)).await.expect("finalize 32");
-                })
-            };
+                        .expect("seed baseline key");
+                }
 
-            barrier.wait().await;
+                table.commit(tx(30)).expect("commit 30");
+                table.finalize(tx(30)).await.expect("finalize 30");
 
-            let saw_future_key = scan_task.await.expect("scan task join");
-            writer_task.await.expect("writer task join");
+                let barrier = Arc::new(Barrier::new(3));
 
-            assert!(
-                !saw_future_key,
-                "txn 31 snapshot must not include key committed/finalized at txn 32"
-            );
-            assert!(table.contains_row(tx(33), &[Value::from(100_u64)]).await);
-        })
-    });
+                let scan_task = {
+                    let table = table.clone();
+                    let barrier = barrier.clone();
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+
+                        let mut saw_future_key = false;
+                        table
+                            .for_each_row_in_order(tx(31), Range::default(), &[], false, |row| {
+                                if row.as_ref()[0] == Value::from(100_u64) {
+                                    saw_future_key = true;
+                                }
+                            })
+                            .await;
+
+                        saw_future_key
+                    })
+                };
+
+                let writer_task = {
+                    let table = table.clone();
+                    let barrier = barrier.clone();
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        sleep(Duration::from_millis(10)).await;
+
+                        table
+                            .upsert_row(
+                                &TestTxn::new(tx(32), txn.clone()),
+                                vec![Value::from(100_u64)],
+                                vec![Value::from("future")],
+                            )
+                            .await
+                            .expect("insert future key");
+                        table.commit(tx(32)).expect("commit 32");
+                        table.finalize(tx(32)).await.expect("finalize 32");
+                    })
+                };
+
+                barrier.wait().await;
+
+                let saw_future_key = scan_task.await.expect("scan task join");
+                writer_task.await.expect("writer task join");
+
+                assert!(
+                    !saw_future_key,
+                    "txn 31 snapshot must not include key committed/finalized at txn 32"
+                );
+                assert!(table.contains_row(tx(33), &[Value::from(100_u64)]).await);
+            })
+        },
+    );
 }
 
 #[test]
@@ -2423,11 +2634,11 @@ fn timeout_cleanup_path_unblocks_later_reads_table() {
         Box::pin(async {
             let root = init_root("timeout-cleanup-unblock-table").await;
             let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::new(persistent, txn, simple_schema());
+            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
             table
                 .upsert_row(
-                    tx(70),
+                    &TestTxn::new(tx(70), txn.clone()),
                     vec![Value::from(1_u64)],
                     vec![Value::from("pending")],
                 )
