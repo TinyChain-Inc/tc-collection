@@ -152,4 +152,20 @@ mod architecture_tests {
         assert!(include_str!("btree/stream.rs").contains("GuardedStream"));
         assert!(include_str!("table/stream.rs").contains("ReadPermit"));
     }
+
+    #[test]
+    fn collection_transaction_types_have_no_default() {
+        for source in [
+            include_str!("collection.rs"),
+            include_str!("btree/file.rs"),
+            include_str!("table/file.rs"),
+            include_str!("table/mod.rs"),
+            include_str!("table/view.rs"),
+        ] {
+            assert!(
+                !source.contains("Txn ="),
+                "collection transaction parameters must always be explicit"
+            );
+        }
+    }
 }

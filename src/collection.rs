@@ -11,7 +11,7 @@ use crate::table::{PersistentTable, Table};
 use crate::tensor::Tensor;
 
 #[derive(Debug)]
-pub struct BTreeView<Txn = ()> {
+pub struct BTreeView<Txn> {
     pub schema: Vec<BTreeColumnSchema>,
     pub btree: BTree<Txn>,
     pub bounds: (Bound<Value>, Bound<Value>),
@@ -59,7 +59,7 @@ impl<Txn> BTreeView<Txn> {
 }
 
 #[derive(Debug)]
-pub enum Collection<Txn = ()> {
+pub enum Collection<Txn> {
     BTree(Box<BTreeView<Txn>>),
     Table(Box<Table<Txn>>),
     Tensor(Tensor),

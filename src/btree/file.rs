@@ -285,7 +285,7 @@ struct VisibleSnapshot {
     deltas: Vec<Delta>,
 }
 
-pub struct BTree<Txn = ()> {
+pub struct BTree<Txn> {
     state: Arc<RwLock<State>>,
     dir: CollectionDir,
     semaphore: txn_lock::semaphore::Semaphore<
@@ -308,7 +308,7 @@ impl<Txn> Clone for BTree<Txn> {
 }
 
 #[derive(Debug, Clone)]
-pub struct BTreeSlice<Txn = ()> {
+pub struct BTreeSlice<Txn> {
     btree: BTree<Txn>,
     lower: Bound<Value>,
     upper: Bound<Value>,

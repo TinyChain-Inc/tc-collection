@@ -269,7 +269,7 @@ struct VisibleSnapshot {
     deltas: Vec<Delta>,
 }
 
-pub struct PersistentTable<Txn = ()> {
+pub struct PersistentTable<Txn> {
     state: Arc<RwLock<State>>,
     dir: CollectionDir,
     semaphore: txn_lock::semaphore::Semaphore<

@@ -37,7 +37,7 @@ pub type LocalTable =
 /// Ported from v1 `Table<Txn, FE>` enum.  All view types convert into this
 /// via `From`, and this converts into [`crate::Collection`] via `From`.
 #[derive(Clone)]
-pub enum Table<Txn = ()> {
+pub enum Table<Txn> {
     File(PersistentTable<Txn>),
     Local(LocalTable),
     Slice(TableSlice<Txn>),

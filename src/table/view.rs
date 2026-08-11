@@ -81,7 +81,7 @@ impl<Txn> TableSource<Txn> {
 /// Constructed via [`PersistentTable::slice`] or [`PersistentTable::order_by`].
 /// All operations delegate to the source table with the stored range, order,
 /// and direction applied. The view is structural — it holds no row data.
-pub struct TableSlice<Txn = ()> {
+pub struct TableSlice<Txn> {
     table: TableSource<Txn>,
     range: Range<Id, Value>,
     order: Vec<Id>,
@@ -231,7 +231,7 @@ impl<Txn> TableSlice<Txn> {
 /// Constructed via [`TableSlice::limit`] or [`PersistentTable::limit`].
 /// `count` streams rows and stops at the cap — no full materialization.
 #[derive(Clone)]
-pub struct Limited<Txn = ()> {
+pub struct Limited<Txn> {
     source: TableSlice<Txn>,
     limit: u64,
 }
@@ -318,7 +318,7 @@ impl<Txn> Limited<Txn> {
 /// The projection is applied lazily during streaming — no rows are copied
 /// until the stream is polled.
 #[derive(Clone)]
-pub struct Selection<Txn = ()> {
+pub struct Selection<Txn> {
     source: TableSlice<Txn>,
     columns: Vec<Id>,
     limit: Option<u64>,

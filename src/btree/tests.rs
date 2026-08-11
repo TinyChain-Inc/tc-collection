@@ -349,10 +349,10 @@ fn btree_is_send_and_sync_when_key_is_send_and_sync() {
     fn assert_send<T: Send>() {}
     fn assert_sync<T: Sync>() {}
 
-    assert_send::<BTree>();
-    assert_sync::<BTree>();
-    assert_send::<BTreeSlice>();
-    assert_sync::<BTreeSlice>();
+    assert_send::<BTree<TestTxn>>();
+    assert_sync::<BTree<TestTxn>>();
+    assert_send::<BTreeSlice<TestTxn>>();
+    assert_sync::<BTreeSlice<TestTxn>>();
 }
 
 #[test]

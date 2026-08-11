@@ -117,6 +117,9 @@ conversions idiomatic, composable, and discoverable.
 - `tc-ir::Transaction` is the sole protocol identity trait. Host-local collection
   storage is the orthogonal `StorageContext` capability; do not introduce another
   trait named `Transaction` or copy identity fields into a storage context.
+- Persistent collection and view types must require an explicit transaction type.
+  Do not add generic defaults such as `Txn = ()`: `()` is not a storage capability,
+  and a default hides incomplete transaction propagation behind a pseudo-valid type.
 - Every `Transact` method returns `TCResult<()>`. Composite implementations recurse
   through their children and propagate the first failure; lifecycle code must never
   convert a storage error into `expect`, logging-only behavior, or best effort.

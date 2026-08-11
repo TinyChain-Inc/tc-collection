@@ -1128,8 +1128,8 @@ fn table_is_send_and_sync() {
     fn assert_send<T: Send>() {}
     fn assert_sync<T: Sync>() {}
 
-    assert_send::<PersistentTable>();
-    assert_sync::<PersistentTable>();
+    assert_send::<PersistentTable<TestTxn>>();
+    assert_sync::<PersistentTable<TestTxn>>();
 }
 
 #[test]
@@ -1976,12 +1976,12 @@ fn rows_and_views_are_send_and_sync() {
     fn assert_sync<T: Sync>() {}
 
     assert_send::<Rows>();
-    assert_send::<TableSlice>();
-    assert_sync::<TableSlice>();
-    assert_send::<Limited>();
-    assert_sync::<Limited>();
-    assert_send::<Selection>();
-    assert_sync::<Selection>();
+    assert_send::<TableSlice<TestTxn>>();
+    assert_sync::<TableSlice<TestTxn>>();
+    assert_send::<Limited<TestTxn>>();
+    assert_sync::<Limited<TestTxn>>();
+    assert_send::<Selection<TestTxn>>();
+    assert_sync::<Selection<TestTxn>>();
 }
 #[test]
 fn blocked_reader_cancellation_does_not_poison_lock_state_table() {
