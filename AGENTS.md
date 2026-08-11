@@ -5,19 +5,59 @@ local and lean, and push cross-host orchestration to client libraries.
 
 ## Routing and semantics
 
+- `tc-collection` is the sole owner of collection-specific values, routes,
+  execution, and views. It consumes a delegated transaction capability and
+  returns the caller's native state; state, kernel, and adapters must delegate
+  rather than reproduce collection behavior or retain collection state.
+- Collection routes return the caller's native `State` type. They never construct
+  response trees or invoke serialization. Transaction-aware BTree/Table streams
+  are acquired only by collection-owned `IntoView` implementations at a terminal
+  boundary; those views own their read guards.
+- Keep route and view code in separate modules. Route modules may not import
+  `destream`, JSON, HTTP, PyO3, or WASM APIs. Collection codecs decode or encode
+  collection structure but may not resolve or invoke a route.
+- Collection view modules acquire schemas, streams, guards, and allocation
+  checks only. They must not implement or depend on `IntoStream`; collection
+  codec modules own the recursive wire representation of those native views.
+- Keep BTree, Table, and Tensor route enums and domain operations in their
+  owning modules. The collection-level router may only aggregate those routes;
+  it must not become a parallel collection-semantics implementation.
 - Collections shard data across blocks; hosts execute shard-local handlers. Do not add
   cross-host routing logic here—client runtimes own cluster-aware dispatch.
-- Keep v1 collection semantics (batching, auth headers, error envelopes) visible in
-  docs and examples so clients can migrate without surprises.
-- Express new handlers in terms of the shared IR envelopes; avoid adapter-specific
-  request/response shapes so Python and WASM clients can reuse the same contracts.
+- Preserve v1 collection semantics while keeping authentication and wire error
+  envelopes at adapter boundaries.
+- Express handlers only in terms of the native `Handler<State>` contract; never
+  add adapter-specific or generalized request/response envelopes.
+- `CollectionState` is the narrow dependency-inversion bridge to a caller-owned
+  universal state type, not a second conversion framework. Its implementation
+  must delegate construction and extraction to the canonical `From` and
+  `TryCastFrom` implementations owned by that state type. Collection modules must
+  not parse, serialize, or duplicate universal State variant matching.
 - Do not materialize collection keysets in memory in production codepaths. In
   particular, avoid building `Vec`/`BTreeSet` snapshots of full BTree keys for
   route responses or serialization; consume key streams incrementally via
   iterators/callbacks and encode/output as you iterate.
+- Preserve the resource owner's backpressure through every collection operation.
+  Collection scans and writes must be pull-driven or explicitly bounded; do not
+  add prefetch queues, detached tasks, eager row/key snapshots, or retries which
+  bypass storage admission. Stream drop must release read guards and permits.
 - Do not construct `freqfs::Cache` in production collection code. `tc-collection`
   constructors and runtime methods must accept host-loaded `Dir`/`DirLock`
   resources rather than creating caches from filesystem paths.
+- Every production collection directory comes from the host's single workspace
+  cache described in [`../docs/storage.md`](../docs/storage.md). Collection code
+  must never receive or use the separate library/artifact `data_dir` cache.
+- Collection code consumes host-delegated persistent and transaction-delta
+  directories. It must not assemble workspace paths, derive directories from a
+  `TxnId`, create `<txn-id>/pending` trees, or choose literal allocation policy.
+  The host derives named contexts from canonical collection URIs and unique contexts
+  for transaction-local BTree/Table literals.
+- Storage lifetime does not imply transactional semantics. Named hosted Tables use
+  `PersistentTable<Txn>` and participate in commit/rollback/finalize. Decoded request
+  Tables and OpDef-local temporary Tables retain the raw `b_table` storage primitive
+  in a unique transaction subcontext and do not create deltas or implement a second
+  transaction lifecycle. Do not collapse these representations or wrap the raw table
+  merely to imitate `PersistentTable`.
 
 ## Documentation and validation
 
@@ -74,13 +114,18 @@ conversions idiomatic, composable, and discoverable.
 
 ## Trait implementations
 
-- When a type has inherent methods that return `Result` (e.g. `commit`/`rollback`/
-  `finalize`) and also implements the `Transact` trait (which returns `()`), the
-  `Transact` impl is the **single** place that converts `Result` to `()` via
-  `.expect()`. Callers that need the infallible API must go through the trait
-  method, not call the inherent method directly with a redundant `.expect()`.
-  This keeps error-handling policy in one place and avoids duplicate panic
-  messages drifting out of sync.
+- `tc-ir::Transaction` is the sole protocol identity trait. Host-local collection
+  storage is the orthogonal `StorageContext` capability; do not introduce another
+  trait named `Transaction` or copy identity fields into a storage context.
+- Persistent collection and view types must require an explicit transaction type.
+  Do not add generic defaults such as `Txn = ()`: `()` is not a storage capability,
+  and a default hides incomplete transaction propagation behind a pseudo-valid type.
+- Every `Transact` method returns `TCResult<()>`. Composite implementations recurse
+  through their children and propagate the first failure; lifecycle code must never
+  convert a storage error into `expect`, logging-only behavior, or best effort.
+- Streams which require a permit, read guard, cache reservation, or device admission
+  must use the shared guard-owning stream primitive. Domain wrappers may add lazy
+  transforms, but may not reimplement guard lifetime or eager materialization.
 
 ## Locking and transaction safety
 

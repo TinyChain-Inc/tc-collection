@@ -1,9 +1,8 @@
 use super::Tensor;
 
-use super::dtype::{TensorDtypeGuard, TensorOpError};
+use super::dtype::TensorOpError;
 
 pub fn tensor_transpose(input: &Tensor, permutation: &[usize]) -> Result<Tensor, TensorOpError> {
-    TensorDtypeGuard::validate(input)?;
     let output_shape = transpose_output_shape(input.shape(), permutation)?;
 
     let result = input
@@ -55,5 +54,24 @@ fn invalid_permutation(rank: usize, permutation: &[usize], reason: &str) -> Tens
         rank,
         permutation: permutation.to_vec(),
         reason: reason.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transpose_preserves_u64_values_exactly() {
+        let values = vec![u64::MAX - 3, u64::MAX - 2, u64::MAX - 1, u64::MAX];
+        let tensor = Tensor::dense_u64(vec![2, 2], values.clone()).expect("tensor");
+
+        let transposed = tensor_transpose(&tensor, &[1, 0]).expect("transpose");
+
+        assert_eq!(transposed.shape(), &[2, 2]);
+        assert_eq!(
+            transposed.flattened_u64().expect("values"),
+            vec![values[0], values[2], values[1], values[3]]
+        );
     }
 }

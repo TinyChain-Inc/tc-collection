@@ -1,18 +1,89 @@
 //! Transactional visibility and ordering regression tests for `BTree`.
 use super::{BTree, BTreeSlice, PersistentFile};
+use crate::test::run_async_test;
 use freqfs::Cache;
 use futures::future::join_all;
 use std::ops::Bound;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tc_ir::{NetworkTime, TxnId};
+use tc_ir::{Claim, NetworkTime, Transaction, TxnId};
 use tc_value::Value;
 use tokio::sync::Barrier;
 use tokio::time::{Duration, sleep, timeout};
 
 fn tx(nonce: u16) -> TxnId {
     TxnId::from_parts(NetworkTime::from_nanos(1), nonce)
+}
+
+#[derive(Clone)]
+struct TestTxn {
+    id: TxnId,
+    claim: Claim,
+    root: freqfs::DirLock<PersistentFile>,
+    path: Vec<String>,
+}
+
+impl TestTxn {
+    fn new(id: TxnId, root: freqfs::DirLock<PersistentFile>) -> Self {
+        Self {
+            id,
+            claim: Claim::new("/test".parse().expect("test claim"), umask::Mode::all()),
+            root,
+            path: Vec::new(),
+        }
+    }
+}
+
+impl Transaction for TestTxn {
+    fn id(&self) -> TxnId {
+        self.id
+    }
+
+    fn timestamp(&self) -> NetworkTime {
+        self.id.timestamp()
+    }
+
+    fn claim(&self) -> &Claim {
+        &self.claim
+    }
+}
+
+impl crate::StorageContext for TestTxn {
+    fn context(
+        &self,
+    ) -> impl std::future::Future<Output = tc_error::TCResult<freqfs::DirLock<PersistentFile>>> + Send
+    {
+        let root = self.root.clone();
+        let mut path = vec![self.id.to_string()];
+        path.extend(self.path.clone());
+        async move {
+            let mut current = root;
+            for name in path {
+                let next = {
+                    let mut dir = current.write().await;
+                    dir.get_or_create_dir(name)
+                        .map_err(tc_error::TCError::internal)?
+                };
+                current = next;
+            }
+            Ok(current)
+        }
+    }
+
+    fn subcontext(&self, name: impl Into<String>) -> Self {
+        let mut txn = self.clone();
+        txn.path.push(name.into());
+        txn
+    }
+
+    fn subcontext_unique(&self) -> Self {
+        self.subcontext(format!("literal-{}", self.id))
+    }
+
+    fn materialized_tensor_bytes(&self) -> usize {
+        256 * 1024 * 1024
+    }
 }
 
 fn test_root(name: &str) -> PathBuf {
@@ -34,37 +105,14 @@ async fn init_root(name: &str) -> PathBuf {
     root
 }
 
-fn run_async_test(
-    name: &str,
-    test_fn: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-    + Send
-    + 'static,
-) {
-    std::thread::Builder::new()
-        .name(name.to_string())
-        .stack_size(16 * 1024 * 1024)
-        .spawn(|| {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .thread_stack_size(16 * 1024 * 1024)
-                .enable_all()
-                .build()
-                .expect("create test runtime");
-
-            runtime.block_on(test_fn());
-        })
-        .expect("spawn test thread")
-        .join()
-        .expect("join test thread");
-}
-
 fn load_roots(
     root: &Path,
 ) -> (
     freqfs::DirLock<PersistentFile>,
     freqfs::DirLock<PersistentFile>,
 ) {
-    let cache = Cache::<PersistentFile>::new(16 * 1024 * 1024, None);
+    let cache =
+        Cache::<PersistentFile>::new(16 * 1024 * 1024, None, 0, std::time::Duration::from_secs(3));
     let persistent = Arc::clone(&cache)
         .load(root.join("persistent"))
         .expect("load persistent root");
@@ -80,9 +128,9 @@ fn pending_is_visible_only_to_its_txn() {
         Box::pin(async {
             let root = init_root("pending-visible").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
             btree
-                .insert_row(tx(10), vec![Value::from(1_u64)])
+                .insert_row(&TestTxn::new(tx(10), txn.clone()), vec![Value::from(1_u64)])
                 .await
                 .expect("insert pending");
 
@@ -120,9 +168,9 @@ fn committed_is_visible_in_txn_order() {
         Box::pin(async {
             let root = init_root("committed-visible").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
             btree
-                .insert_row(tx(10), vec![Value::from(1_u64)])
+                .insert_row(&TestTxn::new(tx(10), txn.clone()), vec![Value::from(1_u64)])
                 .await
                 .expect("insert key");
             btree.commit(tx(10)).expect("commit");
@@ -141,18 +189,18 @@ fn direct_mutation_flow_from_chain_state() {
         Box::pin(async {
             let root = init_root("direct-mutation").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             btree
-                .insert_row(tx(10), vec![Value::from(1_u64)])
+                .insert_row(&TestTxn::new(tx(10), txn.clone()), vec![Value::from(1_u64)])
                 .await
                 .expect("insert 1");
             btree
-                .insert_row(tx(10), vec![Value::from(2_u64)])
+                .insert_row(&TestTxn::new(tx(10), txn.clone()), vec![Value::from(2_u64)])
                 .await
                 .expect("insert 2");
             btree
-                .delete_row(tx(10), vec![Value::from(2_u64)])
+                .delete_row(&TestTxn::new(tx(10), txn.clone()), vec![Value::from(2_u64)])
                 .await
                 .expect("delete 2");
             btree.commit(tx(10)).expect("commit 10");
@@ -178,22 +226,26 @@ fn cannot_write_after_commit_or_finalize() {
         Box::pin(async {
             let root = init_root("write-after-finalize").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             btree
-                .insert_row(tx(10), vec![Value::from(1_u64)])
+                .insert_row(&TestTxn::new(tx(10), txn.clone()), vec![Value::from(1_u64)])
                 .await
                 .expect("insert key");
             btree.commit(tx(10)).expect("commit");
 
             assert_eq!(
-                btree.insert_row(tx(10), vec![Value::from(2_u64)]).await,
+                btree
+                    .insert_row(&TestTxn::new(tx(10), txn.clone()), vec![Value::from(2_u64)])
+                    .await,
                 Err(txn_lock::Error::Committed)
             );
 
             btree.finalize(tx(10)).await.expect("finalize");
             assert_eq!(
-                btree.insert_row(tx(10), vec![Value::from(3_u64)]).await,
+                btree
+                    .insert_row(&TestTxn::new(tx(10), txn.clone()), vec![Value::from(3_u64)])
+                    .await,
                 Err(txn_lock::Error::Outdated)
             );
         })
@@ -206,27 +258,30 @@ fn streamed_keys_match_materialized_keys() {
         Box::pin(async {
             let root = init_root("streamed-vs-materialized").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             for key in [1, 2, 3, 4, 5] {
                 btree
-                    .insert_row(tx(10), vec![Value::from(key as u64)])
+                    .insert_row(
+                        &TestTxn::new(tx(10), txn.clone()),
+                        vec![Value::from(key as u64)],
+                    )
                     .await
                     .expect("insert key");
             }
 
             btree
-                .delete_row(tx(10), vec![Value::from(2_u64)])
+                .delete_row(&TestTxn::new(tx(10), txn.clone()), vec![Value::from(2_u64)])
                 .await
                 .expect("delete key");
             btree.commit(tx(10)).expect("commit 10");
 
             btree
-                .insert_row(tx(11), vec![Value::from(7_u64)])
+                .insert_row(&TestTxn::new(tx(11), txn.clone()), vec![Value::from(7_u64)])
                 .await
                 .expect("insert key 7");
             btree
-                .delete_row(tx(11), vec![Value::from(3_u64)])
+                .delete_row(&TestTxn::new(tx(11), txn.clone()), vec![Value::from(3_u64)])
                 .await
                 .expect("delete key 3");
 
@@ -258,11 +313,14 @@ fn slice_keys_match_range_view() {
         Box::pin(async {
             let root = init_root("slice-keys").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             for key in [1, 3, 5, 7, 9] {
                 btree
-                    .insert_row(tx(40), vec![Value::from(key as u64)])
+                    .insert_row(
+                        &TestTxn::new(tx(40), txn.clone()),
+                        vec![Value::from(key as u64)],
+                    )
                     .await
                     .expect("insert key");
             }
@@ -291,10 +349,10 @@ fn btree_is_send_and_sync_when_key_is_send_and_sync() {
     fn assert_send<T: Send>() {}
     fn assert_sync<T: Sync>() {}
 
-    assert_send::<BTree>();
-    assert_sync::<BTree>();
-    assert_send::<BTreeSlice>();
-    assert_sync::<BTreeSlice>();
+    assert_send::<BTree<TestTxn>>();
+    assert_sync::<BTree<TestTxn>>();
+    assert_send::<BTreeSlice<TestTxn>>();
+    assert_sync::<BTreeSlice<TestTxn>>();
 }
 
 #[test]
@@ -303,15 +361,15 @@ fn overlapping_write_in_past_txn_fails_closed() {
         Box::pin(async {
             let root = init_root("overlapping-write").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             btree
-                .insert_row(tx(2), vec![Value::from("k")])
+                .insert_row(&TestTxn::new(tx(2), txn.clone()), vec![Value::from("k")])
                 .await
                 .expect("reserve write at txn 2");
 
             let err = btree
-                .insert_row(tx(1), vec![Value::from("k")])
+                .insert_row(&TestTxn::new(tx(1), txn.clone()), vec![Value::from("k")])
                 .await
                 .expect_err("expected conflict for out-of-order overlapping write");
 
@@ -326,10 +384,10 @@ fn rollback_unblocks_later_read_and_discards_pending() {
         Box::pin(async {
             let root = init_root("rollback-unblocks-read").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             btree
-                .insert_row(tx(10), vec![Value::from("k")])
+                .insert_row(&TestTxn::new(tx(10), txn.clone()), vec![Value::from("k")])
                 .await
                 .expect("insert pending key");
 
@@ -363,10 +421,13 @@ fn duplicate_commit_is_idempotent() {
         Box::pin(async {
             let root = init_root("duplicate-commit").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             btree
-                .insert_row(tx(10), vec![Value::from(42_u64)])
+                .insert_row(
+                    &TestTxn::new(tx(10), txn.clone()),
+                    vec![Value::from(42_u64)],
+                )
                 .await
                 .expect("insert key");
 
@@ -392,10 +453,10 @@ fn stale_finalize_is_noop() {
         Box::pin(async {
             let root = init_root("stale-finalize").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             btree
-                .insert_row(tx(10), vec![Value::from("x")])
+                .insert_row(&TestTxn::new(tx(10), txn.clone()), vec![Value::from("x")])
                 .await
                 .expect("insert key");
             btree.commit(tx(10)).expect("commit 10");
@@ -426,11 +487,11 @@ fn large_scan_completes_under_timeout() {
         Box::pin(async {
             let root = init_root("large-scan").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             for i in 0_u64..2_000_u64 {
                 btree
-                    .insert_row(tx(20), vec![Value::from(i)])
+                    .insert_row(&TestTxn::new(tx(20), txn.clone()), vec![Value::from(i)])
                     .await
                     .expect("insert large keyset");
             }
@@ -465,10 +526,10 @@ fn many_later_readers_unblock_after_commit() {
         Box::pin(async {
             let root = init_root("many-readers-unblock").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             btree
-                .insert_row(tx(50), vec![Value::from("hot")])
+                .insert_row(&TestTxn::new(tx(50), txn.clone()), vec![Value::from("hot")])
                 .await
                 .expect("insert pending key");
 
@@ -505,35 +566,53 @@ fn concurrent_writer_conflict_matrix() {
         Box::pin(async {
             let root = init_root("writer-conflict-matrix").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
             let barrier = Arc::new(Barrier::new(4));
 
             let later_same = {
                 let btree = btree.clone();
                 let barrier = barrier.clone();
+                let txn = txn.clone();
                 tokio::spawn(async move {
                     barrier.wait().await;
-                    btree.insert_row(tx(20), vec![Value::from("same")]).await
+                    btree
+                        .insert_row(
+                            &TestTxn::new(tx(20), txn.clone()),
+                            vec![Value::from("same")],
+                        )
+                        .await
                 })
             };
 
             let earlier_same = {
                 let btree = btree.clone();
                 let barrier = barrier.clone();
+                let txn = txn.clone();
                 tokio::spawn(async move {
                     barrier.wait().await;
                     sleep(Duration::from_millis(10)).await;
-                    btree.insert_row(tx(19), vec![Value::from("same")]).await
+                    btree
+                        .insert_row(
+                            &TestTxn::new(tx(19), txn.clone()),
+                            vec![Value::from("same")],
+                        )
+                        .await
                 })
             };
 
             let earlier_disjoint = {
                 let btree = btree.clone();
                 let barrier = barrier.clone();
+                let txn = txn.clone();
                 tokio::spawn(async move {
                     barrier.wait().await;
                     sleep(Duration::from_millis(10)).await;
-                    btree.insert_row(tx(19), vec![Value::from("other")]).await
+                    btree
+                        .insert_row(
+                            &TestTxn::new(tx(19), txn.clone()),
+                            vec![Value::from("other")],
+                        )
+                        .await
                 })
             };
 
@@ -562,11 +641,11 @@ fn snapshot_scan_is_coherent_under_concurrent_commits() {
         Box::pin(async {
             let root = init_root("snapshot-coherence").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             for i in 0_u64..100_u64 {
                 btree
-                    .insert_row(tx(30), vec![Value::from(i)])
+                    .insert_row(&TestTxn::new(tx(30), txn.clone()), vec![Value::from(i)])
                     .await
                     .expect("seed baseline key");
             }
@@ -608,7 +687,10 @@ fn snapshot_scan_is_coherent_under_concurrent_commits() {
                     sleep(Duration::from_millis(10)).await;
 
                     btree
-                        .insert_row(tx(32), vec![Value::from(100_u64)])
+                        .insert_row(
+                            &TestTxn::new(tx(32), txn.clone()),
+                            vec![Value::from(100_u64)],
+                        )
                         .await
                         .expect("insert future key");
                     btree.commit(tx(32)).expect("commit 32");
@@ -637,14 +719,17 @@ fn lifecycle_noop_paths_do_not_leak_reservations_soak() {
         Box::pin(async {
             let root = init_root("reservation-leak-soak").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             for i in 0_u16..200_u16 {
                 let txn_id = tx(1_000 + i);
                 let next = tx(1_001 + i);
 
                 btree
-                    .insert_row(txn_id, vec![Value::from(i as u64)])
+                    .insert_row(
+                        &TestTxn::new(txn_id, txn.clone()),
+                        vec![Value::from(i as u64)],
+                    )
                     .await
                     .expect("insert key");
 
@@ -679,11 +764,11 @@ fn load_smoke_mixed_mutation_and_scan() {
         Box::pin(async {
             let root = init_root("load-smoke").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             for i in 0_u64..10_000_u64 {
                 btree
-                    .insert_row(tx(2_000), vec![Value::from(i)])
+                    .insert_row(&TestTxn::new(tx(2_000), txn.clone()), vec![Value::from(i)])
                     .await
                     .expect("seed key");
             }
@@ -693,14 +778,14 @@ fn load_smoke_mixed_mutation_and_scan() {
 
             for i in (0_u64..10_000_u64).step_by(2) {
                 btree
-                    .delete_row(tx(2_001), vec![Value::from(i)])
+                    .delete_row(&TestTxn::new(tx(2_001), txn.clone()), vec![Value::from(i)])
                     .await
                     .expect("delete even key");
             }
 
             for i in 10_000_u64..15_000_u64 {
                 btree
-                    .insert_row(tx(2_001), vec![Value::from(i)])
+                    .insert_row(&TestTxn::new(tx(2_001), txn.clone()), vec![Value::from(i)])
                     .await
                     .expect("insert extension key");
             }
@@ -745,10 +830,10 @@ fn finalize_conflicts_with_future_read() {
         Box::pin(async {
             let root = init_root("finalize-future-read-conflict").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             btree
-                .insert_row(tx(9), vec![Value::from("k")])
+                .insert_row(&TestTxn::new(tx(9), txn.clone()), vec![Value::from("k")])
                 .await
                 .expect("insert seed key");
             btree.commit(tx(9)).expect("commit 9");
@@ -761,7 +846,10 @@ fn finalize_conflicts_with_future_read() {
             // read reservation. Finalize is a lifecycle operation, not a write —
             // it merges already-committed data into canon. Future reads are
             // protected by their own permits and by the DirLock on persistent storage.
-            btree.finalize(tx(10)).await.expect("finalize should succeed with future read");
+            btree
+                .finalize(tx(10))
+                .await
+                .expect("finalize should succeed with future read");
 
             // After finalize, the data should still be visible to later reads.
             assert!(btree.contains_row(tx(12), &[Value::from("k")]).await);
@@ -777,10 +865,10 @@ fn blocked_reader_cancellation_does_not_poison_lock_state() {
             Box::pin(async {
                 let root = init_root("blocked-reader-cancel").await;
                 let (persistent, txn) = load_roots(&root);
-                let btree = BTree::new(persistent, txn);
+                let btree = BTree::<TestTxn>::new(persistent);
 
                 btree
-                    .insert_row(tx(60), vec![Value::from("hot")])
+                    .insert_row(&TestTxn::new(tx(60), txn.clone()), vec![Value::from("hot")])
                     .await
                     .expect("insert pending key");
 
@@ -823,10 +911,13 @@ fn timeout_cleanup_path_unblocks_later_reads() {
         Box::pin(async {
             let root = init_root("timeout-cleanup-unblock").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             btree
-                .insert_row(tx(70), vec![Value::from("pending")])
+                .insert_row(
+                    &TestTxn::new(tx(70), txn.clone()),
+                    vec![Value::from("pending")],
+                )
                 .await
                 .expect("insert pending key");
 
@@ -861,14 +952,16 @@ fn multi_column_partial_overlap_blocking_behavior() {
         Box::pin(async {
             let root = init_root("multi-column-overlap").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::with_schema(
+            let btree = BTree::<TestTxn>::with_schema(
                 persistent,
-                txn,
                 super::BTreeSchema::new(super::StorageConfig::default(), 2, None),
             );
 
             btree
-                .insert_row(tx(80), vec![Value::from("a"), Value::from(1_u64)])
+                .insert_row(
+                    &TestTxn::new(tx(80), txn.clone()),
+                    vec![Value::from("a"), Value::from(1_u64)],
+                )
                 .await
                 .expect("insert pending composite key");
 
@@ -910,7 +1003,7 @@ fn reservation_fuzz_no_read_starvation() {
         Box::pin(async {
             let root = init_root("reservation-fuzz").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             for i in 0_u16..300_u16 {
                 let txn_id = tx(3_000 + i);
@@ -918,7 +1011,7 @@ fn reservation_fuzz_no_read_starvation() {
 
                 if i % 3 != 0 {
                     btree
-                        .insert_row(txn_id, vec![key.clone()])
+                        .insert_row(&TestTxn::new(txn_id, txn.clone()), vec![key.clone()])
                         .await
                         .expect("fuzz insert");
                 }
@@ -957,10 +1050,10 @@ fn same_txn_read_your_own_write_is_non_blocking() {
         Box::pin(async {
             let root = init_root("same-txn-read-own-write").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             btree
-                .insert_row(tx(90), vec![Value::from("own")])
+                .insert_row(&TestTxn::new(tx(90), txn.clone()), vec![Value::from("own")])
                 .await
                 .expect("insert own key");
 
@@ -982,14 +1075,20 @@ fn same_txn_read_your_own_delete_is_non_blocking() {
         Box::pin(async {
             let root = init_root("same-txn-read-own-delete").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             btree
-                .insert_row(tx(91), vec![Value::from("gone")])
+                .insert_row(
+                    &TestTxn::new(tx(91), txn.clone()),
+                    vec![Value::from("gone")],
+                )
                 .await
                 .expect("insert key");
             btree
-                .delete_row(tx(91), vec![Value::from("gone")])
+                .delete_row(
+                    &TestTxn::new(tx(91), txn.clone()),
+                    vec![Value::from("gone")],
+                )
                 .await
                 .expect("delete key in same txn");
 
@@ -1011,10 +1110,13 @@ fn repeated_rollback_and_finalize_are_idempotent() {
         Box::pin(async {
             let root = init_root("repeated-lifecycle-idempotency").await;
             let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             btree
-                .insert_row(tx(92), vec![Value::from("rollback")])
+                .insert_row(
+                    &TestTxn::new(tx(92), txn.clone()),
+                    vec![Value::from("rollback")],
+                )
                 .await
                 .expect("insert key for rollback");
 
@@ -1024,7 +1126,10 @@ fn repeated_rollback_and_finalize_are_idempotent() {
                 .expect("second rollback should be no-op");
 
             btree
-                .insert_row(tx(93), vec![Value::from("finalize")])
+                .insert_row(
+                    &TestTxn::new(tx(93), txn.clone()),
+                    vec![Value::from("finalize")],
+                )
                 .await
                 .expect("insert key for finalize");
             btree.commit(tx(93)).expect("commit 93");
@@ -1047,8 +1152,8 @@ fn empty_tree_semantics_across_lifecycle() {
     run_async_test("empty_tree_semantics_across_lifecycle", || {
         Box::pin(async {
             let root = init_root("empty-tree-lifecycle").await;
-            let (persistent, txn) = load_roots(&root);
-            let btree = BTree::new(persistent, txn);
+            let (persistent, _) = load_roots(&root);
+            let btree = BTree::<TestTxn>::new(persistent);
 
             assert!(btree.is_empty(tx(95)).await);
             assert_eq!(btree.count(tx(95)).await, 0);

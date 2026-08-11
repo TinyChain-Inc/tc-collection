@@ -135,7 +135,8 @@ impl TableSchema {
         let key_names: Vec<Id> = key.iter().map(|c| c.name.clone()).collect();
         let value_names: Vec<Id> = values.iter().map(|c| c.name.clone()).collect();
 
-        let mut column_map: HashMap<&Id, &Column> = HashMap::with_capacity(key.len() + values.len());
+        let mut column_map: HashMap<&Id, &Column> =
+            HashMap::with_capacity(key.len() + values.len());
         for col in key.iter().chain(values.iter()) {
             column_map.insert(&col.name, col);
         }
@@ -355,7 +356,11 @@ fn cast_column_list(value: &Value) -> Option<Vec<Column>> {
 fn cast_index_list(value: &Value) -> Option<Vec<(String, Vec<Id>)>> {
     match value {
         Value::None => Some(Vec::new()),
-        Value::Tuple(tuple) => tuple.iter().cloned().map(<(String, Vec<Id>)>::opt_cast_from).collect(),
+        Value::Tuple(tuple) => tuple
+            .iter()
+            .cloned()
+            .map(<(String, Vec<Id>)>::opt_cast_from)
+            .collect(),
         _ => None,
     }
 }
@@ -399,10 +404,7 @@ impl CastFrom<TableSchema> for Value {
                     .take(col_count)
                     .map(|c| Value::String(c.to_string()))
                     .collect::<Vec<_>>();
-                Value::Tuple(vec![
-                    Value::String(name.clone()),
-                    Value::Tuple(cols),
-                ])
+                Value::Tuple(vec![Value::String(name.clone()), Value::Tuple(cols)])
             })
             .collect::<Vec<_>>();
         let indices = Value::Tuple(indices);
@@ -448,9 +450,17 @@ impl CastFrom<Column> for Value {
 
 impl fmt::Display for TableSchema {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "TableSchema(key={:?}, values={:?}", self.key, self.values)?;
+        write!(
+            f,
+            "TableSchema(key={:?}, values={:?}",
+            self.key, self.values
+        )?;
         if !self.indices.is_empty() {
-            write!(f, ", indices={:?}", self.indices.iter().map(|(n, _)| n).collect::<Vec<_>>())?;
+            write!(
+                f,
+                ", indices={:?}",
+                self.indices.iter().map(|(n, _)| n).collect::<Vec<_>>()
+            )?;
         }
         write!(f, ")")
     }

@@ -1,4 +1,4 @@
-use ha_ndarray::{ArrayBuf, Buffer, NDArray, NDArrayRead, NDArrayTransform};
+use ha_ndarray::{ArrayBuf, Axes, Buffer, NDArray, NDArrayRead, NDArrayTransform};
 use number_general::{FloatType, Number, UIntType};
 use safecast::CastInto;
 use tc_value::NumberType;
@@ -63,6 +63,16 @@ impl Tensor {
 
     pub fn size(&self) -> usize {
         self.shape().iter().product()
+    }
+
+    pub fn retained_bytes(&self) -> Option<usize> {
+        let element = match self {
+            Tensor::F32(_) => std::mem::size_of::<f32>(),
+            Tensor::F64(_) | Tensor::U64(_) => std::mem::size_of::<u64>(),
+        };
+        self.shape()
+            .iter()
+            .try_fold(element, |bytes, dim| bytes.checked_mul(*dim))
     }
 
     pub fn flattened_f32(&self) -> Result<Vec<f32>, String> {
@@ -284,24 +294,49 @@ impl Tensor {
         } else {
             (0..shape.len()).rev().collect()
         };
+        let permutation: Axes = permutation.into_iter().collect();
 
-        let out_shape: Vec<usize> = permutation.iter().map(|axis| shape[*axis]).collect();
-        let out_len = out_shape.iter().product::<usize>();
-        let values = self.values_f64()?;
-        let mut out = vec![0.0; out_len];
-
-        for (linear_idx, out_value) in out.iter_mut().enumerate() {
-            let out_coord = unravel_index(linear_idx, &out_shape);
-            let mut in_coord = vec![0usize; shape.len()];
-            for (out_axis, in_axis) in permutation.iter().copied().enumerate() {
-                in_coord[in_axis] = out_coord[out_axis];
+        match self {
+            Tensor::F32(array) => {
+                let transposed = (*array)
+                    .transpose(Some(permutation.clone()))
+                    .map_err(|err| err.to_string())?;
+                let shape = transposed.shape().to_vec();
+                let values = transposed
+                    .buffer()
+                    .map_err(|err| err.to_string())?
+                    .to_slice()
+                    .map_err(|err| err.to_string())?
+                    .into_vec();
+                Tensor::dense_f32(shape, values)
             }
-
-            let in_offset = coord_offset_usize(&shape, &in_coord)?;
-            *out_value = values[in_offset];
+            Tensor::F64(array) => {
+                let transposed = (*array)
+                    .transpose(Some(permutation.clone()))
+                    .map_err(|err| err.to_string())?;
+                let shape = transposed.shape().to_vec();
+                let values = transposed
+                    .buffer()
+                    .map_err(|err| err.to_string())?
+                    .to_slice()
+                    .map_err(|err| err.to_string())?
+                    .into_vec();
+                Tensor::dense_f64(shape, values)
+            }
+            Tensor::U64(array) => {
+                let transposed = (*array)
+                    .transpose(Some(permutation))
+                    .map_err(|err| err.to_string())?;
+                let shape = transposed.shape().to_vec();
+                let values = transposed
+                    .buffer()
+                    .map_err(|err| err.to_string())?
+                    .to_slice()
+                    .map_err(|err| err.to_string())?
+                    .into_vec();
+                Tensor::dense_u64(shape, values)
+            }
         }
-
-        self.from_f64_like(out_shape, out)
     }
 
     pub fn slice(self, range: Range) -> Result<Self, String> {

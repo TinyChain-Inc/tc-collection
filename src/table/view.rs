@@ -10,24 +10,96 @@ use futures::TryStreamExt;
 use tc_ir::{Id, TxnId};
 use tc_value::Value;
 
+use super::LocalTable;
 use super::file::PersistentTable;
 use super::schema::TableSchema;
 use super::stream::Rows;
+
+enum TableSource<Txn> {
+    File(PersistentTable<Txn>),
+    Local(LocalTable),
+}
+
+impl<Txn> Clone for TableSource<Txn> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::File(table) => Self::File(table.clone()),
+            Self::Local(table) => Self::Local(table.clone()),
+        }
+    }
+}
+
+impl<Txn> TableSource<Txn> {
+    fn schema(&self) -> &TableSchema {
+        match self {
+            Self::File(table) => table.schema(),
+            Self::Local(table) => table.schema(),
+        }
+    }
+
+    async fn rows(
+        &self,
+        txn_id: TxnId,
+        range: Range<Id, Value>,
+        order: Vec<Id>,
+        reverse: bool,
+    ) -> tc_error::TCResult<Rows> {
+        match self {
+            Self::File(table) => table
+                .rows(txn_id, range, order, reverse)
+                .await
+                .map_err(tc_error::TCError::from),
+            Self::Local(table) => {
+                let rows = table
+                    .clone()
+                    .into_read()
+                    .await
+                    .rows(range, &order, reverse, None)
+                    .await?;
+                Ok(Rows::local(rows))
+            }
+        }
+    }
+
+    async fn count(&self, txn_id: TxnId, range: Range<Id, Value>) -> u64 {
+        match self {
+            Self::File(table) => table.count_in(txn_id, range).await,
+            Self::Local(table) => table.read().await.count(range).await.unwrap_or(0),
+        }
+    }
+
+    async fn is_empty(&self, txn_id: TxnId, range: Range<Id, Value>) -> bool {
+        match self {
+            Self::File(table) => table.is_empty_in(txn_id, range).await,
+            Self::Local(table) => table.read().await.is_empty(range).await.unwrap_or(true),
+        }
+    }
+}
 
 /// A range + order + reverse view over a [`PersistentTable`].
 ///
 /// Constructed via [`PersistentTable::slice`] or [`PersistentTable::order_by`].
 /// All operations delegate to the source table with the stored range, order,
 /// and direction applied. The view is structural — it holds no row data.
-#[derive(Clone)]
-pub struct TableSlice {
-    table: PersistentTable,
+pub struct TableSlice<Txn> {
+    table: TableSource<Txn>,
     range: Range<Id, Value>,
     order: Vec<Id>,
     reverse: bool,
 }
 
-impl fmt::Debug for TableSlice {
+impl<Txn> Clone for TableSlice<Txn> {
+    fn clone(&self) -> Self {
+        Self {
+            table: self.table.clone(),
+            range: self.range.clone(),
+            order: self.order.clone(),
+            reverse: self.reverse,
+        }
+    }
+}
+
+impl<Txn> fmt::Debug for TableSlice<Txn> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TableSlice")
             .field("range", &self.range)
@@ -37,9 +109,9 @@ impl fmt::Debug for TableSlice {
     }
 }
 
-impl TableSlice {
-    pub(crate) fn new(
-        table: PersistentTable,
+impl<Txn> TableSlice<Txn> {
+    fn from_source(
+        table: TableSource<Txn>,
         range: Range<Id, Value>,
         order: Vec<Id>,
         reverse: bool,
@@ -50,6 +122,24 @@ impl TableSlice {
             order,
             reverse,
         }
+    }
+
+    pub(crate) fn new(
+        table: PersistentTable<Txn>,
+        range: Range<Id, Value>,
+        order: Vec<Id>,
+        reverse: bool,
+    ) -> Self {
+        Self::from_source(TableSource::File(table), range, order, reverse)
+    }
+
+    pub(crate) fn local(
+        table: LocalTable,
+        range: Range<Id, Value>,
+        order: Vec<Id>,
+        reverse: bool,
+    ) -> Self {
+        Self::from_source(TableSource::Local(table), range, order, reverse)
     }
 
     pub fn schema(&self) -> &TableSchema {
@@ -71,7 +161,7 @@ impl TableSlice {
     /// Return a row stream over this slice's range, order, and direction.
     ///
     /// The stream holds a transactional read permit for its entire lifetime.
-    pub async fn rows(&self, txn_id: TxnId) -> Result<Rows, txn_lock::Error> {
+    pub async fn rows(&self, txn_id: TxnId) -> tc_error::TCResult<Rows> {
         self.table
             .rows(txn_id, self.range.clone(), self.order.clone(), self.reverse)
             .await
@@ -79,12 +169,12 @@ impl TableSlice {
 
     /// Count the visible rows in this slice at `txn_id`.
     pub async fn count(&self, txn_id: TxnId) -> u64 {
-        self.table.count_in(txn_id, self.range.clone()).await
+        self.table.count(txn_id, self.range.clone()).await
     }
 
     /// Return `true` if this slice has no visible rows at `txn_id`.
     pub async fn is_empty(&self, txn_id: TxnId) -> bool {
-        self.table.is_empty_in(txn_id, self.range.clone()).await
+        self.table.is_empty(txn_id, self.range.clone()).await
     }
 
     /// Iterate visible rows in this slice, calling `on_row` for each.
@@ -92,19 +182,17 @@ impl TableSlice {
     where
         F: FnMut(Row<Value>),
     {
-        self.table
-            .for_each_row_in_order(
-                txn_id,
-                self.range.clone(),
-                &self.order,
-                self.reverse,
-                on_row,
-            )
-            .await;
+        let Ok(mut rows) = self.rows(txn_id).await else {
+            return;
+        };
+        let mut on_row = on_row;
+        while let Some(row) = rows.try_next().await.expect("read table row") {
+            on_row(row);
+        }
     }
 
     /// Cap this slice to at most `n` rows.
-    pub fn limit(&self, n: u64) -> Limited {
+    pub fn limit(&self, n: u64) -> Limited<Txn> {
         Limited {
             source: self.clone(),
             limit: n,
@@ -112,7 +200,7 @@ impl TableSlice {
     }
 
     /// Project only the given `columns` from each row in this slice.
-    pub fn select(&self, columns: Vec<Id>) -> Selection {
+    pub fn select(&self, columns: Vec<Id>) -> Selection<Txn> {
         Selection {
             source: self.clone(),
             columns,
@@ -124,12 +212,12 @@ impl TableSlice {
     ///
     /// The sub-range columns are merged with this slice's range (the sub-range
     /// takes precedence for shared columns).
-    pub fn slice(&self, sub_range: Range<Id, Value>) -> TableSlice {
+    pub fn slice(&self, sub_range: Range<Id, Value>) -> TableSlice<Txn> {
         let mut combined = self.range.inner().clone();
         for (name, bound) in sub_range.into_inner() {
             combined.insert(name, bound);
         }
-        TableSlice::new(
+        TableSlice::from_source(
             self.table.clone(),
             combined.into(),
             self.order.clone(),
@@ -143,12 +231,12 @@ impl TableSlice {
 /// Constructed via [`TableSlice::limit`] or [`PersistentTable::limit`].
 /// `count` streams rows and stops at the cap — no full materialization.
 #[derive(Clone)]
-pub struct Limited {
-    source: TableSlice,
+pub struct Limited<Txn> {
+    source: TableSlice<Txn>,
     limit: u64,
 }
 
-impl fmt::Debug for Limited {
+impl<Txn> fmt::Debug for Limited<Txn> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Limited")
             .field("limit", &self.limit)
@@ -156,7 +244,7 @@ impl fmt::Debug for Limited {
     }
 }
 
-impl Limited {
+impl<Txn> Limited<Txn> {
     pub fn schema(&self) -> &TableSchema {
         self.source.schema()
     }
@@ -166,7 +254,7 @@ impl Limited {
     }
 
     /// Return a row stream capped to at most `limit` rows.
-    pub async fn rows(&self, txn_id: TxnId) -> Result<Rows, txn_lock::Error> {
+    pub async fn rows(&self, txn_id: TxnId) -> tc_error::TCResult<Rows> {
         let rows = self.source.rows(txn_id).await?;
         Ok(rows.limit(self.limit))
     }
@@ -215,7 +303,7 @@ impl Limited {
 
     /// Project only the given `columns` from each row, preserving this
     /// view's row cap.
-    pub fn select(&self, columns: Vec<Id>) -> Selection {
+    pub fn select(&self, columns: Vec<Id>) -> Selection<Txn> {
         Selection {
             source: self.source.clone(),
             columns,
@@ -230,13 +318,13 @@ impl Limited {
 /// The projection is applied lazily during streaming — no rows are copied
 /// until the stream is polled.
 #[derive(Clone)]
-pub struct Selection {
-    source: TableSlice,
+pub struct Selection<Txn> {
+    source: TableSlice<Txn>,
     columns: Vec<Id>,
     limit: Option<u64>,
 }
 
-impl fmt::Debug for Selection {
+impl<Txn> fmt::Debug for Selection<Txn> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Selection")
             .field("columns", &self.columns)
@@ -244,7 +332,7 @@ impl fmt::Debug for Selection {
     }
 }
 
-impl Selection {
+impl<Txn> Selection<Txn> {
     pub fn schema(&self) -> &TableSchema {
         self.source.schema()
     }
@@ -257,7 +345,7 @@ impl Selection {
     ///
     /// If this selection was composed from a [`Limited`] view, the row cap
     /// is applied as a lazy `take` before the column projection.
-    pub async fn rows(&self, txn_id: TxnId) -> Result<Rows, txn_lock::Error> {
+    pub async fn rows(&self, txn_id: TxnId) -> tc_error::TCResult<Rows> {
         let rows = self.source.rows(txn_id).await?;
         let rows = if let Some(limit) = self.limit {
             rows.limit(limit)
@@ -285,8 +373,10 @@ impl Selection {
         let indices = Self::column_indices(self.schema(), &self.columns);
         self.source
             .for_each_row_in_order(txn_id, |row| {
-                let projected: Row<Value> =
-                    indices.iter().filter_map(|&i| row.get(i).cloned()).collect();
+                let projected: Row<Value> = indices
+                    .iter()
+                    .filter_map(|&i| row.get(i).cloned())
+                    .collect();
                 on_row(projected);
             })
             .await;

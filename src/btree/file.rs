@@ -1,19 +1,21 @@
 //! Core transactional BTree behavior and range/snapshot query logic.
 use std::collections::BTreeMap;
 use std::fmt;
+use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Arc, RwLock};
 
 use b_tree::{BTreeLock, Range, Schema};
-use collate::{Collate, Collator as TxnCollator, try_diff, try_merge};
+use collate::{Collate, try_diff, try_merge};
 use freqfs::DirLock;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-use tc_error::TCError;
+use tc_error::{TCError, TCResult};
 use tc_ir::{Transact, TxnId};
-use tc_value::{Value, ValueType};
+use tc_value::{Value, ValueCollator, ValueType};
 
 use super::PersistentFile;
+use crate::CollectionDir;
 
 const UNARY_KEY_ARITY: usize = 1;
 
@@ -28,19 +30,30 @@ fn background_error(err: impl fmt::Display) -> txn_lock::Error {
     txn_lock::Error::Background(err.to_string())
 }
 
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Copy, Clone, Eq, PartialEq)]
 struct KeyStreamCollator {
+    values: b_tree::Collator<ValueCollator>,
     reverse: bool,
+}
+
+impl KeyStreamCollator {
+    fn new(reverse: bool) -> Self {
+        Self {
+            values: b_tree::Collator::new(ValueCollator::default()),
+            reverse,
+        }
+    }
 }
 
 impl Collate for KeyStreamCollator {
     type Value = Vec<Value>;
 
     fn cmp(&self, left: &Self::Value, right: &Self::Value) -> std::cmp::Ordering {
+        let ordering = self.values.cmp(left, right);
         if self.reverse {
-            right.cmp(left)
+            ordering.reverse()
         } else {
-            left.cmp(right)
+            ordering
         }
     }
 }
@@ -68,7 +81,11 @@ pub struct BTreeSchema {
 }
 
 impl BTreeSchema {
-    pub fn new(storage: StorageConfig, key_arity: usize, key_types: Option<Vec<ValueType>>) -> Self {
+    pub fn new(
+        storage: StorageConfig,
+        key_arity: usize,
+        key_types: Option<Vec<ValueType>>,
+    ) -> Self {
         assert!(key_arity > 0, "BTree key arity must be >= 1");
         if let Some(types) = &key_types {
             assert!(
@@ -166,7 +183,7 @@ impl Schema for BTreeSchema {
 
 #[derive(Clone)]
 struct PersistentStore {
-    tree: BTreeLock<BTreeSchema, b_tree::collate::Collator<Value>, PersistentFile>,
+    tree: BTreeLock<BTreeSchema, ValueCollator, PersistentFile>,
 }
 
 impl PersistentStore {
@@ -175,7 +192,7 @@ impl PersistentStore {
     }
 
     fn from_dir(dir: DirLock<PersistentFile>, schema: BTreeSchema) -> std::io::Result<Self> {
-        let tree = BTreeLock::load(schema, b_tree::collate::Collator::default(), dir)?;
+        let tree = BTreeLock::load(schema, ValueCollator::default(), dir)?;
         Ok(Self { tree })
     }
 
@@ -260,7 +277,6 @@ struct State {
     committed: BTreeMap<TxnId, Delta>,
     pending: BTreeMap<TxnId, Delta>,
     finalized: Option<TxnId>,
-    txn_root: DirLock<PersistentFile>,
 }
 
 #[derive(Clone)]
@@ -269,25 +285,37 @@ struct VisibleSnapshot {
     deltas: Vec<Delta>,
 }
 
-#[derive(Clone)]
-pub struct BTree {
+pub struct BTree<Txn> {
     state: Arc<RwLock<State>>,
+    dir: CollectionDir,
     semaphore: txn_lock::semaphore::Semaphore<
         TxnId,
-        TxnCollator<Vec<Value>>,
+        b_tree::Collator<ValueCollator>,
         txn_lock::set::Range<Vec<Value>>,
     >,
+    txn: PhantomData<fn() -> Txn>,
+}
+
+impl<Txn> Clone for BTree<Txn> {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            dir: self.dir.clone(),
+            semaphore: self.semaphore.clone(),
+            txn: PhantomData,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
-pub struct BTreeSlice {
-    btree: BTree,
+pub struct BTreeSlice<Txn> {
+    btree: BTree<Txn>,
     lower: Bound<Value>,
     upper: Bound<Value>,
     reverse: bool,
 }
 
-impl fmt::Debug for BTree {
+impl<Txn> fmt::Debug for BTree<Txn> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = self.state.read().expect("state read lock");
         f.debug_struct("BTree")
@@ -298,35 +326,58 @@ impl fmt::Debug for BTree {
     }
 }
 
-impl BTree {
+impl<Txn> BTree<Txn> {
     /// Construct a transactional BTree with default unary-key schema.
-    pub fn new(persistent_dir: DirLock<PersistentFile>, txn_root: DirLock<PersistentFile>) -> Self {
-        Self::with_schema(
-            persistent_dir,
-            txn_root,
-            BTreeSchema::default(),
-        )
+    pub fn new(persistent_dir: DirLock<PersistentFile>) -> Self {
+        Self::with_schema(persistent_dir, BTreeSchema::default())
     }
 
-    pub fn with_schema(
-        persistent_dir: DirLock<PersistentFile>,
-        txn_root: DirLock<PersistentFile>,
-        schema: BTreeSchema,
-    ) -> Self {
-        let persistent = Self::load_store(persistent_dir, schema);
+    pub fn with_schema(persistent_dir: DirLock<PersistentFile>, schema: BTreeSchema) -> Self {
+        let persistent = Self::load_store(persistent_dir.clone(), schema);
 
         let state = State {
             persistent,
             committed: BTreeMap::new(),
             pending: BTreeMap::new(),
             finalized: None,
-            txn_root,
         };
 
         Self {
             state: Arc::new(RwLock::new(state)),
-            semaphore: txn_lock::semaphore::Semaphore::new(TxnCollator::default()),
+            dir: CollectionDir::Transaction,
+            semaphore: txn_lock::semaphore::Semaphore::new(b_tree::Collator::new(
+                ValueCollator::default(),
+            )),
+            txn: PhantomData,
         }
+    }
+
+    pub fn literal(persistent_dir: DirLock<PersistentFile>, schema: BTreeSchema) -> Self {
+        let mut btree = Self::with_schema(persistent_dir.clone(), schema);
+        btree.dir = CollectionDir::literal(persistent_dir);
+        btree
+    }
+
+    pub fn named(
+        uri: &pathlink::Link,
+        persistent_dir: DirLock<PersistentFile>,
+        schema: BTreeSchema,
+    ) -> TCResult<Self> {
+        let dir = CollectionDir::named(uri, "btree")?;
+        let persistent = Self::load_store(persistent_dir, schema);
+        Ok(Self {
+            state: Arc::new(RwLock::new(State {
+                persistent,
+                committed: BTreeMap::new(),
+                pending: BTreeMap::new(),
+                finalized: None,
+            })),
+            dir,
+            semaphore: txn_lock::semaphore::Semaphore::new(b_tree::Collator::new(
+                ValueCollator::default(),
+            )),
+            txn: PhantomData,
+        })
     }
 
     pub fn finalized(&self) -> Option<TxnId> {
@@ -351,7 +402,52 @@ impl BTree {
         persistent.key_stream_in(bounds, reverse).await
     }
 
-    pub fn slice<R>(&self, range: R, reverse: bool) -> BTreeSlice
+    /// Stream the keys visible to `txn_id` while retaining the range read permit.
+    pub async fn keys(
+        &self,
+        txn_id: TxnId,
+        bounds: (Bound<Value>, Bound<Value>),
+        reverse: bool,
+    ) -> Result<super::Keys, txn_lock::Error> {
+        let permit = self
+            .acquire_read_permit(txn_id, txn_lock::set::Range::All)
+            .await;
+        let snapshot = self.visible_snapshot(txn_id);
+        let collator = KeyStreamCollator::new(reverse);
+
+        let mut visible: BoxStream<'static, Result<Vec<Value>, std::io::Error>> = snapshot
+            .persistent
+            .key_stream_in(bounds.clone(), reverse)
+            .await
+            .map_err(background_error)?
+            .map_ok(|row| row.to_vec())
+            .boxed();
+
+        for delta in snapshot.deltas {
+            let deletes = delta
+                .deletes
+                .key_stream_in(bounds.clone(), reverse)
+                .await
+                .map_err(background_error)?
+                .map_ok(|row| row.to_vec())
+                .boxed();
+            visible = try_diff(collator, visible, deletes).boxed();
+
+            let inserts = delta
+                .inserts
+                .key_stream_in(bounds.clone(), reverse)
+                .await
+                .map_err(background_error)?
+                .map_ok(|row| row.to_vec())
+                .boxed();
+            visible = try_merge(collator, visible, inserts).boxed();
+        }
+
+        let stream = visible.map_err(TCError::from).boxed();
+        Ok(super::Keys::new(stream, permit))
+    }
+
+    pub fn slice<R>(&self, range: R, reverse: bool) -> BTreeSlice<Txn>
     where
         R: RangeBounds<Value>,
     {
@@ -376,26 +472,34 @@ impl BTree {
         persistent.insert_key(row).await
     }
 
-    pub async fn insert_row(&self, txn_id: TxnId, key: Vec<Value>) -> Result<(), txn_lock::Error> {
+    pub async fn insert_row(&self, txn: &Txn, key: Vec<Value>) -> Result<(), txn_lock::Error>
+    where
+        Txn: crate::StorageContext,
+    {
+        let txn_id = txn.id();
         // Reserve a write lock for this exact key range at txn_id.
         // This is the canonical ordering gate which enforces conflict semantics across txns.
         let _permit = self
             .semaphore
             .try_write(txn_id, txn_lock::set::Range::One(Arc::new(key.clone())))?;
 
-        let pending = self.pending_delta_for_txn(txn_id).await?;
+        let pending = self.pending_delta_for_txn(txn).await?;
         pending.insert(key).await.map_err(background_error)?;
 
         Ok(())
     }
 
-    pub async fn delete_row(&self, txn_id: TxnId, key: Vec<Value>) -> Result<(), txn_lock::Error> {
+    pub async fn delete_row(&self, txn: &Txn, key: Vec<Value>) -> Result<(), txn_lock::Error>
+    where
+        Txn: crate::StorageContext,
+    {
+        let txn_id = txn.id();
         // Deletions take the same key-scoped write reservation as inserts.
         let _permit = self
             .semaphore
             .try_write(txn_id, txn_lock::set::Range::One(Arc::new(key.clone())))?;
 
-        let pending = self.pending_delta_for_txn(txn_id).await?;
+        let pending = self.pending_delta_for_txn(txn).await?;
         pending.delete(key).await.map_err(background_error)?;
 
         Ok(())
@@ -564,7 +668,7 @@ impl BTree {
         F: FnMut(Vec<Value>),
     {
         // Range scans use an All-range read reservation so the snapshot and stream composition
-        // are transactionally coherent with pending/commit/finalize transitions.
+        // remain coherent through commit and finalize transitions.
         let _permit = self
             .acquire_read_permit(txn_id, txn_lock::set::Range::All)
             .await;
@@ -623,7 +727,7 @@ impl BTree {
         F: FnMut(Vec<Value>) -> bool,
     {
         let snapshot = self.visible_snapshot(txn_id);
-        let collator = KeyStreamCollator { reverse };
+        let collator = KeyStreamCollator::new(reverse);
 
         let mut visible: BoxStream<'_, Result<Vec<Value>, std::io::Error>> = snapshot
             .persistent
@@ -746,12 +850,15 @@ impl BTree {
     }
 
     fn load_store(persistent_dir: DirLock<PersistentFile>, schema: BTreeSchema) -> PersistentStore {
-        PersistentStore::from_dir(persistent_dir, schema)
-            .expect("load persistent BTree store")
+        PersistentStore::from_dir(persistent_dir, schema).expect("load persistent BTree store")
     }
 
-    async fn pending_delta_for_txn(&self, txn_id: TxnId) -> Result<Delta, txn_lock::Error> {
-        let (txn_root, key_schema) = {
+    async fn pending_delta_for_txn(&self, txn: &Txn) -> Result<Delta, txn_lock::Error>
+    where
+        Txn: crate::StorageContext,
+    {
+        let txn_id = txn.id();
+        let key_schema = {
             let state = self.state.write().expect("state write lock");
             Self::assert_writable_state(&state, txn_id)?;
 
@@ -759,28 +866,17 @@ impl BTree {
                 return Ok(pending);
             }
 
-            (state.txn_root.clone(), state.persistent.key_schema())
+            state.persistent.key_schema()
         };
 
-        let txn_dir = {
-            let mut root = txn_root.write().await;
-            root.get_or_create_dir(txn_id.to_string())
-                .map_err(background_error)?
-        };
-
-        let pending_dir = {
-            let mut txn_dir = txn_dir.write().await;
-            txn_dir
-                .get_or_create_dir("pending".to_string())
-                .map_err(background_error)?
-        };
+        let txn_dir = self.dir.resolve(txn).await.map_err(background_error)?;
 
         let (inserts, deletes) = {
-            let mut pending_dir = pending_dir.write().await;
-            let inserts = pending_dir
+            let mut txn_dir = txn_dir.write().await;
+            let inserts = txn_dir
                 .get_or_create_dir("inserts".to_string())
                 .map_err(background_error)?;
-            let deletes = pending_dir
+            let deletes = txn_dir
                 .get_or_create_dir("deletes".to_string())
                 .map_err(background_error)?;
             (inserts, deletes)
@@ -788,9 +884,8 @@ impl BTree {
 
         let delta = Delta {
             inserts: PersistentStore::from_dir(inserts, key_schema.clone())
-            .map_err(background_error)?,
-            deletes: PersistentStore::from_dir(deletes, key_schema)
-            .map_err(background_error)?,
+                .map_err(background_error)?,
+            deletes: PersistentStore::from_dir(deletes, key_schema).map_err(background_error)?,
         };
 
         let mut state = self.state.write().expect("state write lock");
@@ -814,7 +909,7 @@ impl BTree {
     }
 }
 
-impl BTreeSlice {
+impl<Txn> BTreeSlice<Txn> {
     pub async fn count(&self, txn_id: TxnId) -> u64 {
         self.btree
             .count_in(txn_id, (self.lower.clone(), self.upper.clone()))
@@ -847,26 +942,24 @@ impl BTreeSlice {
     }
 }
 
-impl Transact for BTree {
-    type Commit = ();
-
-    async fn commit(&self, txn_id: TxnId) -> Self::Commit {
-        BTree::commit(self, txn_id).expect("BTree commit failed");
+impl<Txn> Transact for BTree<Txn> {
+    async fn commit(&self, txn_id: TxnId) -> tc_error::TCResult<()> {
+        BTree::commit(self, txn_id).map_err(Into::into)
     }
 
-    fn rollback(&self, txn_id: &TxnId) -> impl std::future::Future<Output = ()> + Send {
+    fn rollback(
+        &self,
+        txn_id: &TxnId,
+    ) -> impl std::future::Future<Output = tc_error::TCResult<()>> + Send {
         let txn_id = *txn_id;
-        async move {
-            BTree::rollback(self, txn_id).expect("BTree rollback failed");
-        }
+        async move { BTree::rollback(self, txn_id).map_err(Into::into) }
     }
 
-    fn finalize(&self, txn_id: &TxnId) -> impl std::future::Future<Output = ()> + Send {
+    fn finalize(
+        &self,
+        txn_id: &TxnId,
+    ) -> impl std::future::Future<Output = tc_error::TCResult<()>> + Send {
         let txn_id = *txn_id;
-        async move {
-            BTree::finalize(self, txn_id)
-                .await
-                .expect("BTree finalize failed");
-        }
+        async move { BTree::finalize(self, txn_id).await.map_err(Into::into) }
     }
 }

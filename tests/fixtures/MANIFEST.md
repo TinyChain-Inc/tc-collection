@@ -1,8 +1,8 @@
 # Table parity test fixtures
 
-Small, deterministic datasets reused by the `Table` port test matrix in
-[`TABLE_PARITY_PORT.md`](../../TABLE_PARITY_PORT.md) §7. Fixtures are CSV with a
-header row; the key column(s) are noted below. Values are intentionally tiny so
+Small, deterministic datasets reused by the Table parity matrix in
+[`TRANSACTIONAL_COLLECTION_CONTRACT.md`](../../TRANSACTIONAL_COLLECTION_CONTRACT.md).
+Fixtures are CSV with a header row; the key column(s) are noted below. Values are intentionally tiny so
 tests stay fast. Column names are generic and structural — they describe the
 table shape each fixture exercises, not any application domain.
 
@@ -30,4 +30,4 @@ table shape each fixture exercises, not any application domain.
 
 Implementation issues should load these via `include_str!` and parse with the
 crate's value codec, or read from the path at test time. No fixture here implies
-a schema or behavior beyond what `TABLE_PARITY_PORT.md` specifies.
+a schema or behavior beyond the transactional collection contract.
