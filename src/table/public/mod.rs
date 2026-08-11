@@ -18,7 +18,7 @@
 pub mod handler;
 pub mod selector;
 
-use crate::table::PersistentTable;
+use crate::table::Table;
 
 pub use handler::{
     ContainsHandler, CountHandler, LimitHandler, OrderHandler, SelectHandler, TableHandler,
@@ -26,12 +26,12 @@ pub use handler::{
 /// Owned routes for one persistent table.
 #[derive(Clone)]
 pub struct TableRoutes<State: crate::CollectionState> {
-    table: PersistentTable<State::Txn>,
+    table: Table<State::Txn>,
     state: std::marker::PhantomData<fn() -> State>,
 }
 
 impl<State: crate::CollectionState> TableRoutes<State> {
-    pub fn new(table: PersistentTable<State::Txn>) -> Self {
+    pub fn new(table: Table<State::Txn>) -> Self {
         Self {
             table,
             state: std::marker::PhantomData,
@@ -85,10 +85,10 @@ impl<State: crate::CollectionState> tc_ir::Route<State> for TableRoutes<State> {
 
 /// Resolve a persistent table route for the caller's universal state type.
 pub fn route<State: crate::CollectionState>(
-    table: &PersistentTable<State::Txn>,
+    table: &(impl Clone + Into<Table<State::Txn>>),
     path: &[pathlink::PathSegment],
 ) -> Option<TableRoute<State>> {
-    tc_ir::Route::route(&TableRoutes::new(table.clone()), path)
+    tc_ir::Route::route(&TableRoutes::new(table.clone().into()), path)
 }
 
 impl<State> tc_ir::Handler<State> for TableRoute<State>

@@ -52,6 +52,12 @@ local and lean, and push cross-host orchestration to client libraries.
   `TxnId`, create `<txn-id>/pending` trees, or choose literal allocation policy.
   The host derives named contexts from canonical collection URIs and unique contexts
   for transaction-local BTree/Table literals.
+- Storage lifetime does not imply transactional semantics. Named hosted Tables use
+  `PersistentTable<Txn>` and participate in commit/rollback/finalize. Decoded request
+  Tables and OpDef-local temporary Tables retain the raw `b_table` storage primitive
+  in a unique transaction subcontext and do not create deltas or implement a second
+  transaction lifecycle. Do not collapse these representations or wrap the raw table
+  merely to imitate `PersistentTable`.
 
 ## Documentation and validation
 

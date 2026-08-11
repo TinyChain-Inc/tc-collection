@@ -14,19 +14,15 @@ pub(crate) type ReadPermit = txn_lock::semaphore::PermitRead<txn_lock::set::Rang
 /// notified only after no further item can be polled.
 pub struct GuardedStream<T, Guard> {
     stream: BoxStream<'static, T>,
-    guard: Guard,
+    _guard: Guard,
 }
 
 impl<T, Guard> GuardedStream<T, Guard> {
     pub(crate) fn new(stream: BoxStream<'static, T>, guard: Guard) -> Self {
-        Self { stream, guard }
-    }
-
-    pub(crate) fn transform<U>(
-        self,
-        transform: impl FnOnce(BoxStream<'static, T>) -> BoxStream<'static, U>,
-    ) -> GuardedStream<U, Guard> {
-        GuardedStream::new(transform(self.stream), self.guard)
+        Self {
+            stream,
+            _guard: guard,
+        }
     }
 }
 

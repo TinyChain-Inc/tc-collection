@@ -15,7 +15,7 @@ use tc_error::{TCResult, bad_request, not_found};
 use tc_ir::Id;
 use tc_value::Value;
 
-use super::super::file::PersistentTable;
+use super::super::TableSchema;
 
 /// A table selector parsed from a request: all rows, a single key, or a range.
 ///
@@ -36,11 +36,8 @@ impl KeyOrRange {
     ///
     /// Matches v1 parse order: range check (all elements are column-bound
     /// pairs) comes before the key-arity check.
-    pub(crate) fn try_from_value<Txn>(
-        table: &PersistentTable<Txn>,
-        value: Value,
-    ) -> TCResult<Self> {
-        let columns = table.schema().primary().columns();
+    pub(crate) fn try_from_value(schema: &TableSchema, value: Value) -> TCResult<Self> {
+        let columns = schema.primary().columns();
 
         match value {
             Value::None => Ok(Self::All),
@@ -54,10 +51,10 @@ impl KeyOrRange {
                     _ => false,
                 }) =>
             {
-                let range = cast_into_range(table, Value::Tuple(tuple))?;
+                let range = cast_into_range(schema, Value::Tuple(tuple))?;
                 Ok(Self::Range(range))
             }
-            Value::Tuple(key) if key.len() == table.schema().key().len() => Ok(Self::Key(key)),
+            Value::Tuple(key) if key.len() == schema.key().len() => Ok(Self::Key(key)),
             other => Err(bad_request!("invalid table selector: {other:?}")),
         }
     }
@@ -69,17 +66,14 @@ impl KeyOrRange {
 /// `(column_name, bound)` pairs.  If a bound is itself a 2-tuple it is
 /// interpreted as `(lower, upper)` inclusive/excluded bounds; otherwise it
 /// is an equality match.
-pub(crate) fn cast_into_range<Txn>(
-    table: &PersistentTable<Txn>,
-    value: Value,
-) -> TCResult<Range<Id, Value>> {
+pub(crate) fn cast_into_range(schema: &TableSchema, value: Value) -> TCResult<Range<Id, Value>> {
     let tuple = match value {
         Value::Tuple(tuple) => tuple,
         Value::None => return Ok(Range::default()),
         other => return Err(bad_request!("invalid selection bounds: {other:?}")),
     };
 
-    let columns = table.schema().primary().columns();
+    let columns = schema.primary().columns();
     let mut ranges = HashMap::new();
 
     for entry in tuple {

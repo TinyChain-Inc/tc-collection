@@ -2,18 +2,18 @@
 
 use super::route;
 use super::selector::KeyOrRange;
-use crate::CollectionState;
 use crate::PersistentFile;
 use crate::btree::StorageConfig;
-use crate::table::{Column, PersistentTable, Table, TableSchema};
+use crate::table::{Column, LocalTable, PersistentTable, Table, TableSchema};
 use crate::test::run_async_test;
+use crate::{CollectionState, StorageContext};
 use freqfs::Cache;
 use safecast::TryCastInto;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use tc_ir::{Claim, Handler, Map, NetworkTime, Scalar, Transaction, TxnId};
-use tc_value::ValueType;
+use tc_ir::{Claim, Handler, Map, NetworkTime, Scalar, Transact, Transaction, TxnId};
+use tc_value::{ValueCollator, ValueType};
 use umask::Mode;
 
 fn segment(name: &str) -> pathlink::PathSegment {
@@ -319,6 +319,29 @@ async fn make_table_with_data() -> PersistentTable<MockTxn> {
     table
 }
 
+async fn make_local_table_with_data(txn: &MockTxn) -> Table<MockTxn> {
+    use tc_value::Value;
+
+    let dir = crate::StorageContext::subcontext_unique(txn)
+        .context()
+        .await
+        .expect("local table directory");
+    let table = LocalTable::create(simple_schema(), ValueCollator::default(), dir)
+        .expect("create local table");
+    {
+        let mut table = table.write().await;
+        table
+            .upsert(vec![Value::from(1_u64)], vec![Value::from("alpha")])
+            .await
+            .expect("upsert local row");
+        table
+            .upsert(vec![Value::from(2_u64)], vec![Value::from("beta")])
+            .await
+            .expect("upsert local row");
+    }
+    Table::Local(table)
+}
+
 // ── Route resolution ──────────────────────────────────────────
 
 #[test]
@@ -367,6 +390,88 @@ fn get_table_all() {
                 .await
                 .expect("response");
             assert!(matches!(resp, State::Collection(_)));
+        })
+    });
+}
+
+#[test]
+fn local_table_uses_native_routes_without_transaction_deltas() {
+    run_async_test(
+        "local_table_uses_native_routes_without_transaction_deltas",
+        || {
+            Box::pin(async {
+                use tc_value::Value;
+
+                let txn = MockTxn::new(21);
+                let table = make_local_table_with_data(&txn).await;
+                let collection = crate::Collection::from(table.clone());
+                collection
+                    .commit(txn.id())
+                    .await
+                    .expect("local commit is a no-op");
+                collection
+                    .rollback(&txn.id())
+                    .await
+                    .expect("local rollback is a no-op");
+                collection
+                    .finalize(&txn.id())
+                    .await
+                    .expect("local finalize is a no-op");
+
+                let count = route::<State>(&table, &[segment("count")]).expect("count route");
+                assert_eq!(
+                    count
+                        .get(&txn, Scalar::Value(Value::None))
+                        .await
+                        .expect("count local rows"),
+                    State::Count(2)
+                );
+
+                let root = route::<State>(&table, &[]).expect("root route");
+                root.put(
+                    &txn,
+                    Scalar::Value(Value::Tuple(vec![Value::from(3_u64)])),
+                    State::from_scalar(Scalar::Value(Value::from("gamma"))),
+                )
+                .await
+                .expect("upsert local row");
+
+                let row = root
+                    .get(&txn, Scalar::Value(Value::Tuple(vec![Value::from(3_u64)])))
+                    .await
+                    .expect("read local row");
+                assert_eq!(
+                    row,
+                    State::Value(Value::Tuple(vec![Value::from(3_u64), Value::from("gamma")]))
+                );
+            })
+        },
+    );
+}
+
+#[test]
+fn decoded_table_is_local_not_persistent() {
+    run_async_test("decoded_table_is_local_not_persistent", || {
+        Box::pin(async {
+            use safecast::CastFrom;
+            use tc_value::Value;
+
+            let schema = simple_schema();
+            let payload = (
+                Value::cast_from(schema),
+                vec![
+                    Value::Tuple(vec![Value::from(1_u64), Value::from("alpha")]),
+                    Value::Tuple(vec![Value::from(2_u64), Value::from("beta")]),
+                ],
+            );
+            let stream = destream_json::encode(payload).expect("encode Table payload");
+            let decoded: crate::table::DecodedTablePayload<MockTxn> =
+                destream_json::try_decode(MockTxn::new(22), stream)
+                    .await
+                    .expect("decode Table payload");
+
+            assert!(matches!(decoded.table, Table::Local(_)));
+            assert_eq!(decoded.table.count(tx(22)).await.expect("count rows"), 2);
         })
     });
 }
@@ -779,7 +884,7 @@ fn key_or_range_all() {
         Box::pin(async {
             use tc_value::Value;
             let table = make_table_with_data().await;
-            let kor = KeyOrRange::try_from_value(&table, Value::None).expect("parse None");
+            let kor = KeyOrRange::try_from_value(table.schema(), Value::None).expect("parse None");
             assert!(matches!(kor, KeyOrRange::All));
         })
     });
@@ -791,8 +896,9 @@ fn key_or_range_key() {
         Box::pin(async {
             use tc_value::Value;
             let table = make_table_with_data().await;
-            let kor = KeyOrRange::try_from_value(&table, Value::Tuple(vec![Value::from(1_u64)]))
-                .expect("parse key");
+            let kor =
+                KeyOrRange::try_from_value(table.schema(), Value::Tuple(vec![Value::from(1_u64)]))
+                    .expect("parse key");
             match kor {
                 KeyOrRange::Key(key) => assert_eq!(key, vec![Value::from(1_u64)]),
                 other => panic!("expected Key, got {other:?}"),
@@ -811,7 +917,7 @@ fn key_or_range_range() {
                 Value::from("id"),
                 Value::Tuple(vec![Value::from(1_u64), Value::from(2_u64)]),
             ])]);
-            let kor = KeyOrRange::try_from_value(&table, selector).expect("parse range");
+            let kor = KeyOrRange::try_from_value(table.schema(), selector).expect("parse range");
             assert!(matches!(kor, KeyOrRange::Range(_)));
         })
     });

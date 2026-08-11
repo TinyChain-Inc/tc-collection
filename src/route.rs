@@ -40,14 +40,14 @@ pub trait CollectionState:
 #[derive(Clone)]
 pub enum CollectionRoutes<S: CollectionState> {
     BTree(Box<BTreeRoutes<S>>),
-    Table(TableRoutes<S>),
+    Table(Box<TableRoutes<S>>),
     Tensor(TensorRoutes<S>),
 }
 
 /// A resolved native collection handler.
 pub enum CollectionRoute<S: CollectionState> {
     BTree(Box<BTreeRoute<S>>),
-    Table(TableRoute<S>),
+    Table(Box<TableRoute<S>>),
     Tensor(TensorRoute<S>),
 }
 
@@ -59,7 +59,9 @@ impl<S: CollectionState> tc_ir::Route<S> for CollectionRoutes<S> {
             Self::BTree(routes) => tc_ir::Route::route(routes.as_ref(), path)
                 .map(Box::new)
                 .map(CollectionRoute::BTree),
-            Self::Table(routes) => tc_ir::Route::route(routes, path).map(CollectionRoute::Table),
+            Self::Table(routes) => tc_ir::Route::route(routes.as_ref(), path)
+                .map(Box::new)
+                .map(CollectionRoute::Table),
             Self::Tensor(routes) => tc_ir::Route::route(routes, path).map(CollectionRoute::Tensor),
         }
     }
@@ -71,12 +73,9 @@ impl<Txn: crate::StorageContext> Collection<Txn> {
             Self::BTree(view) => Some(CollectionRoutes::BTree(Box::new(BTreeRoutes::new(
                 (**view).clone(),
             )))),
-            Self::Table(table) => match table.as_ref() {
-                crate::table::Table::File(table) => {
-                    Some(CollectionRoutes::Table(TableRoutes::new(table.clone())))
-                }
-                _ => None,
-            },
+            Self::Table(table) => Some(CollectionRoutes::Table(Box::new(TableRoutes::new(
+                (**table).clone(),
+            )))),
             Self::Tensor(tensor) => {
                 Some(CollectionRoutes::Tensor(TensorRoutes::new(tensor.clone())))
             }
@@ -101,14 +100,14 @@ impl<S: CollectionState> Handler<S> for CollectionRoute<S> {
     async fn get(&self, txn: &S::Txn, key: Scalar) -> TCResult<S> {
         match self {
             Self::BTree(route) => Handler::get(route.as_ref(), txn, key).await,
-            Self::Table(route) => Handler::get(route, txn, key).await,
+            Self::Table(route) => Handler::get(route.as_ref(), txn, key).await,
             Self::Tensor(route) => Handler::get(route, txn, key).await,
         }
     }
 
     async fn put(&self, txn: &S::Txn, key: Scalar, value: S) -> TCResult<()> {
         match self {
-            Self::Table(route) => Handler::put(route, txn, key, value).await,
+            Self::Table(route) => Handler::put(route.as_ref(), txn, key, value).await,
             Self::BTree(_) | Self::Tensor(_) => Err(TCError::method_not_allowed(
                 tc_ir::Method::Put,
                 "collection",
@@ -119,7 +118,7 @@ impl<S: CollectionState> Handler<S> for CollectionRoute<S> {
     async fn post(&self, txn: &S::Txn, params: Map<S>) -> TCResult<S> {
         match self {
             Self::BTree(route) => Handler::post(route.as_ref(), txn, params).await,
-            Self::Table(route) => Handler::post(route, txn, params).await,
+            Self::Table(route) => Handler::post(route.as_ref(), txn, params).await,
             Self::Tensor(route) => Handler::post(route, txn, params).await,
         }
     }
@@ -127,7 +126,7 @@ impl<S: CollectionState> Handler<S> for CollectionRoute<S> {
     async fn delete(&self, txn: &S::Txn, key: Scalar) -> TCResult<()> {
         match self {
             Self::BTree(route) => Handler::delete(route.as_ref(), txn, key).await,
-            Self::Table(route) => Handler::delete(route, txn, key).await,
+            Self::Table(route) => Handler::delete(route.as_ref(), txn, key).await,
             Self::Tensor(_) => Err(TCError::method_not_allowed(tc_ir::Method::Delete, "tensor")),
         }
     }

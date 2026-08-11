@@ -1,29 +1,29 @@
 use destream::de;
 use safecast::TryCastFrom;
-use tc_value::Value;
+use tc_value::{Value, ValueCollator};
 
-use super::{PersistentTable, TableSchema};
+use super::{LocalTable, Table, TableSchema};
 
 #[derive(Clone, Debug)]
 pub struct DecodedTablePayload<Txn> {
-    pub table: PersistentTable<Txn>,
+    pub table: Table<Txn>,
 }
 
-struct Rows<Txn>(std::marker::PhantomData<fn() -> Txn>);
+struct Rows;
 
-impl<Txn> de::FromStream for Rows<Txn> {
-    type Context = PersistentTable<Txn>;
+impl de::FromStream for Rows {
+    type Context = LocalTable;
 
     async fn from_stream<D: de::Decoder>(
         table: Self::Context,
         decoder: &mut D,
     ) -> Result<Self, D::Error> {
-        struct Visitor<Txn> {
-            table: PersistentTable<Txn>,
+        struct Visitor {
+            table: LocalTable,
         }
 
-        impl<Txn> de::Visitor for Visitor<Txn> {
-            type Value = Rows<Txn>;
+        impl de::Visitor for Visitor {
+            type Value = Rows;
 
             fn expecting() -> &'static str {
                 "a sequence of Table rows"
@@ -33,13 +33,26 @@ impl<Txn> de::FromStream for Rows<Txn> {
                 self,
                 mut seq: A,
             ) -> Result<Self::Value, A::Error> {
+                let schema = self.table.schema().clone();
+                let key_len = schema.key().len();
+                let mut table = self.table.write().await;
                 while let Some(row) = seq.next_element::<Value>(()).await? {
-                    self.table
-                        .load_literal_row(row)
+                    let Value::Tuple(row) = row else {
+                        return Err(de::Error::custom("table row must be a tuple"));
+                    };
+                    if row.len() != schema.column_count() {
+                        return Err(de::Error::custom(format!(
+                            "table row has {} columns but schema has {}",
+                            row.len(),
+                            schema.column_count()
+                        )));
+                    }
+                    table
+                        .upsert(row[..key_len].to_vec(), row[key_len..].to_vec())
                         .await
                         .map_err(de::Error::custom)?;
                 }
-                Ok(Rows(std::marker::PhantomData))
+                Ok(Rows)
             }
         }
 
@@ -80,16 +93,19 @@ impl<Txn: crate::StorageContext> de::FromStream for DecodedTablePayload<Txn> {
                 let schema = TableSchema::try_cast_from(schema, |schema| {
                     de::Error::custom(format!("invalid Table schema: {schema:?}"))
                 })?;
-                let table = PersistentTable::literal(self.dir, schema);
+                let table = LocalTable::create(schema, ValueCollator::default(), self.dir)
+                    .map_err(de::Error::custom)?;
 
-                seq.next_element::<Rows<Txn>>(table.clone())
+                seq.next_element::<Rows>(table.clone())
                     .await?
                     .ok_or_else(|| de::Error::custom("missing Table rows"))?;
                 if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
                     return Err(de::Error::custom("Table payload must be [schema, rows]"));
                 }
 
-                Ok(DecodedTablePayload { table })
+                Ok(DecodedTablePayload {
+                    table: Table::Local(table),
+                })
             }
         }
 

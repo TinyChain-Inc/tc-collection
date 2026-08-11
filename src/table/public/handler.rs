@@ -18,7 +18,7 @@ use tc_value::Value;
 
 use super::selector::{KeyOrRange, cast_into_range};
 use crate::CollectionState;
-use crate::table::{PersistentTable, Table};
+use crate::table::Table;
 
 // ─── SchemaHandler ─────────────────────────────────────────────────────
 
@@ -27,18 +27,18 @@ use crate::table::{PersistentTable, Table};
 /// Holds a function pointer that extracts the schema `Value` from the table.
 /// Ported from v1 `SchemaHandler<'a, T>`.
 pub struct SchemaHandler<Txn> {
-    table: PersistentTable<Txn>,
-    schema_fn: fn(&PersistentTable<Txn>) -> Value,
+    table: Table<Txn>,
+    schema_fn: fn(&Table<Txn>) -> Value,
 }
 
 impl<Txn> SchemaHandler<Txn> {
-    pub fn new(table: PersistentTable<Txn>, schema_fn: fn(&PersistentTable<Txn>) -> Value) -> Self {
+    pub fn new(table: Table<Txn>, schema_fn: fn(&Table<Txn>) -> Value) -> Self {
         Self { table, schema_fn }
     }
 }
 
 /// Return the primary column names as a `Value::Tuple` of strings.
-pub fn column_schema<Txn>(table: &PersistentTable<Txn>) -> Value {
+pub fn column_schema<Txn>(table: &Table<Txn>) -> Value {
     let columns = table
         .schema()
         .columns()
@@ -48,7 +48,7 @@ pub fn column_schema<Txn>(table: &PersistentTable<Txn>) -> Value {
 }
 
 /// Return the key column names as a `Value::Tuple` of strings.
-pub fn key_columns<Txn>(table: &PersistentTable<Txn>) -> Value {
+pub fn key_columns<Txn>(table: &Table<Txn>) -> Value {
     let key = table
         .schema()
         .key()
@@ -65,11 +65,11 @@ pub fn key_columns<Txn>(table: &PersistentTable<Txn>) -> Value {
 /// Ported from v1 `ContainsHandler<Txn, FE>`.
 #[derive(Clone)]
 pub struct ContainsHandler<Txn> {
-    table: PersistentTable<Txn>,
+    table: Table<Txn>,
 }
 
-impl<Txn> From<PersistentTable<Txn>> for ContainsHandler<Txn> {
-    fn from(table: PersistentTable<Txn>) -> Self {
+impl<Txn> From<Table<Txn>> for ContainsHandler<Txn> {
+    fn from(table: Table<Txn>) -> Self {
         Self { table }
     }
 }
@@ -81,11 +81,11 @@ impl<Txn> From<PersistentTable<Txn>> for ContainsHandler<Txn> {
 /// Ported from v1 `CountHandler<T>`.
 #[derive(Clone)]
 pub struct CountHandler<Txn> {
-    table: PersistentTable<Txn>,
+    table: Table<Txn>,
 }
 
-impl<Txn> From<PersistentTable<Txn>> for CountHandler<Txn> {
-    fn from(table: PersistentTable<Txn>) -> Self {
+impl<Txn> From<Table<Txn>> for CountHandler<Txn> {
+    fn from(table: Table<Txn>) -> Self {
         Self { table }
     }
 }
@@ -97,11 +97,11 @@ impl<Txn> From<PersistentTable<Txn>> for CountHandler<Txn> {
 /// Ported from v1 `LimitHandler<T>`.
 #[derive(Clone)]
 pub struct LimitHandler<Txn> {
-    table: PersistentTable<Txn>,
+    table: Table<Txn>,
 }
 
-impl<Txn> From<PersistentTable<Txn>> for LimitHandler<Txn> {
-    fn from(table: PersistentTable<Txn>) -> Self {
+impl<Txn> From<Table<Txn>> for LimitHandler<Txn> {
+    fn from(table: Table<Txn>) -> Self {
         Self { table }
     }
 }
@@ -113,11 +113,11 @@ impl<Txn> From<PersistentTable<Txn>> for LimitHandler<Txn> {
 /// Ported from v1 `OrderHandler<T>`.
 #[derive(Clone)]
 pub struct OrderHandler<Txn> {
-    table: PersistentTable<Txn>,
+    table: Table<Txn>,
 }
 
-impl<Txn> From<PersistentTable<Txn>> for OrderHandler<Txn> {
-    fn from(table: PersistentTable<Txn>) -> Self {
+impl<Txn> From<Table<Txn>> for OrderHandler<Txn> {
+    fn from(table: Table<Txn>) -> Self {
         Self { table }
     }
 }
@@ -129,11 +129,11 @@ impl<Txn> From<PersistentTable<Txn>> for OrderHandler<Txn> {
 /// Ported from v1 `SelectHandler<T>`.
 #[derive(Clone)]
 pub struct SelectHandler<Txn> {
-    table: PersistentTable<Txn>,
+    table: Table<Txn>,
 }
 
-impl<Txn> From<PersistentTable<Txn>> for SelectHandler<Txn> {
-    fn from(table: PersistentTable<Txn>) -> Self {
+impl<Txn> From<Table<Txn>> for SelectHandler<Txn> {
+    fn from(table: Table<Txn>) -> Self {
         Self { table }
     }
 }
@@ -145,11 +145,11 @@ impl<Txn> From<PersistentTable<Txn>> for SelectHandler<Txn> {
 /// Ported from v1 `TableHandler<Txn, FE>`.
 #[derive(Clone)]
 pub struct TableHandler<Txn> {
-    table: PersistentTable<Txn>,
+    table: Table<Txn>,
 }
 
-impl<Txn> From<PersistentTable<Txn>> for TableHandler<Txn> {
-    fn from(table: PersistentTable<Txn>) -> Self {
+impl<Txn> From<Table<Txn>> for TableHandler<Txn> {
+    fn from(table: Table<Txn>) -> Self {
         Self { table }
     }
 }
@@ -185,11 +185,11 @@ impl<Txn: crate::StorageContext> TableHandler<Txn> {
         let value: Value =
             request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
-            let kor = KeyOrRange::try_from_value(&table, value)?;
+            let kor = KeyOrRange::try_from_value(table.schema(), value)?;
             match kor {
-                KeyOrRange::All => Ok(State::from(Table::from(table))),
+                KeyOrRange::All => Ok(State::from(table)),
                 KeyOrRange::Range(range) => {
-                    let slice = table.slice(range, &[], false);
+                    let slice = table.slice(range, &[], false)?;
                     Ok(State::from(Table::from(slice)))
                 }
                 KeyOrRange::Key(key) => {
@@ -212,21 +212,15 @@ impl<Txn: crate::StorageContext> TableHandler<Txn> {
         let value_scalar = params.require("value")?;
 
         Ok(Box::pin(async move {
-            let kor = KeyOrRange::try_from_value(&table, key_value)?;
+            let kor = KeyOrRange::try_from_value(table.schema(), key_value)?;
             match kor {
                 KeyOrRange::All => {
                     let values = update_values(value_scalar)?;
-                    table
-                        .update(txn, Range::default(), values)
-                        .await
-                        .map_err(TCError::from)
+                    table.update(txn, Range::default(), values).await
                 }
                 KeyOrRange::Range(range) => {
                     let values = update_values(value_scalar)?;
-                    table
-                        .update(txn, range, values)
-                        .await
-                        .map_err(TCError::from)
+                    table.update(txn, range, values).await
                 }
                 KeyOrRange::Key(key) => {
                     let value: Value = value_scalar
@@ -236,10 +230,7 @@ impl<Txn: crate::StorageContext> TableHandler<Txn> {
                     } else {
                         vec![value]
                     };
-                    table
-                        .upsert_row(txn, key, values)
-                        .await
-                        .map_err(TCError::from)
+                    table.upsert_row(txn, key, values).await
                 }
             }
         }))
@@ -261,8 +252,8 @@ impl<Txn: crate::StorageContext> TableHandler<Txn> {
                 .collect::<TCResult<_>>()?,
         );
         Ok(Box::pin(async move {
-            let range = cast_into_range(&table, value)?;
-            let slice = table.slice(range, &[], false);
+            let range = cast_into_range(table.schema(), value)?;
+            let slice = table.slice(range, &[], false)?;
             Ok(State::from(Table::from(slice)))
         }))
     }
@@ -272,14 +263,11 @@ impl<Txn: crate::StorageContext> TableHandler<Txn> {
         let value: Value =
             request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
-            let kor = KeyOrRange::try_from_value(&table, value)?;
+            let kor = KeyOrRange::try_from_value(table.schema(), value)?;
             match kor {
-                KeyOrRange::All => table
-                    .truncate(txn, Range::default())
-                    .await
-                    .map_err(TCError::from),
-                KeyOrRange::Key(key) => table.delete_row(txn, key).await.map_err(TCError::from),
-                KeyOrRange::Range(range) => table.truncate(txn, range).await.map_err(TCError::from),
+                KeyOrRange::All => table.truncate(txn, Range::default()).await,
+                KeyOrRange::Key(key) => table.delete_row(txn, key).await,
+                KeyOrRange::Range(range) => table.truncate(txn, range).await,
             }
         }))
     }
@@ -296,12 +284,12 @@ impl<Txn: crate::StorageContext> ContainsHandler<Txn> {
         let value: Value =
             request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
-            let kor = KeyOrRange::try_from_value(&table, value)?;
+            let kor = KeyOrRange::try_from_value(table.schema(), value)?;
             let filled = match kor {
-                KeyOrRange::All => !table.is_empty(txn_id).await,
+                KeyOrRange::All => !table.is_empty(txn_id).await?,
                 KeyOrRange::Key(key) => table.contains_row(txn_id, &key).await,
                 KeyOrRange::Range(range) => {
-                    let slice = table.slice(range, &[], false);
+                    let slice = table.slice(range, &[], false)?;
                     !slice.is_empty(txn_id).await
                 }
             };
@@ -340,9 +328,9 @@ impl<Txn: crate::StorageContext> CountHandler<Txn> {
         let value: Value =
             request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
         Ok(Box::pin(async move {
-            let kor = KeyOrRange::try_from_value(&table, value)?;
+            let kor = KeyOrRange::try_from_value(table.schema(), value)?;
             let count: u64 = match kor {
-                KeyOrRange::All => table.count(txn_id).await,
+                KeyOrRange::All => table.count(txn_id).await?,
                 KeyOrRange::Key(key) => {
                     if table.contains_row(txn_id, &key).await {
                         1
@@ -351,7 +339,7 @@ impl<Txn: crate::StorageContext> CountHandler<Txn> {
                     }
                 }
                 KeyOrRange::Range(range) => {
-                    let slice = table.slice(range, &[], false);
+                    let slice = table.slice(range, &[], false)?;
                     slice.count(txn_id).await
                 }
             };
@@ -394,7 +382,7 @@ impl<Txn: crate::StorageContext> LimitHandler<Txn> {
                     ));
                 }
             };
-            let limited = table.limit(limit);
+            let limited = table.limit(limit)?;
             Ok(State::from(Table::from(limited)))
         }))
     }
@@ -433,7 +421,7 @@ impl<Txn: crate::StorageContext> OrderHandler<Txn> {
                     value.try_cast_into(|v| bad_request!("invalid column list: {v:?}"))?;
                 (columns, false)
             };
-            let slice = table.order_by(&columns, reverse);
+            let slice = table.order_by(&columns, reverse)?;
             Ok(State::from(Table::from(slice)))
         }))
     }
@@ -467,7 +455,7 @@ impl<Txn: crate::StorageContext> SelectHandler<Txn> {
         Ok(Box::pin(async move {
             let columns: Vec<Id> =
                 value.try_cast_into(|v| bad_request!("invalid column list: {v:?}"))?;
-            let selection = table.select(&columns);
+            let selection = table.select(&columns)?;
             Ok(State::from(Table::from(selection)))
         }))
     }

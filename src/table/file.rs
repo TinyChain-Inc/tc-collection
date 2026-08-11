@@ -326,12 +326,6 @@ impl<Txn> PersistentTable<Txn> {
         }
     }
 
-    pub fn literal(persistent_dir: DirLock<PersistentFile>, schema: TableSchema) -> Self {
-        let mut table = Self::new(persistent_dir.clone(), schema);
-        table.dir = CollectionDir::literal(persistent_dir);
-        table
-    }
-
     pub fn named(
         uri: &pathlink::Link,
         persistent_dir: DirLock<PersistentFile>,
@@ -361,36 +355,6 @@ impl<Txn> PersistentTable<Txn> {
 
     pub fn finalized(&self) -> Option<TxnId> {
         self.state.read().expect("state read lock").finalized
-    }
-
-    /// Load one decoded literal row into the table's canonical store.
-    pub async fn load_literal_row(&self, row: Value) -> std::io::Result<()> {
-        let Value::Tuple(row) = row else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "table literal row must be a tuple",
-            ));
-        };
-
-        let key_len = self.schema.key().len();
-        if row.len() != self.schema.column_count() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "table literal row has {} columns but schema has {}",
-                    row.len(),
-                    self.schema.column_count()
-                ),
-            ));
-        }
-
-        let key = row[..key_len].to_vec();
-        let values = row[key_len..].to_vec();
-        let persistent = {
-            let state = self.state.read().expect("state read lock");
-            state.persistent.clone()
-        };
-        persistent.upsert_row(key, values).await
     }
 
     /// Sync the canonical (persistent) state to disk.

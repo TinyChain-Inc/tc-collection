@@ -21,4 +21,5 @@ tokio = { version = "1.51", features = ["fs", "rt", "sync", "time", "macros", "r
 txn_lock = { path = "../deps/txn_lock" }
 
 [dev-dependencies]
+destream_json = { path = "../deps/destream_json", version = "0.15", default-features = false }
 umask = "2.1"

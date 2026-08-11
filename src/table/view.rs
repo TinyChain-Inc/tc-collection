@@ -10,9 +10,71 @@ use futures::TryStreamExt;
 use tc_ir::{Id, TxnId};
 use tc_value::Value;
 
+use super::LocalTable;
 use super::file::PersistentTable;
 use super::schema::TableSchema;
 use super::stream::Rows;
+
+enum TableSource<Txn> {
+    File(PersistentTable<Txn>),
+    Local(LocalTable),
+}
+
+impl<Txn> Clone for TableSource<Txn> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::File(table) => Self::File(table.clone()),
+            Self::Local(table) => Self::Local(table.clone()),
+        }
+    }
+}
+
+impl<Txn> TableSource<Txn> {
+    fn schema(&self) -> &TableSchema {
+        match self {
+            Self::File(table) => table.schema(),
+            Self::Local(table) => table.schema(),
+        }
+    }
+
+    async fn rows(
+        &self,
+        txn_id: TxnId,
+        range: Range<Id, Value>,
+        order: Vec<Id>,
+        reverse: bool,
+    ) -> tc_error::TCResult<Rows> {
+        match self {
+            Self::File(table) => table
+                .rows(txn_id, range, order, reverse)
+                .await
+                .map_err(tc_error::TCError::from),
+            Self::Local(table) => {
+                let rows = table
+                    .clone()
+                    .into_read()
+                    .await
+                    .rows(range, &order, reverse, None)
+                    .await?;
+                Ok(Rows::local(rows))
+            }
+        }
+    }
+
+    async fn count(&self, txn_id: TxnId, range: Range<Id, Value>) -> u64 {
+        match self {
+            Self::File(table) => table.count_in(txn_id, range).await,
+            Self::Local(table) => table.read().await.count(range).await.unwrap_or(0),
+        }
+    }
+
+    async fn is_empty(&self, txn_id: TxnId, range: Range<Id, Value>) -> bool {
+        match self {
+            Self::File(table) => table.is_empty_in(txn_id, range).await,
+            Self::Local(table) => table.read().await.is_empty(range).await.unwrap_or(true),
+        }
+    }
+}
 
 /// A range + order + reverse view over a [`PersistentTable`].
 ///
@@ -20,7 +82,7 @@ use super::stream::Rows;
 /// All operations delegate to the source table with the stored range, order,
 /// and direction applied. The view is structural — it holds no row data.
 pub struct TableSlice<Txn = ()> {
-    table: PersistentTable<Txn>,
+    table: TableSource<Txn>,
     range: Range<Id, Value>,
     order: Vec<Id>,
     reverse: bool,
@@ -48,8 +110,8 @@ impl<Txn> fmt::Debug for TableSlice<Txn> {
 }
 
 impl<Txn> TableSlice<Txn> {
-    pub(crate) fn new(
-        table: PersistentTable<Txn>,
+    fn from_source(
+        table: TableSource<Txn>,
         range: Range<Id, Value>,
         order: Vec<Id>,
         reverse: bool,
@@ -60,6 +122,24 @@ impl<Txn> TableSlice<Txn> {
             order,
             reverse,
         }
+    }
+
+    pub(crate) fn new(
+        table: PersistentTable<Txn>,
+        range: Range<Id, Value>,
+        order: Vec<Id>,
+        reverse: bool,
+    ) -> Self {
+        Self::from_source(TableSource::File(table), range, order, reverse)
+    }
+
+    pub(crate) fn local(
+        table: LocalTable,
+        range: Range<Id, Value>,
+        order: Vec<Id>,
+        reverse: bool,
+    ) -> Self {
+        Self::from_source(TableSource::Local(table), range, order, reverse)
     }
 
     pub fn schema(&self) -> &TableSchema {
@@ -81,7 +161,7 @@ impl<Txn> TableSlice<Txn> {
     /// Return a row stream over this slice's range, order, and direction.
     ///
     /// The stream holds a transactional read permit for its entire lifetime.
-    pub async fn rows(&self, txn_id: TxnId) -> Result<Rows, txn_lock::Error> {
+    pub async fn rows(&self, txn_id: TxnId) -> tc_error::TCResult<Rows> {
         self.table
             .rows(txn_id, self.range.clone(), self.order.clone(), self.reverse)
             .await
@@ -89,12 +169,12 @@ impl<Txn> TableSlice<Txn> {
 
     /// Count the visible rows in this slice at `txn_id`.
     pub async fn count(&self, txn_id: TxnId) -> u64 {
-        self.table.count_in(txn_id, self.range.clone()).await
+        self.table.count(txn_id, self.range.clone()).await
     }
 
     /// Return `true` if this slice has no visible rows at `txn_id`.
     pub async fn is_empty(&self, txn_id: TxnId) -> bool {
-        self.table.is_empty_in(txn_id, self.range.clone()).await
+        self.table.is_empty(txn_id, self.range.clone()).await
     }
 
     /// Iterate visible rows in this slice, calling `on_row` for each.
@@ -102,15 +182,13 @@ impl<Txn> TableSlice<Txn> {
     where
         F: FnMut(Row<Value>),
     {
-        self.table
-            .for_each_row_in_order(
-                txn_id,
-                self.range.clone(),
-                &self.order,
-                self.reverse,
-                on_row,
-            )
-            .await;
+        let Ok(mut rows) = self.rows(txn_id).await else {
+            return;
+        };
+        let mut on_row = on_row;
+        while let Some(row) = rows.try_next().await.expect("read table row") {
+            on_row(row);
+        }
     }
 
     /// Cap this slice to at most `n` rows.
@@ -139,7 +217,7 @@ impl<Txn> TableSlice<Txn> {
         for (name, bound) in sub_range.into_inner() {
             combined.insert(name, bound);
         }
-        TableSlice::new(
+        TableSlice::from_source(
             self.table.clone(),
             combined.into(),
             self.order.clone(),
@@ -176,7 +254,7 @@ impl<Txn> Limited<Txn> {
     }
 
     /// Return a row stream capped to at most `limit` rows.
-    pub async fn rows(&self, txn_id: TxnId) -> Result<Rows, txn_lock::Error> {
+    pub async fn rows(&self, txn_id: TxnId) -> tc_error::TCResult<Rows> {
         let rows = self.source.rows(txn_id).await?;
         Ok(rows.limit(self.limit))
     }
@@ -267,7 +345,7 @@ impl<Txn> Selection<Txn> {
     ///
     /// If this selection was composed from a [`Limited`] view, the row cap
     /// is applied as a lazy `take` before the column projection.
-    pub async fn rows(&self, txn_id: TxnId) -> Result<Rows, txn_lock::Error> {
+    pub async fn rows(&self, txn_id: TxnId) -> tc_error::TCResult<Rows> {
         let rows = self.source.rows(txn_id).await?;
         let rows = if let Some(limit) = self.limit {
             rows.limit(limit)

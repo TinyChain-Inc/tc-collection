@@ -229,6 +229,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "destream_json"
+version = "0.15.0"
+dependencies = [
+ "async-recursion",
+ "base64",
+ "bytes",
+ "destream",
+ "futures",
+ "pin-project",
+ "trait-variant",
+ "uuid",
+]
+
+[[package]]
 name = "displaydoc"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1104,6 +1118,7 @@ dependencies = [
  "b-tree",
  "collate",
  "destream",
+ "destream_json",
  "freqfs",
  "futures",
  "ha-ndarray",

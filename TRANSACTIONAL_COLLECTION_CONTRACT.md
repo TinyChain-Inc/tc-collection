@@ -24,6 +24,12 @@ Chain replay and server transaction/finalize invariants.
 
 Every transactional collection structure must implement the same lifecycle surface.
 
+This contract applies to named persistent collection state, not every collection
+value. A Table decoded from a request or created as an OpDef-local value is a raw
+non-transactional `b-table` value. Its files live in a unique transaction workspace
+child for bounded lifetime and automatic cleanup, but it does not create deltas or
+participate independently in commit, rollback, or finalize.
+
 1. Persistence contract
    - Optional local materialization snapshots are allowed for performance only.
    - Snapshots are non-authoritative and must always be rebuildable from Chain history.

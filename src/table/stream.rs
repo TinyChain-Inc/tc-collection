@@ -16,7 +16,7 @@ use tc_value::Value;
 
 use super::schema::TableSchema;
 
-type RowStream = BoxStream<'static, Result<Row<Value>, std::io::Error>>;
+pub(crate) type RowStream = BoxStream<'static, Result<Row<Value>, std::io::Error>>;
 
 /// A transactional read-permit-bound stream of table rows.
 ///
@@ -27,14 +27,22 @@ type RowStream = BoxStream<'static, Result<Row<Value>, std::io::Error>>;
 /// Fields are dropped in declaration order (`stream` before `_permit`), so the
 /// stream is released before the permit notifies blocked transactions.
 pub struct Rows {
-    inner:
-        crate::stream::GuardedStream<Result<Row<Value>, std::io::Error>, crate::stream::ReadPermit>,
+    stream: RowStream,
+    _permit: Option<crate::stream::ReadPermit>,
 }
 
 impl Rows {
     pub(crate) fn new(stream: RowStream, permit: crate::stream::ReadPermit) -> Self {
         Self {
-            inner: crate::stream::GuardedStream::new(stream, permit),
+            stream,
+            _permit: Some(permit),
+        }
+    }
+
+    pub(crate) fn local(stream: RowStream) -> Self {
+        Self {
+            stream,
+            _permit: None,
         }
     }
 
@@ -45,7 +53,8 @@ impl Rows {
     pub fn limit(self, n: u64) -> Self {
         let n = n.try_into().unwrap_or(usize::MAX);
         Self {
-            inner: self.inner.transform(|stream| stream.take(n).boxed()),
+            stream: self.stream.take(n).boxed(),
+            _permit: self._permit,
         }
     }
 
@@ -57,16 +66,16 @@ impl Rows {
     pub fn select(self, schema: &TableSchema, columns: &[Id]) -> Self {
         let indices = Self::column_indices(schema, columns);
         Self {
-            inner: self.inner.transform(|stream| {
-                stream
-                    .map_ok(move |row| {
-                        indices
-                            .iter()
-                            .filter_map(|&i| row.get(i).cloned())
-                            .collect::<Row<Value>>()
-                    })
-                    .boxed()
-            }),
+            stream: self
+                .stream
+                .map_ok(move |row| {
+                    indices
+                        .iter()
+                        .filter_map(|&i| row.get(i).cloned())
+                        .collect::<Row<Value>>()
+                })
+                .boxed(),
+            _permit: self._permit,
         }
     }
 
@@ -89,6 +98,6 @@ impl futures::Stream for Rows {
     type Item = Result<Row<Value>, std::io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(cx)
+        self.stream.as_mut().poll_next(cx)
     }
 }

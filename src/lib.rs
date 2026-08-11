@@ -109,6 +109,14 @@ mod architecture_tests {
             assert!(!source.contains(&obsolete_temp));
             assert!(!source.contains(&obsolete_static));
         }
+
+        let codec = include_str!("table/codec.rs");
+        assert!(codec.contains("Table::Local"));
+        assert!(!codec.contains("PersistentTable"));
+
+        let persistent = include_str!("table/file.rs");
+        assert!(!persistent.contains("pub fn literal"));
+        assert!(!persistent.contains("load_literal_row"));
     }
 
     #[test]
@@ -142,6 +150,6 @@ mod architecture_tests {
         }
 
         assert!(include_str!("btree/stream.rs").contains("GuardedStream"));
-        assert!(include_str!("table/stream.rs").contains("GuardedStream"));
+        assert!(include_str!("table/stream.rs").contains("ReadPermit"));
     }
 }
