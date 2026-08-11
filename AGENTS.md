@@ -19,15 +19,19 @@ local and lean, and push cross-host orchestration to client libraries.
 - Collection view modules acquire schemas, streams, guards, and allocation
   checks only. They must not implement or depend on `IntoStream`; collection
   codec modules own the recursive wire representation of those native views.
-- Keep BTree, Table, and Tensor route enums and domain operations in their
-  owning modules. The collection-level router may only aggregate those routes;
-  it must not become a parallel collection-semantics implementation.
+- Implement `Route` directly on BTree, Table, Tensor, and Collection values.
+  Resolve each path to its owning concrete handler behind the shared object-safe
+  handler boundary. Do not define route enums, associated handler types,
+  `*Routes` wrappers, phantom-state routers, or aggregate verb-dispatch matches;
+  Collection delegates each variant directly to that variant's route.
 - Collections shard data across blocks; hosts execute shard-local handlers. Do not add
   cross-host routing logic here—client runtimes own cluster-aware dispatch.
 - Preserve v1 collection semantics while keeping authentication and wire error
   envelopes at adapter boundaries.
 - Express handlers only in terms of the native `Handler<State>` contract; never
-  add adapter-specific or generalized request/response envelopes.
+  add adapter-specific or generalized request/response envelopes. Implement the
+  trait directly on leaf handlers and use its unsupported-verb defaults instead
+  of introducing boxed per-verb futures or duplicate method errors.
 - `CollectionState` is the narrow dependency-inversion bridge to a caller-owned
   universal state type, not a second conversion framework. Its implementation
   must delegate construction and extraction to the canonical `From` and

@@ -11,44 +11,33 @@ use crate::collection::BTreeView;
 use crate::route::CollectionState;
 
 type BTreeBounds = (Bound<Value>, Bound<Value>);
-#[derive(Clone)]
-pub struct BTreeRoutes<S: CollectionState> {
-    view: BTreeView<S::Txn>,
-    state: std::marker::PhantomData<fn() -> S>,
-}
-
-impl<S: CollectionState> BTreeRoutes<S> {
-    pub fn new(view: BTreeView<S::Txn>) -> Self {
-        Self {
-            view,
-            state: std::marker::PhantomData,
-        }
-    }
-}
-
-pub struct BTreeRoute<S: CollectionState> {
+pub struct BTreeHandler<S: CollectionState> {
     view: BTreeView<S::Txn>,
     path: Vec<PathSegment>,
     state: std::marker::PhantomData<fn() -> S>,
 }
 
-impl<S: CollectionState> tc_ir::Route<S> for BTreeRoutes<S> {
-    type Handler = BTreeRoute<S>;
-
-    fn route(&self, path: &[PathSegment]) -> Option<Self::Handler> {
+impl<S, Txn> tc_ir::Route<S> for BTreeView<Txn>
+where
+    S: CollectionState<Txn = Txn>,
+    Txn: crate::StorageContext,
+{
+    fn route(&self, path: &[PathSegment]) -> Option<Box<dyn tc_ir::Handler<S> + '_>> {
         let known = path.is_empty()
             || matches!(path, [segment] if matches!(segment.as_str(), "contains" | "count" | "is_empty" | "slice" | "insert" | "delete"));
-        known.then(|| BTreeRoute {
-            view: self.view.clone(),
-            path: path.to_vec(),
-            state: std::marker::PhantomData,
+        known.then(|| {
+            Box::new(BTreeHandler {
+                view: self.clone(),
+                path: path.to_vec(),
+                state: std::marker::PhantomData,
+            }) as Box<dyn tc_ir::Handler<S>>
         })
     }
 }
-impl<S: CollectionState> BTreeRoute<S> {
+impl<S: CollectionState> BTreeHandler<S> {
     async fn get(&self, txn: &S::Txn, request: Scalar) -> TCResult<S> {
         self.view
-            .get(&self.path, S::from_scalar(request), txn)
+            .get(&self.path, S::from(request), txn)
             .await?
             .ok_or_else(|| TCError::method_not_allowed(tc_ir::Method::Get, "BTree"))
     }
@@ -63,7 +52,7 @@ impl<S: CollectionState> BTreeRoute<S> {
     async fn delete(&self, txn: &S::Txn, request: Scalar) -> TCResult<()> {
         let _ = self
             .view
-            .delete(&self.path, S::from_scalar(request), txn)
+            .delete(&self.path, S::from(request), txn)
             .await?
             .ok_or_else(|| TCError::method_not_allowed(tc_ir::Method::Delete, "BTree"))?;
         Ok(())
@@ -81,14 +70,14 @@ impl<Txn: crate::StorageContext> BTreeView<Txn> {
             return Ok(None);
         }
         let state = match path[0].as_str() {
-            "contains" => S::from_value(Value::from(
+            "contains" => S::from(Value::from(
                 self.btree
                     .contains_row(txn.id(), &row_from_state(key, "BTree row")?)
                     .await,
             )),
             "count" => {
                 let view = self.slice_from_key(key)?;
-                S::from_value(Value::from(
+                S::from(Value::from(
                     view.btree
                         .slice(view.bounds.clone(), view.reverse)
                         .count(txn.id())
@@ -97,7 +86,7 @@ impl<Txn: crate::StorageContext> BTreeView<Txn> {
             }
             "is_empty" => {
                 let view = self.slice_from_key(key)?;
-                S::from_value(Value::from(
+                S::from(Value::from(
                     view.btree
                         .slice(view.bounds.clone(), view.reverse)
                         .is_empty(txn.id())
@@ -106,7 +95,7 @@ impl<Txn: crate::StorageContext> BTreeView<Txn> {
             }
             "slice" => {
                 let (bounds, reverse) = slice_bounds_from_state(key)?;
-                S::from_collection(Collection::BTree(Box::new(self.slice(bounds, reverse))))
+                S::from(Collection::BTree(Box::new(self.slice(bounds, reverse))))
             }
             _ => return Ok(None),
         };
@@ -136,7 +125,7 @@ impl<Txn: crate::StorageContext> BTreeView<Txn> {
             _ => return Ok(None),
         }
         .map_err(|err| TCError::bad_request(err.to_string()))?;
-        Ok(Some(S::none()))
+        Ok(Some(S::from(Value::None)))
     }
 
     async fn delete<S: CollectionState<Txn = Txn>>(
@@ -152,7 +141,7 @@ impl<Txn: crate::StorageContext> BTreeView<Txn> {
             .delete_row(txn, row_from_state(key, "BTree row")?)
             .await
             .map_err(|err| TCError::bad_request(err.to_string()))?;
-        Ok(Some(S::none()))
+        Ok(Some(S::from(Value::None)))
     }
 
     fn slice_from_key<S: CollectionState>(&self, key: S) -> TCResult<Self> {
@@ -207,16 +196,17 @@ fn bound_from_map<S: CollectionState>(
     }
 }
 
-impl<S: CollectionState> tc_ir::Handler<S> for BTreeRoute<S> {
+#[tc_ir::async_trait]
+impl<S: CollectionState> tc_ir::Handler<S> for BTreeHandler<S> {
     async fn get(&self, txn: &S::Txn, key: Scalar) -> TCResult<S> {
-        BTreeRoute::get(self, txn, key).await
+        BTreeHandler::get(self, txn, key).await
     }
 
     async fn post(&self, txn: &S::Txn, params: Map<S>) -> TCResult<S> {
-        BTreeRoute::post(self, txn, params).await
+        BTreeHandler::post(self, txn, params).await
     }
 
     async fn delete(&self, txn: &S::Txn, key: Scalar) -> TCResult<()> {
-        BTreeRoute::delete(self, txn, key).await
+        BTreeHandler::delete(self, txn, key).await
     }
 }

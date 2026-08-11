@@ -95,6 +95,14 @@ mod architecture_tests {
                 );
             }
         }
+
+        let table_handlers = include_str!("table/public/handler.rs");
+        for duplicate in ["GetFut", "PutFut", "method_not_allowed"] {
+            assert!(
+                !table_handlers.contains(duplicate),
+                "Table leaf handlers must delegate unsupported verbs to tc_ir::Handler"
+            );
+        }
     }
 
     #[test]
@@ -125,12 +133,46 @@ mod architecture_tests {
         assert!(!view.contains("destream"));
         assert!(!view.contains("IntoStream"));
 
+        let table_view = include_str!("table/view.rs");
+        for fail_open in [".unwrap_or(", "let Ok(", ".expect("] {
+            assert!(
+                !table_view.contains(fail_open),
+                "Table views must propagate storage and stream failures"
+            );
+        }
+
         let encode = include_str!("encode.rs");
         for forbidden in ["Handler", "Public", "Route<", ".route("] {
             assert!(
                 !encode.contains(forbidden),
                 "collection encoding must not depend on {forbidden}"
             );
+        }
+    }
+
+    #[test]
+    fn routes_delegate_without_handler_carrier_enums() {
+        let ir = include_str!("../../tc-ir/src/handler.rs");
+        assert!(!ir.contains("type Handler"));
+
+        for source in [
+            include_str!("route.rs"),
+            include_str!("btree/route.rs"),
+            include_str!("table/public/mod.rs"),
+            include_str!("tensor/route.rs"),
+        ] {
+            for forbidden in [
+                ["enum Collection", "Route"].concat(),
+                ["enum Table", "Route"].concat(),
+                ["enum BTree", "Route"].concat(),
+                ["enum Tensor", "Route"].concat(),
+                ["type Hand", "ler ="].concat(),
+            ] {
+                assert!(
+                    !source.contains(&forbidden),
+                    "native routes must not use {forbidden} carrier dispatch"
+                );
+            }
         }
     }
 

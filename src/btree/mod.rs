@@ -10,7 +10,7 @@ mod stream;
 pub use crate::PersistentFile;
 pub use codec::{BTreeColumnSchema, DecodedBTreePayload};
 pub use file::{BTree, BTreeSchema, BTreeSlice, StorageConfig};
-pub use route::{BTreeRoute, BTreeRoutes};
+pub use route::BTreeHandler;
 pub use stream::Keys;
 
 #[cfg(test)]

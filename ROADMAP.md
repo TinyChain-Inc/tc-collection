@@ -84,6 +84,28 @@
     - Tensor uses the same State operation and stream contracts as BTree and
       Table.
 
+8. **Collection fallibility debt removal.**
+   - Begin the project-wide fallibility audit with persistent Table storage in
+     `src/table/file.rs`. Its stream reads, permit acquisition, persistence
+     checks, store loading, and lock access currently contain pre-existing
+     `expect`-based failure paths; none may remain in production code.
+   - Make each owning storage/view operation return `TCResult` and propagate that
+     result recursively through Table, collection handlers, `State`, and native
+     execution. Adapters translate the error once; collection code must not log,
+     serialize, suppress, or replace it with an empty row set, zero count,
+     `false`, or another successful-looking value.
+   - Audit BTree and Tensor after Table using the same rule, then audit shared
+     collection visitors, streams, transaction lifecycle implementations, and
+     codecs. Prefer correcting a type signature or invariant representation over
+     adding a helper, wrapper, fallback, or duplicate infallible API.
+   - Add storage and stream fault-injection regressions, including read/write
+     failure, closed permits, corrupt persisted state, cancellation, and finalize
+     failure. Verify guards and permits are released while the original
+     structured error reaches the caller.
+   - Exit only when collection production code passes source guards and strict
+     fallibility lints with no compatibility allowlist, and the project-wide
+     audit records the collection layer as complete.
+
 
 ## Deferred explorations
 

@@ -397,6 +397,44 @@ impl<Txn> PersistentTable<Txn> {
         Ok(())
     }
 
+    pub async fn insert_row(
+        &self,
+        txn: &Txn,
+        key: Vec<Value>,
+        values: Vec<Value>,
+    ) -> tc_error::TCResult<()>
+    where
+        Txn: crate::StorageContext,
+    {
+        let txn_id = txn.id();
+        let key = b_table::Schema::validate_key(&self.schema, key)?;
+        let values = b_table::Schema::validate_values(&self.schema, values)?;
+
+        let _permit = self
+            .semaphore
+            .try_write(txn_id, txn_lock::set::Range::One(Arc::new(key.clone())))
+            .map_err(tc_error::TCError::from)?;
+
+        if self
+            .resolve_row(&self.visible_snapshot(txn_id), &key)
+            .await
+            .is_some()
+        {
+            return Err(tc_error::TCError::bad_request(format!(
+                "cannot insert Table row: key {key:?} already exists"
+            )));
+        }
+
+        self.pending_delta_for_txn(txn)
+            .await
+            .map_err(tc_error::TCError::from)?
+            .upsert(key, values)
+            .await
+            .map_err(tc_error::TCError::from)?;
+
+        Ok(())
+    }
+
     pub async fn delete_row(&self, txn: &Txn, key: Vec<Value>) -> Result<(), txn_lock::Error>
     where
         Txn: crate::StorageContext,
@@ -580,7 +618,7 @@ impl<Txn> PersistentTable<Txn> {
     }
 
     /// Create a column-projection view that yields only `columns`.
-    pub fn select(&self, columns: &[Id]) -> Selection<Txn> {
+    pub fn select(&self, columns: &[Id]) -> tc_error::TCResult<Selection<Txn>> {
         self.slice(Range::default(), &[], false)
             .select(columns.to_vec())
     }

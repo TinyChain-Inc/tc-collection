@@ -64,7 +64,7 @@ impl KeyOrRange {
 ///
 /// Ported from v1 `cast_into_range`.  The value is a tuple of
 /// `(column_name, bound)` pairs.  If a bound is itself a 2-tuple it is
-/// interpreted as `(lower, upper)` inclusive/excluded bounds; otherwise it
+/// interpreted as `(lower, upper)` tagged bounds; otherwise it
 /// is an equality match.
 pub(crate) fn cast_into_range(schema: &TableSchema, value: Value) -> TCResult<Range<Id, Value>> {
     let tuple = match value {
@@ -97,12 +97,10 @@ pub(crate) fn cast_into_range(schema: &TableSchema, value: Value) -> TCResult<Ra
             Value::Tuple(bounds) if bounds.len() == 2 => {
                 let lower: Bound<Value> = bounds[0]
                     .clone()
-                    .try_cast_into(|_| ())
-                    .unwrap_or(Bound::Unbounded);
+                    .try_cast_into(|bound| bad_request!("invalid lower bound: {bound:?}"))?;
                 let upper: Bound<Value> = bounds[1]
                     .clone()
-                    .try_cast_into(|_| ())
-                    .unwrap_or(Bound::Unbounded);
+                    .try_cast_into(|bound| bad_request!("invalid upper bound: {bound:?}"))?;
                 ColumnRange::In((lower, upper))
             }
             _ => ColumnRange::Eq(pair[1].clone()),

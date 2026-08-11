@@ -144,22 +144,36 @@ impl<Txn> Table<Txn> {
 
     pub(crate) fn select(&self, columns: &[Id]) -> TCResult<Selection<Txn>> {
         self.slice(Range::default(), &[], false)
-            .map(|slice| slice.select(columns.to_vec()))
+            .and_then(|slice| slice.select(columns.to_vec()))
     }
 
-    pub(crate) async fn read_row(&self, txn_id: TxnId, key: &[Value]) -> Option<Row<Value>> {
+    pub(crate) async fn read_row(
+        &self,
+        txn_id: TxnId,
+        key: &[Value],
+    ) -> TCResult<Option<Row<Value>>> {
         match self {
-            Self::File(table) => table.read_row(txn_id, key).await,
-            Self::Local(table) => table.read().await.get_row(key).await.ok().flatten(),
-            _ => None,
+            Self::File(table) => Ok(table.read_row(txn_id, key).await),
+            Self::Local(table) => table.read().await.get_row(key).await.map_err(TCError::from),
+            _ => Err(TCError::bad_request(
+                "cannot read a row from this Table view",
+            )),
         }
     }
 
-    pub(crate) async fn contains_row(&self, txn_id: TxnId, key: &[Value]) -> bool {
+    pub(crate) async fn contains_row(&self, txn_id: TxnId, key: &[Value]) -> TCResult<bool> {
         match self {
-            Self::File(table) => table.contains_row(txn_id, key).await,
-            Self::Local(table) => table.read().await.contains(key).await.unwrap_or(false),
-            _ => false,
+            Self::File(table) => Ok(table.contains_row(txn_id, key).await),
+            Self::Local(table) => table
+                .read()
+                .await
+                .get_row(key)
+                .await
+                .map(|row| row.is_some())
+                .map_err(TCError::from),
+            _ => Err(TCError::bad_request(
+                "cannot test membership of this Table view",
+            )),
         }
     }
 
@@ -172,9 +186,9 @@ impl<Txn> Table<Txn> {
                 .count(Range::default())
                 .await
                 .map_err(TCError::from),
-            Self::Slice(table) => Ok(table.count(txn_id).await),
-            Self::Limited(table) => Ok(table.count(txn_id).await),
-            Self::Selection(table) => Ok(table.count(txn_id).await),
+            Self::Slice(table) => table.count(txn_id).await,
+            Self::Limited(table) => table.count(txn_id).await,
+            Self::Selection(table) => table.count(txn_id).await,
         }
     }
 
@@ -187,9 +201,9 @@ impl<Txn> Table<Txn> {
                 .is_empty(Range::default())
                 .await
                 .map_err(TCError::from),
-            Self::Slice(table) => Ok(table.is_empty(txn_id).await),
-            Self::Limited(table) => Ok(table.is_empty(txn_id).await),
-            Self::Selection(table) => Ok(table.is_empty(txn_id).await),
+            Self::Slice(table) => table.is_empty(txn_id).await,
+            Self::Limited(table) => table.is_empty(txn_id).await,
+            Self::Selection(table) => table.is_empty(txn_id).await,
         }
     }
 
@@ -207,8 +221,36 @@ impl<Txn> Table<Txn> {
                 .upsert_row(txn, key, values)
                 .await
                 .map_err(TCError::from),
-            Self::Local(table) => table.write().await.upsert(key, values).await.map(|_| ()),
+            Self::Local(table) => {
+                let mut table = table.write().await;
+                table.delete_row(&key).await.map_err(TCError::from)?;
+                table.upsert(key, values).await.map(|_| ())
+            }
             _ => Err(TCError::bad_request("cannot mutate a Table view")),
+        }
+    }
+
+    pub(crate) async fn insert_row(
+        &self,
+        txn: &Txn,
+        key: Vec<Value>,
+        values: Vec<Value>,
+    ) -> TCResult<()>
+    where
+        Txn: crate::StorageContext,
+    {
+        match self {
+            Self::File(table) => table.insert_row(txn, key, values).await,
+            Self::Local(table) => {
+                let mut table = table.write().await;
+                if table.get_row(&key).await.map_err(TCError::from)?.is_some() {
+                    return Err(TCError::bad_request(format!(
+                        "cannot insert Table row: key {key:?} already exists"
+                    )));
+                }
+                table.upsert(key, values).await.map(|_| ())
+            }
+            _ => Err(TCError::bad_request("cannot insert into a Table view")),
         }
     }
 
@@ -225,7 +267,9 @@ impl<Txn> Table<Txn> {
                 .await
                 .map(|_| ())
                 .map_err(TCError::from),
-            _ => Err(TCError::bad_request("cannot mutate a Table view")),
+            _ => Err(TCError::bad_request(
+                "cannot delete a row from a Table view",
+            )),
         }
     }
 
@@ -235,14 +279,9 @@ impl<Txn> Table<Txn> {
     {
         match self {
             Self::File(table) => table.truncate(txn, range).await.map_err(TCError::from),
-            Self::Local(table) => table
-                .write()
-                .await
-                .delete_range(range)
-                .await
-                .map(|_| ())
-                .map_err(TCError::from),
-            _ => Err(TCError::bad_request("cannot mutate a Table view")),
+            Self::Local(table) => view::truncate_local(table, txn, range).await,
+            Self::Slice(table) => table.truncate(txn, range).await,
+            _ => Err(TCError::bad_request("cannot truncate this Table view")),
         }
     }
 
@@ -260,23 +299,9 @@ impl<Txn> Table<Txn> {
                 .update(txn, range, values)
                 .await
                 .map_err(TCError::from),
-            Self::Local(table) => {
-                let value_columns = self.schema().values();
-                for name in values.keys() {
-                    if !value_columns.contains(name) {
-                        return Err(TCError::bad_request(format!(
-                            "cannot update key column {name}"
-                        )));
-                    }
-                }
-
-                let _ = (table, range);
-                Err(TCError::method_not_allowed(
-                    tc_ir::Method::Put,
-                    "bulk update of a local Table",
-                ))
-            }
-            _ => Err(TCError::bad_request("cannot mutate a Table view")),
+            Self::Local(table) => view::update_local(table, txn, range, values).await,
+            Self::Slice(table) => table.update(txn, range, values).await,
+            _ => Err(TCError::bad_request("cannot update this Table view")),
         }
     }
 }
