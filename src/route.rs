@@ -1,13 +1,11 @@
 use pathlink::Link;
-use tc_error::{TCError, TCResult};
-use tc_ir::{Handler, Map, NativeClass, Scalar};
+use tc_error::TCResult;
+use tc_ir::{Map, NativeClass, Scalar};
 use tc_value::Value;
 
 use crate::Collection;
-use crate::btree::{BTreeRoute, BTreeRoutes};
 use crate::class::CollectionType;
-use crate::table::public::{TableRoute, TableRoutes};
-use crate::tensor::{Tensor, TensorRoute, TensorRoutes};
+use crate::tensor::Tensor;
 
 /// The minimal conversion boundary required by collection route handlers.
 ///
@@ -34,52 +32,21 @@ pub trait CollectionState:
     fn is_none(&self) -> bool;
 }
 
-/// Routes exposed by a collection value.
-#[derive(Clone)]
-pub enum CollectionRoutes<S: CollectionState> {
-    BTree(Box<BTreeRoutes<S>>),
-    Table(Box<TableRoutes<S>>),
-    Tensor(TensorRoutes<S>),
-}
-
-/// A resolved native collection handler.
-pub enum CollectionRoute<S: CollectionState> {
-    BTree(Box<BTreeRoute<S>>),
-    Table(Box<TableRoute<S>>),
-    Tensor(TensorRoute<S>),
-}
-
-impl<S: CollectionState> tc_ir::Route<S> for CollectionRoutes<S> {
-    type Handler = CollectionRoute<S>;
-
-    fn route(&self, path: &[pathlink::PathSegment]) -> Option<Self::Handler> {
+impl<S, Txn> tc_ir::Route<S> for Collection<Txn>
+where
+    S: CollectionState<Txn = Txn>,
+    Txn: crate::StorageContext,
+{
+    fn route(&self, path: &[pathlink::PathSegment]) -> Option<Box<dyn tc_ir::Handler<S> + '_>> {
         match self {
-            Self::BTree(routes) => tc_ir::Route::route(routes.as_ref(), path)
-                .map(Box::new)
-                .map(CollectionRoute::BTree),
-            Self::Table(routes) => tc_ir::Route::route(routes.as_ref(), path)
-                .map(Box::new)
-                .map(CollectionRoute::Table),
-            Self::Tensor(routes) => tc_ir::Route::route(routes, path).map(CollectionRoute::Tensor),
+            Self::BTree(view) => tc_ir::Route::route(view.as_ref(), path),
+            Self::Table(table) => tc_ir::Route::route(table.as_ref(), path),
+            Self::Tensor(tensor) => tc_ir::Route::route(tensor, path),
         }
     }
 }
 
 impl<Txn: crate::StorageContext> Collection<Txn> {
-    pub fn routes<S: CollectionState<Txn = Txn>>(&self) -> Option<CollectionRoutes<S>> {
-        match self {
-            Self::BTree(view) => Some(CollectionRoutes::BTree(Box::new(BTreeRoutes::new(
-                (**view).clone(),
-            )))),
-            Self::Table(table) => Some(CollectionRoutes::Table(Box::new(TableRoutes::new(
-                (**table).clone(),
-            )))),
-            Self::Tensor(tensor) => {
-                Some(CollectionRoutes::Tensor(TensorRoutes::new(tensor.clone())))
-            }
-        }
-    }
-
     pub fn from_put<S: CollectionState<Txn = Txn>>(
         link: &Link,
         key: S,
@@ -93,42 +60,6 @@ impl<Txn: crate::StorageContext> Collection<Txn> {
     }
 }
 
-impl<S: CollectionState> Handler<S> for CollectionRoute<S> {
-    async fn get(&self, txn: &S::Txn, key: Scalar) -> TCResult<S> {
-        match self {
-            Self::BTree(route) => Handler::get(route.as_ref(), txn, key).await,
-            Self::Table(route) => Handler::get(route.as_ref(), txn, key).await,
-            Self::Tensor(route) => Handler::get(route, txn, key).await,
-        }
-    }
-
-    async fn put(&self, txn: &S::Txn, key: Scalar, value: S) -> TCResult<()> {
-        match self {
-            Self::Table(route) => Handler::put(route.as_ref(), txn, key, value).await,
-            Self::BTree(_) | Self::Tensor(_) => Err(TCError::method_not_allowed(
-                tc_ir::Method::Put,
-                "collection",
-            )),
-        }
-    }
-
-    async fn post(&self, txn: &S::Txn, params: Map<S>) -> TCResult<S> {
-        match self {
-            Self::BTree(route) => Handler::post(route.as_ref(), txn, params).await,
-            Self::Table(route) => Handler::post(route.as_ref(), txn, params).await,
-            Self::Tensor(route) => Handler::post(route, txn, params).await,
-        }
-    }
-
-    async fn delete(&self, txn: &S::Txn, key: Scalar) -> TCResult<()> {
-        match self {
-            Self::BTree(route) => Handler::delete(route.as_ref(), txn, key).await,
-            Self::Table(route) => Handler::delete(route.as_ref(), txn, key).await,
-            Self::Tensor(_) => Err(TCError::method_not_allowed(tc_ir::Method::Delete, "tensor")),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -137,7 +68,8 @@ mod tests {
     use freqfs::Cache;
     use pathlink::{Link, PathSegment};
     use safecast::TryCastFrom;
-    use tc_ir::{Claim, NetworkTime, Route, Transaction, TxnId};
+    use tc_error::TCError;
+    use tc_ir::{Claim, NetworkTime, Transaction, TxnId};
     use tc_value::Value;
 
     use super::*;
@@ -317,7 +249,7 @@ mod tests {
         PathSegment::from_str(path).expect("path segment")
     }
 
-    fn btree_routes() -> BTreeRoutes<TestState> {
+    fn btree_view() -> BTreeView<TestTxn> {
         let root = std::env::temp_dir().join(format!("tc-collection-route-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("persistent")).expect("persistent root");
@@ -333,24 +265,23 @@ mod tests {
             .load(root.join("persistent"))
             .expect("persistent directory");
         let btree = crate::btree::BTree::<TestTxn>::new(persistent);
-        BTreeRoutes::new(BTreeView::new(
+        BTreeView::new(
             vec![BTreeColumnSchema {
                 name: "id".to_string(),
                 dtype: tc_value::ValueType::Number,
                 max_size: None,
             }],
             btree,
-        ))
+        )
     }
 
     #[tokio::test]
     async fn tensor_route_rejects_unknown_path_and_invalid_shape() {
-        let routes = TensorRoutes::<TestState>::new(
-            Tensor::dense_f64(vec![2], vec![1.0, 2.0]).expect("tensor"),
-        );
-        assert!(routes.route(&[segment("unknown")]).is_none());
+        let tensor = Tensor::dense_f64(vec![2], vec![1.0, 2.0]).expect("tensor");
+        assert!(tc_ir::Route::<TestState>::route(&tensor, &[segment("unknown")]).is_none());
 
-        let route = routes.route(&[segment("reshape")]).expect("reshape route");
+        let route = tc_ir::Route::<TestState>::route(&tensor, &[segment("reshape")])
+            .expect("reshape route");
         let err = route
             .get(
                 &TestTxn::new(),
@@ -363,11 +294,10 @@ mod tests {
 
     #[tokio::test]
     async fn btree_route_rejects_unknown_path_and_invalid_row() {
-        let routes = btree_routes();
-        assert!(routes.route(&[segment("unknown")]).is_none());
+        let view = btree_view();
+        assert!(tc_ir::Route::<TestState>::route(&view, &[segment("unknown")]).is_none());
 
-        let route = routes
-            .route(&[segment("contains")])
+        let route = tc_ir::Route::<TestState>::route(&view, &[segment("contains")])
             .expect("contains route");
         let err = route
             .get(

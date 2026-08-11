@@ -28,7 +28,7 @@ mod view;
 pub use view::CollectionView;
 
 pub mod route;
-pub use route::{CollectionRoutes, CollectionState};
+pub use route::CollectionState;
 
 #[cfg(test)]
 mod test {
@@ -147,6 +147,32 @@ mod architecture_tests {
                 !encode.contains(forbidden),
                 "collection encoding must not depend on {forbidden}"
             );
+        }
+    }
+
+    #[test]
+    fn routes_delegate_without_handler_carrier_enums() {
+        let ir = include_str!("../../tc-ir/src/handler.rs");
+        assert!(!ir.contains("type Handler"));
+
+        for source in [
+            include_str!("route.rs"),
+            include_str!("btree/route.rs"),
+            include_str!("table/public/mod.rs"),
+            include_str!("tensor/route.rs"),
+        ] {
+            for forbidden in [
+                ["enum Collection", "Route"].concat(),
+                ["enum Table", "Route"].concat(),
+                ["enum BTree", "Route"].concat(),
+                ["enum Tensor", "Route"].concat(),
+                ["type Hand", "ler ="].concat(),
+            ] {
+                assert!(
+                    !source.contains(&forbidden),
+                    "native routes must not use {forbidden} carrier dispatch"
+                );
+            }
         }
     }
 

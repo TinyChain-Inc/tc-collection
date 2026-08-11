@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tc_ir::{Claim, Handler, Map, NetworkTime, Scalar, Transact, Transaction, TxnId};
+use tc_ir::{Claim, Map, NetworkTime, Scalar, Transact, Transaction, TxnId};
 use tc_value::{Value, ValueCollator, ValueType};
 use umask::Mode;
 

@@ -183,6 +183,7 @@ fn value_from_state<State: CollectionState>(state: State, expected: &str) -> TCR
         .try_cast_into(|state| bad_request!("expected {expected}, not {state:?}"))
 }
 
+#[tc_ir::async_trait]
 impl<State, Txn> tc_ir::Handler<State> for TableHandler<Txn>
 where
     State: CollectionState<Txn = Txn>,
@@ -257,6 +258,7 @@ where
     }
 }
 
+#[tc_ir::async_trait]
 impl<State, Txn> tc_ir::Handler<State> for ContainsHandler<Txn>
 where
     State: CollectionState<Txn = Txn>,
@@ -279,6 +281,7 @@ where
     }
 }
 
+#[tc_ir::async_trait]
 impl<State, Txn> tc_ir::Handler<State> for CountHandler<Txn>
 where
     State: CollectionState<Txn = Txn>,
@@ -301,6 +304,7 @@ where
     }
 }
 
+#[tc_ir::async_trait]
 impl<State, Txn> tc_ir::Handler<State> for IsEmptyHandler<Txn>
 where
     State: CollectionState<Txn = Txn>,
@@ -320,6 +324,7 @@ where
     }
 }
 
+#[tc_ir::async_trait]
 impl<State, Txn> tc_ir::Handler<State> for InsertHandler<Txn>
 where
     State: CollectionState<Txn = Txn>,
@@ -338,6 +343,7 @@ where
     }
 }
 
+#[tc_ir::async_trait]
 impl<State, Txn> tc_ir::Handler<State> for LimitHandler<Txn>
 where
     State: CollectionState<Txn = Txn>,
@@ -358,6 +364,7 @@ where
     }
 }
 
+#[tc_ir::async_trait]
 impl<State, Txn> tc_ir::Handler<State> for OrderHandler<Txn>
 where
     State: CollectionState<Txn = Txn>,
@@ -377,6 +384,7 @@ where
     }
 }
 
+#[tc_ir::async_trait]
 impl<State, Txn> tc_ir::Handler<State> for SelectHandler<Txn>
 where
     State: CollectionState<Txn = Txn>,
@@ -392,6 +400,7 @@ where
     }
 }
 
+#[tc_ir::async_trait]
 impl<State, Txn> tc_ir::Handler<State> for SchemaHandler<Txn>
 where
     State: CollectionState<Txn = Txn>,

@@ -12,30 +12,13 @@ use crate::tensor::{
     broadcast_reduce_sum, tensor_op_result, tensor_transpose,
 };
 
-#[derive(Clone)]
-pub struct TensorRoutes<S> {
-    tensor: Tensor,
-    state: std::marker::PhantomData<fn() -> S>,
-}
-
-impl<S> TensorRoutes<S> {
-    pub fn new(tensor: Tensor) -> Self {
-        Self {
-            tensor,
-            state: std::marker::PhantomData,
-        }
-    }
-}
-
-pub struct TensorRoute<S> {
+pub struct TensorHandler<S> {
     tensor: Tensor,
     path: Vec<PathSegment>,
     state: std::marker::PhantomData<fn() -> S>,
 }
-impl<S: CollectionState> tc_ir::Route<S> for TensorRoutes<S> {
-    type Handler = TensorRoute<S>;
-
-    fn route(&self, path: &[PathSegment]) -> Option<Self::Handler> {
+impl<S: CollectionState> tc_ir::Route<S> for Tensor {
+    fn route(&self, path: &[PathSegment]) -> Option<Box<dyn tc_ir::Handler<S> + '_>> {
         let known = path.is_empty()
             || matches!(path, [segment] if matches!(segment.as_str(),
                 "broadcast" | "cast" | "expand_dims" | "reshape" | "transpose" |
@@ -43,14 +26,16 @@ impl<S: CollectionState> tc_ir::Route<S> for TensorRoutes<S> {
                 "max" | "min" | "mean" | "norm" | "product" | "std" | "sum" |
                 "broadcast_reduce" | "matmul" | "add" | "sub" | "mul" | "div" |
                 "and" | "or" | "xor" | "not"));
-        known.then(|| TensorRoute {
-            tensor: self.tensor.clone(),
-            path: path.to_vec(),
-            state: std::marker::PhantomData,
+        known.then(|| {
+            Box::new(TensorHandler {
+                tensor: self.clone(),
+                path: path.to_vec(),
+                state: std::marker::PhantomData,
+            }) as Box<dyn tc_ir::Handler<S>>
         })
     }
 }
-impl<S: CollectionState> TensorRoute<S> {
+impl<S: CollectionState> TensorHandler<S> {
     async fn get<T: Transaction + ?Sized>(&self, txn: &T, request: Scalar) -> TCResult<S> {
         let _ = txn;
         tensor_get(&self.tensor, &self.path, S::from(request))?
@@ -376,12 +361,13 @@ fn tensor_truthy_state<S: CollectionState>(tensor: &Tensor, all: bool) -> TCResu
     ))))
 }
 
-impl<S: CollectionState> tc_ir::Handler<S> for TensorRoute<S> {
+#[tc_ir::async_trait]
+impl<S: CollectionState> tc_ir::Handler<S> for TensorHandler<S> {
     async fn get(&self, txn: &S::Txn, key: Scalar) -> TCResult<S> {
-        TensorRoute::get(self, txn, key).await
+        TensorHandler::get(self, txn, key).await
     }
 
     async fn post(&self, txn: &S::Txn, params: Map<S>) -> TCResult<S> {
-        TensorRoute::post(self, txn, params).await
+        TensorHandler::post(self, txn, params).await
     }
 }
