@@ -1,18 +1,12 @@
 //! Public API route handlers for a transactional [`PersistentTable`].
 //!
-//! Ports the v1 `table/public.rs` routing logic.  Each route is a separate
-//! handler **struct** (not an enum variant) with a `From` impl, following
-//! the v1 pattern.  Handlers are generic over the response type `State`,
-//! which must support `From<Table>` and `From<Value>` (and `From<u64>` for
-//! `CountHandler`). Table handlers only produce their owned `Table` type.
-//!
 //! [`TableRoutes`] resolves a path to a [`TableRoute`], which implements the
 //! same native [`tc_ir::Handler`] contract as every other collection. Routing
 //! and execution remain table-owned and serialization-free.
 //!
 //! ## Module layout
 //!
-//! - [`handler`] — individual handler structs + verb trait impls
+//! - [`handler`] — individual route handlers
 //! - [`selector`] — `KeyOrRange` and `cast_into_range` selector parsing
 
 pub mod handler;
@@ -21,7 +15,8 @@ pub mod selector;
 use crate::table::Table;
 
 pub use handler::{
-    ContainsHandler, CountHandler, LimitHandler, OrderHandler, SelectHandler, TableHandler,
+    ContainsHandler, CountHandler, InsertHandler, IsEmptyHandler, LimitHandler, OrderHandler,
+    SelectHandler, TableHandler,
 };
 /// Owned routes for one persistent table.
 #[derive(Clone)]
@@ -45,7 +40,10 @@ pub enum TableRoute<State: crate::CollectionState> {
     Columns(handler::SchemaHandler<State::Txn>),
     Contains(ContainsHandler<State::Txn>),
     Count(CountHandler<State::Txn>),
+    Insert(InsertHandler<State::Txn>),
+    IsEmpty(IsEmptyHandler<State::Txn>),
     KeyColumns(handler::SchemaHandler<State::Txn>),
+    KeyNames(handler::SchemaHandler<State::Txn>),
     Limit(LimitHandler<State::Txn>),
     Order(OrderHandler<State::Txn>),
     Select(SelectHandler<State::Txn>),
@@ -66,9 +64,15 @@ impl<State: crate::CollectionState> tc_ir::Route<State> for TableRoutes<State> {
                 )),
                 "contains" => TableRoute::Contains(ContainsHandler::from(self.table.clone())),
                 "count" => TableRoute::Count(CountHandler::from(self.table.clone())),
+                "insert" => TableRoute::Insert(InsertHandler::from(self.table.clone())),
+                "is_empty" => TableRoute::IsEmpty(IsEmptyHandler::from(self.table.clone())),
                 "key_columns" => TableRoute::KeyColumns(handler::SchemaHandler::new(
                     self.table.clone(),
                     handler::key_columns,
+                )),
+                "key_names" => TableRoute::KeyNames(handler::SchemaHandler::new(
+                    self.table.clone(),
+                    handler::key_names,
                 )),
                 "limit" => TableRoute::Limit(LimitHandler::from(self.table.clone())),
                 "order" => TableRoute::Order(OrderHandler::from(self.table.clone())),
@@ -91,19 +95,35 @@ pub fn route<State: crate::CollectionState>(
     tc_ir::Route::route(&TableRoutes::new(table.clone().into()), path)
 }
 
+async fn dispatch_delete<State, H>(
+    handler: &H,
+    txn: &State::Txn,
+    request: tc_ir::Scalar,
+) -> tc_error::TCResult<()>
+where
+    State: crate::CollectionState,
+    H: tc_ir::Handler<State>,
+{
+    tc_ir::Handler::delete(handler, txn, request).await
+}
+
 impl<State> tc_ir::Handler<State> for TableRoute<State>
 where
     State: crate::CollectionState,
 {
     async fn get(&self, txn: &State::Txn, request: tc_ir::Scalar) -> tc_error::TCResult<State> {
         match self {
-            Self::Table(handler) => handler.get(txn, request)?.await,
-            Self::Columns(handler) | Self::KeyColumns(handler) => handler.get(txn, request)?.await,
-            Self::Contains(handler) => handler.get(txn, request)?.await,
-            Self::Count(handler) => handler.get(txn, request)?.await,
-            Self::Limit(handler) => handler.get(txn, request)?.await,
-            Self::Order(handler) => handler.get(txn, request)?.await,
-            Self::Select(handler) => handler.get(txn, request)?.await,
+            Self::Table(handler) => tc_ir::Handler::get(handler, txn, request).await,
+            Self::Columns(handler) | Self::KeyColumns(handler) | Self::KeyNames(handler) => {
+                tc_ir::Handler::get(handler, txn, request).await
+            }
+            Self::Contains(handler) => tc_ir::Handler::get(handler, txn, request).await,
+            Self::Count(handler) => tc_ir::Handler::get(handler, txn, request).await,
+            Self::Insert(handler) => tc_ir::Handler::get(handler, txn, request).await,
+            Self::IsEmpty(handler) => tc_ir::Handler::get(handler, txn, request).await,
+            Self::Limit(handler) => tc_ir::Handler::get(handler, txn, request).await,
+            Self::Order(handler) => tc_ir::Handler::get(handler, txn, request).await,
+            Self::Select(handler) => tc_ir::Handler::get(handler, txn, request).await,
             Self::State(_) => unreachable!("route state marker is never constructed"),
         }
     }
@@ -114,23 +134,18 @@ where
         key: tc_ir::Scalar,
         value: State,
     ) -> tc_error::TCResult<()> {
-        let request = [
-            ("key".parse().expect("static key id"), key),
-            (
-                "value".parse().expect("static value id"),
-                value.into_scalar()?,
-            ),
-        ]
-        .into_iter()
-        .collect();
         match self {
-            Self::Table(handler) => handler.put(txn, request)?.await,
-            Self::Columns(handler) | Self::KeyColumns(handler) => handler.put(txn, request)?.await,
-            Self::Contains(handler) => handler.put(txn, request)?.await,
-            Self::Count(handler) => handler.put(txn, request)?.await,
-            Self::Limit(handler) => handler.put(txn, request)?.await,
-            Self::Order(handler) => handler.put(txn, request)?.await,
-            Self::Select(handler) => handler.put(txn, request)?.await,
+            Self::Table(handler) => tc_ir::Handler::put(handler, txn, key, value).await,
+            Self::Columns(handler) | Self::KeyColumns(handler) | Self::KeyNames(handler) => {
+                tc_ir::Handler::put(handler, txn, key, value).await
+            }
+            Self::Contains(handler) => tc_ir::Handler::put(handler, txn, key, value).await,
+            Self::Count(handler) => tc_ir::Handler::put(handler, txn, key, value).await,
+            Self::Insert(handler) => tc_ir::Handler::put(handler, txn, key, value).await,
+            Self::IsEmpty(handler) => tc_ir::Handler::put(handler, txn, key, value).await,
+            Self::Limit(handler) => tc_ir::Handler::put(handler, txn, key, value).await,
+            Self::Order(handler) => tc_ir::Handler::put(handler, txn, key, value).await,
+            Self::Select(handler) => tc_ir::Handler::put(handler, txn, key, value).await,
             Self::State(_) => unreachable!("route state marker is never constructed"),
         }
     }
@@ -140,33 +155,35 @@ where
         txn: &State::Txn,
         request: tc_ir::Map<State>,
     ) -> tc_error::TCResult<State> {
-        let request = request
-            .into_iter()
-            .map(|(id, value)| value.into_scalar().map(|value| (id, value)))
-            .collect::<tc_error::TCResult<tc_ir::Map<_>>>()?;
         match self {
-            Self::Table(handler) => handler.post(txn, request)?.await,
-            Self::Columns(handler) | Self::KeyColumns(handler) => handler.post(txn, request)?.await,
-            Self::Contains(handler) => handler.post(txn, request)?.await,
-            Self::Count(handler) => handler.post(txn, request)?.await,
-            Self::Limit(handler) => handler.post(txn, request)?.await,
-            Self::Order(handler) => handler.post(txn, request)?.await,
-            Self::Select(handler) => handler.post(txn, request)?.await,
+            Self::Table(handler) => tc_ir::Handler::post(handler, txn, request).await,
+            Self::Columns(handler) | Self::KeyColumns(handler) | Self::KeyNames(handler) => {
+                tc_ir::Handler::post(handler, txn, request).await
+            }
+            Self::Contains(handler) => tc_ir::Handler::post(handler, txn, request).await,
+            Self::Count(handler) => tc_ir::Handler::post(handler, txn, request).await,
+            Self::Insert(handler) => tc_ir::Handler::post(handler, txn, request).await,
+            Self::IsEmpty(handler) => tc_ir::Handler::post(handler, txn, request).await,
+            Self::Limit(handler) => tc_ir::Handler::post(handler, txn, request).await,
+            Self::Order(handler) => tc_ir::Handler::post(handler, txn, request).await,
+            Self::Select(handler) => tc_ir::Handler::post(handler, txn, request).await,
             Self::State(_) => unreachable!("route state marker is never constructed"),
         }
     }
 
     async fn delete(&self, txn: &State::Txn, request: tc_ir::Scalar) -> tc_error::TCResult<()> {
         match self {
-            Self::Table(handler) => handler.delete(txn, request)?.await,
-            Self::Columns(handler) | Self::KeyColumns(handler) => {
-                handler.delete(txn, request)?.await
+            Self::Table(handler) => dispatch_delete::<State, _>(handler, txn, request).await,
+            Self::Columns(handler) | Self::KeyColumns(handler) | Self::KeyNames(handler) => {
+                dispatch_delete::<State, _>(handler, txn, request).await
             }
-            Self::Contains(handler) => handler.delete(txn, request)?.await,
-            Self::Count(handler) => handler.delete(txn, request)?.await,
-            Self::Limit(handler) => handler.delete(txn, request)?.await,
-            Self::Order(handler) => handler.delete(txn, request)?.await,
-            Self::Select(handler) => handler.delete(txn, request)?.await,
+            Self::Contains(handler) => dispatch_delete::<State, _>(handler, txn, request).await,
+            Self::Count(handler) => dispatch_delete::<State, _>(handler, txn, request).await,
+            Self::Insert(handler) => dispatch_delete::<State, _>(handler, txn, request).await,
+            Self::IsEmpty(handler) => dispatch_delete::<State, _>(handler, txn, request).await,
+            Self::Limit(handler) => dispatch_delete::<State, _>(handler, txn, request).await,
+            Self::Order(handler) => dispatch_delete::<State, _>(handler, txn, request).await,
+            Self::Select(handler) => dispatch_delete::<State, _>(handler, txn, request).await,
             Self::State(_) => unreachable!("route state marker is never constructed"),
         }
     }

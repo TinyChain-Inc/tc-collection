@@ -28,7 +28,7 @@ mod view;
 pub use view::CollectionView;
 
 pub mod route;
-pub use route::CollectionState;
+pub use route::{CollectionRoutes, CollectionState};
 
 #[cfg(test)]
 mod test {
@@ -95,6 +95,14 @@ mod architecture_tests {
                 );
             }
         }
+
+        let table_handlers = include_str!("table/public/handler.rs");
+        for duplicate in ["GetFut", "PutFut", "method_not_allowed"] {
+            assert!(
+                !table_handlers.contains(duplicate),
+                "Table leaf handlers must delegate unsupported verbs to tc_ir::Handler"
+            );
+        }
     }
 
     #[test]
@@ -124,6 +132,14 @@ mod architecture_tests {
         let view = include_str!("view.rs");
         assert!(!view.contains("destream"));
         assert!(!view.contains("IntoStream"));
+
+        let table_view = include_str!("table/view.rs");
+        for fail_open in [".unwrap_or(", "let Ok(", ".expect("] {
+            assert!(
+                !table_view.contains(fail_open),
+                "Table views must propagate storage and stream failures"
+            );
+        }
 
         let encode = include_str!("encode.rs");
         for forbidden in ["Handler", "Public", "Route<", ".route("] {

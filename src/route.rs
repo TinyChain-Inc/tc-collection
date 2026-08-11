@@ -5,7 +5,7 @@ use tc_value::Value;
 
 use crate::Collection;
 use crate::btree::{BTreeRoute, BTreeRoutes};
-use crate::class::TensorType;
+use crate::class::CollectionType;
 use crate::table::public::{TableRoute, TableRoutes};
 use crate::tensor::{Tensor, TensorRoute, TensorRoutes};
 
@@ -18,16 +18,14 @@ pub trait CollectionState:
     + Clone
     + Send
     + 'static
+    + From<Scalar>
+    + From<Collection<Self::Txn>>
     + From<crate::table::Table<Self::Txn>>
     + From<Value>
     + From<u64>
 {
     type Txn: crate::StorageContext;
 
-    fn none() -> Self;
-    fn from_scalar(scalar: Scalar) -> Self;
-    fn from_value(value: Value) -> Self;
-    fn from_collection(collection: Collection<Self::Txn>) -> Self;
     fn into_scalar(self) -> TCResult<Scalar>;
     fn into_value(self) -> TCResult<Value>;
     fn into_tuple(self) -> TCResult<Vec<Self>>;
@@ -82,17 +80,16 @@ impl<Txn: crate::StorageContext> Collection<Txn> {
         }
     }
 
-    pub fn tensor_literal<S: CollectionState<Txn = Txn>>(
+    pub fn from_put<S: CollectionState<Txn = Txn>>(
         link: &Link,
         key: S,
         value: S,
     ) -> TCResult<Option<S>> {
-        if link.path() != &TensorType.path() {
-            return Ok(None);
+        match CollectionType::from_path(link.path()) {
+            Some(CollectionType::Tensor(_)) => crate::tensor::route::tensor_literal(key, value)
+                .map(|tensor| Some(S::from(Self::Tensor(tensor)))),
+            Some(CollectionType::BTree(_) | CollectionType::Table(_)) | None => Ok(None),
         }
-
-        crate::tensor::route::tensor_literal(key, value)
-            .map(|tensor| Some(S::from_collection(Self::Tensor(tensor))))
     }
 }
 
@@ -168,6 +165,18 @@ mod tests {
         }
     }
 
+    impl From<Scalar> for TestState {
+        fn from(scalar: Scalar) -> Self {
+            Self::Value(Value::try_cast_from(scalar, |_| "value").expect("test scalar"))
+        }
+    }
+
+    impl From<Collection<TestTxn>> for TestState {
+        fn from(collection: Collection<TestTxn>) -> Self {
+            Self::Collection(collection)
+        }
+    }
+
     impl From<u64> for TestState {
         fn from(value: u64) -> Self {
             Self::Value(Value::from(value))
@@ -181,18 +190,6 @@ mod tests {
     impl CollectionState for TestState {
         type Txn = TestTxn;
 
-        fn none() -> Self {
-            Self::Value(Value::None)
-        }
-        fn from_scalar(scalar: Scalar) -> Self {
-            Self::Value(Value::try_cast_from(scalar, |_| "value").expect("test scalar"))
-        }
-        fn from_value(value: Value) -> Self {
-            Self::Value(value)
-        }
-        fn from_collection(collection: Collection<TestTxn>) -> Self {
-            Self::Collection(collection)
-        }
         fn into_scalar(self) -> TCResult<Scalar> {
             self.into_value().map(Scalar::Value)
         }

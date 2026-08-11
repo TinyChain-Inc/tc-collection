@@ -7,8 +7,8 @@ use std::fmt;
 
 use b_table::{Range, Row};
 use futures::TryStreamExt;
-use tc_ir::{Id, TxnId};
-use tc_value::Value;
+use tc_ir::{Id, Map, TxnId};
+use tc_value::{Value, ValueCollator};
 
 use super::LocalTable;
 use super::file::PersistentTable;
@@ -61,17 +61,27 @@ impl<Txn> TableSource<Txn> {
         }
     }
 
-    async fn count(&self, txn_id: TxnId, range: Range<Id, Value>) -> u64 {
+    async fn count(&self, txn_id: TxnId, range: Range<Id, Value>) -> tc_error::TCResult<u64> {
         match self {
-            Self::File(table) => table.count_in(txn_id, range).await,
-            Self::Local(table) => table.read().await.count(range).await.unwrap_or(0),
+            Self::File(table) => Ok(table.count_in(txn_id, range).await),
+            Self::Local(table) => table
+                .read()
+                .await
+                .count(range)
+                .await
+                .map_err(tc_error::TCError::from),
         }
     }
 
-    async fn is_empty(&self, txn_id: TxnId, range: Range<Id, Value>) -> bool {
+    async fn is_empty(&self, txn_id: TxnId, range: Range<Id, Value>) -> tc_error::TCResult<bool> {
         match self {
-            Self::File(table) => table.is_empty_in(txn_id, range).await,
-            Self::Local(table) => table.read().await.is_empty(range).await.unwrap_or(true),
+            Self::File(table) => Ok(table.is_empty_in(txn_id, range).await),
+            Self::Local(table) => table
+                .read()
+                .await
+                .is_empty(range)
+                .await
+                .map_err(tc_error::TCError::from),
         }
     }
 }
@@ -168,27 +178,26 @@ impl<Txn> TableSlice<Txn> {
     }
 
     /// Count the visible rows in this slice at `txn_id`.
-    pub async fn count(&self, txn_id: TxnId) -> u64 {
+    pub async fn count(&self, txn_id: TxnId) -> tc_error::TCResult<u64> {
         self.table.count(txn_id, self.range.clone()).await
     }
 
     /// Return `true` if this slice has no visible rows at `txn_id`.
-    pub async fn is_empty(&self, txn_id: TxnId) -> bool {
+    pub async fn is_empty(&self, txn_id: TxnId) -> tc_error::TCResult<bool> {
         self.table.is_empty(txn_id, self.range.clone()).await
     }
 
     /// Iterate visible rows in this slice, calling `on_row` for each.
-    pub async fn for_each_row_in_order<F>(&self, txn_id: TxnId, on_row: F)
+    pub async fn for_each_row_in_order<F>(&self, txn_id: TxnId, on_row: F) -> tc_error::TCResult<()>
     where
         F: FnMut(Row<Value>),
     {
-        let Ok(mut rows) = self.rows(txn_id).await else {
-            return;
-        };
+        let mut rows = self.rows(txn_id).await?;
         let mut on_row = on_row;
-        while let Some(row) = rows.try_next().await.expect("read table row") {
+        while let Some(row) = rows.try_next().await.map_err(tc_error::TCError::from)? {
             on_row(row);
         }
+        Ok(())
     }
 
     /// Cap this slice to at most `n` rows.
@@ -200,12 +209,14 @@ impl<Txn> TableSlice<Txn> {
     }
 
     /// Project only the given `columns` from each row in this slice.
-    pub fn select(&self, columns: Vec<Id>) -> Selection<Txn> {
-        Selection {
+    pub fn select(&self, columns: Vec<Id>) -> tc_error::TCResult<Selection<Txn>> {
+        let (schema, columns) = self.schema().project(&columns)?;
+        Ok(Selection {
             source: self.clone(),
+            schema,
             columns,
             limit: None,
-        }
+        })
     }
 
     /// Further narrow this slice to a sub-range.
@@ -224,6 +235,133 @@ impl<Txn> TableSlice<Txn> {
             self.reverse,
         )
     }
+
+    pub(crate) async fn update(
+        &self,
+        txn: &Txn,
+        range: Range<Id, Value>,
+        values: Map<Value>,
+    ) -> tc_error::TCResult<()>
+    where
+        Txn: crate::StorageContext,
+    {
+        let Some(range) = self.range.intersection(range, &ValueCollator::default()) else {
+            return Ok(());
+        };
+        match &self.table {
+            TableSource::File(table) => table
+                .update(txn, range, values)
+                .await
+                .map_err(tc_error::TCError::from),
+            TableSource::Local(table) => update_local(table, txn, range, values).await,
+        }
+    }
+
+    pub(crate) async fn truncate(
+        &self,
+        txn: &Txn,
+        range: Range<Id, Value>,
+    ) -> tc_error::TCResult<()>
+    where
+        Txn: crate::StorageContext,
+    {
+        let Some(range) = self.range.intersection(range, &ValueCollator::default()) else {
+            return Ok(());
+        };
+        match &self.table {
+            TableSource::File(table) => table
+                .truncate(txn, range)
+                .await
+                .map_err(tc_error::TCError::from),
+            TableSource::Local(table) => truncate_local(table, txn, range).await,
+        }
+    }
+}
+
+pub(crate) async fn update_local<Txn: crate::StorageContext>(
+    table: &LocalTable,
+    txn: &Txn,
+    range: Range<Id, Value>,
+    values: Map<Value>,
+) -> tc_error::TCResult<()> {
+    let schema = table.schema().clone();
+    for name in values.keys() {
+        if !schema.values().contains(name) {
+            return Err(tc_error::TCError::bad_request(format!(
+                "cannot update key column {name}"
+            )));
+        }
+    }
+
+    rewrite_local(table, txn, range, Some(values)).await
+}
+
+pub(crate) async fn truncate_local<Txn: crate::StorageContext>(
+    table: &LocalTable,
+    txn: &Txn,
+    range: Range<Id, Value>,
+) -> tc_error::TCResult<()> {
+    rewrite_local(table, txn, range, None).await
+}
+
+async fn rewrite_local<Txn: crate::StorageContext>(
+    table: &LocalTable,
+    txn: &Txn,
+    range: Range<Id, Value>,
+    updates: Option<Map<Value>>,
+) -> tc_error::TCResult<()> {
+    let schema = table.schema().clone();
+    let temp_txn = txn.subcontext_unique();
+    let temp = LocalTable::create(
+        schema.clone(),
+        ValueCollator::default(),
+        temp_txn.context().await?,
+    )
+    .map_err(tc_error::TCError::from)?;
+    let key_len = schema.key().len();
+
+    let mut rows = table
+        .clone()
+        .into_read()
+        .await
+        .rows(range, &[], false, None)
+        .await
+        .map_err(tc_error::TCError::from)?;
+    while let Some(row) = rows.try_next().await.map_err(tc_error::TCError::from)? {
+        let mut row = row.into_vec();
+        if let Some(updates) = updates.as_ref() {
+            for (i, name) in schema.values().iter().enumerate() {
+                if let Some(value) = updates.get(name) {
+                    row[key_len + i] = value.clone();
+                }
+            }
+        }
+
+        let values = row.split_off(key_len);
+        temp.write().await.upsert(row, values).await?;
+    }
+    drop(rows);
+
+    let mut staged = temp
+        .into_read()
+        .await
+        .into_rows()
+        .await
+        .map_err(tc_error::TCError::from)?;
+    while let Some(row) = staged.try_next().await.map_err(tc_error::TCError::from)? {
+        let mut row = row.into_vec();
+        let values = row.split_off(key_len);
+        let mut table = table.write().await;
+        table
+            .delete_row(&row)
+            .await
+            .map_err(tc_error::TCError::from)?;
+        if updates.is_some() {
+            table.upsert(row, values).await?;
+        }
+    }
+
+    Ok(())
 }
 
 /// A row-cap view that yields at most `limit` rows from its source.
@@ -263,52 +401,60 @@ impl<Txn> Limited<Txn> {
     ///
     /// This streams rows (with the limit applied via a lazy `take`) and counts
     /// them — no full source range is materialized.
-    pub async fn count(&self, txn_id: TxnId) -> u64 {
+    pub async fn count(&self, txn_id: TxnId) -> tc_error::TCResult<u64> {
         if self.limit == 0 {
-            return 0;
+            return Ok(0);
         }
-        let Ok(mut rows) = self.rows(txn_id).await else {
-            return 0;
-        };
+        let mut rows = self.rows(txn_id).await?;
         let mut count = 0_u64;
-        while rows.try_next().await.expect("read limited row").is_some() {
+        while rows
+            .try_next()
+            .await
+            .map_err(tc_error::TCError::from)?
+            .is_some()
+        {
             count += 1;
         }
-        count
+        Ok(count)
     }
 
     /// Return `true` if there are no visible rows or `limit` is zero.
-    pub async fn is_empty(&self, txn_id: TxnId) -> bool {
+    pub async fn is_empty(&self, txn_id: TxnId) -> tc_error::TCResult<bool> {
         if self.limit == 0 {
-            return true;
+            return Ok(true);
         }
         self.source.is_empty(txn_id).await
     }
 
     /// Iterate at most `limit` visible rows, calling `on_row` for each.
-    pub async fn for_each_row_in_order<F>(&self, txn_id: TxnId, mut on_row: F)
+    pub async fn for_each_row_in_order<F>(
+        &self,
+        txn_id: TxnId,
+        mut on_row: F,
+    ) -> tc_error::TCResult<()>
     where
         F: FnMut(Row<Value>),
     {
         if self.limit == 0 {
-            return;
+            return Ok(());
         }
-        let Ok(mut rows) = self.rows(txn_id).await else {
-            return;
-        };
-        while let Some(row) = rows.try_next().await.expect("read limited row") {
+        let mut rows = self.rows(txn_id).await?;
+        while let Some(row) = rows.try_next().await.map_err(tc_error::TCError::from)? {
             on_row(row);
         }
+        Ok(())
     }
 
     /// Project only the given `columns` from each row, preserving this
     /// view's row cap.
-    pub fn select(&self, columns: Vec<Id>) -> Selection<Txn> {
-        Selection {
+    pub fn select(&self, columns: Vec<Id>) -> tc_error::TCResult<Selection<Txn>> {
+        let (schema, columns) = self.schema().project(&columns)?;
+        Ok(Selection {
             source: self.source.clone(),
+            schema,
             columns,
             limit: Some(self.limit),
-        }
+        })
     }
 }
 
@@ -320,6 +466,7 @@ impl<Txn> Limited<Txn> {
 #[derive(Clone)]
 pub struct Selection<Txn> {
     source: TableSlice<Txn>,
+    schema: TableSchema,
     columns: Vec<Id>,
     limit: Option<u64>,
 }
@@ -334,7 +481,7 @@ impl<Txn> fmt::Debug for Selection<Txn> {
 
 impl<Txn> Selection<Txn> {
     pub fn schema(&self) -> &TableSchema {
-        self.source.schema()
+        &self.schema
     }
 
     pub fn columns(&self) -> &[Id] {
@@ -352,25 +499,29 @@ impl<Txn> Selection<Txn> {
         } else {
             rows
         };
-        Ok(rows.select(self.schema(), &self.columns))
+        Ok(rows.select(self.source.schema(), &self.columns))
     }
 
     /// Count visible rows (column projection does not change row count).
-    pub async fn count(&self, txn_id: TxnId) -> u64 {
+    pub async fn count(&self, txn_id: TxnId) -> tc_error::TCResult<u64> {
         self.source.count(txn_id).await
     }
 
     /// Return `true` if there are no visible rows.
-    pub async fn is_empty(&self, txn_id: TxnId) -> bool {
+    pub async fn is_empty(&self, txn_id: TxnId) -> tc_error::TCResult<bool> {
         self.source.is_empty(txn_id).await
     }
 
     /// Iterate visible rows with only the selected columns, calling `on_row`.
-    pub async fn for_each_row_in_order<F>(&self, txn_id: TxnId, mut on_row: F)
+    pub async fn for_each_row_in_order<F>(
+        &self,
+        txn_id: TxnId,
+        mut on_row: F,
+    ) -> tc_error::TCResult<()>
     where
         F: FnMut(Row<Value>),
     {
-        let indices = Self::column_indices(self.schema(), &self.columns);
+        let indices = Self::column_indices(self.source.schema(), &self.columns);
         self.source
             .for_each_row_in_order(txn_id, |row| {
                 let projected: Row<Value> = indices
@@ -379,7 +530,7 @@ impl<Txn> Selection<Txn> {
                     .collect();
                 on_row(projected);
             })
-            .await;
+            .await
     }
 
     fn column_indices(schema: &TableSchema, columns: &[Id]) -> Vec<usize> {

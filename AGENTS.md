@@ -27,7 +27,9 @@ local and lean, and push cross-host orchestration to client libraries.
 - Preserve v1 collection semantics while keeping authentication and wire error
   envelopes at adapter boundaries.
 - Express handlers only in terms of the native `Handler<State>` contract; never
-  add adapter-specific or generalized request/response envelopes.
+  add adapter-specific or generalized request/response envelopes. Implement the
+  trait directly on leaf handlers and use its unsupported-verb defaults instead
+  of introducing boxed per-verb futures or duplicate method errors.
 - `CollectionState` is the narrow dependency-inversion bridge to a caller-owned
   universal state type, not a second conversion framework. Its implementation
   must delegate construction and extraction to the canonical `From` and

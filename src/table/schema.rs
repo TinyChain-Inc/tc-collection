@@ -212,6 +212,30 @@ impl TableSchema {
     pub fn storage(&self) -> &StorageConfig {
         self.primary.storage()
     }
+
+    pub(crate) fn project(&self, columns: &[Id]) -> Result<(Self, Vec<Id>), TCError> {
+        for column in columns {
+            if !self.columns().any(|name| name == column) {
+                return Err(tc_error::not_found!("column not found: {column}"));
+            }
+        }
+        for key in &self.key {
+            if !columns.contains(key) {
+                return Err(tc_error::bad_request!(
+                    "Table selection must include key column {key}"
+                ));
+            }
+        }
+
+        let mut selected: Vec<Column> = self
+            .column_schema()
+            .filter(|column| columns.contains(&column.name))
+            .collect();
+        let columns = selected.iter().map(|column| column.name.clone()).collect();
+        let values = selected.split_off(self.key.len());
+        let schema = Self::new(selected, values, Vec::new(), *self.storage())?;
+        Ok((schema, columns))
+    }
 }
 
 impl Schema for TableSchema {
@@ -289,6 +313,21 @@ impl TableSchema {
     /// Return an iterator over all column names (key followed by value columns).
     pub fn columns(&self) -> impl Iterator<Item = &Id> {
         self.key.iter().chain(self.values.iter())
+    }
+
+    /// Return all column definitions in row order.
+    pub fn column_schema(&self) -> impl Iterator<Item = Column> + '_ {
+        self.columns()
+            .zip(self.primary.column_types())
+            .map(|(name, dtype)| Column {
+                name: name.clone(),
+                dtype: dtype.clone(),
+            })
+    }
+
+    /// Return the primary-key column definitions.
+    pub fn key_schema(&self) -> impl Iterator<Item = Column> + '_ {
+        self.column_schema().take(self.key.len())
     }
 }
 

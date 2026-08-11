@@ -53,7 +53,7 @@ impl<S: CollectionState> tc_ir::Route<S> for TensorRoutes<S> {
 impl<S: CollectionState> TensorRoute<S> {
     async fn get<T: Transaction + ?Sized>(&self, txn: &T, request: Scalar) -> TCResult<S> {
         let _ = txn;
-        tensor_get(&self.tensor, &self.path, S::from_scalar(request))?
+        tensor_get(&self.tensor, &self.path, S::from(request))?
             .ok_or_else(|| TCError::method_not_allowed(tc_ir::Method::Get, "Tensor"))
     }
 
@@ -72,7 +72,7 @@ fn tensor_get<S: CollectionState>(
         return tensor
             .clone()
             .slice(tensor_range_from_state(key, tensor.shape())?)
-            .map(|tensor| Some(S::from_collection(Collection::Tensor(tensor))))
+            .map(|tensor| Some(S::from(Collection::Tensor(tensor))))
             .map_err(TCError::bad_request);
     }
     if path.len() != 1 {
@@ -89,7 +89,7 @@ fn tensor_get<S: CollectionState>(
         _ => return Ok(None),
     }
     .map_err(TCError::bad_request)?;
-    Ok(Some(S::from_collection(Collection::Tensor(tensor))))
+    Ok(Some(S::from(Collection::Tensor(tensor))))
 }
 
 fn tensor_post<S: CollectionState>(
@@ -101,21 +101,21 @@ fn tensor_post<S: CollectionState>(
         return Ok(None);
     }
     let state = match path[0].as_str() {
-        "dtype" => S::from_value(Value::String(
+        "dtype" => S::from(Value::String(
             number_type_path(&tensor.number_type()).to_string(),
         )),
-        "ndim" => S::from_value(Value::Number(Number::from(tensor.shape().len() as u64))),
-        "shape" => S::from_scalar(Scalar::Tuple(
+        "ndim" => S::from(Value::Number(Number::from(tensor.shape().len() as u64))),
+        "shape" => S::from(Scalar::Tuple(
             tensor
                 .shape()
                 .iter()
                 .map(|dim| Scalar::Value(Value::Number(Number::from(*dim as u64))))
                 .collect(),
         )),
-        "size" => S::from_value(Value::Number(Number::from(tensor.size() as u64))),
+        "size" => S::from(Value::Number(Number::from(tensor.size() as u64))),
         "all" => tensor_truthy_state::<S>(tensor, true)?,
         "any" => tensor_truthy_state::<S>(tensor, false)?,
-        "cond" => S::from_collection(Collection::Tensor(
+        "cond" => S::from(Collection::Tensor(
             Tensor::cond(
                 tensor,
                 &tensor_param(&params, "then")?,
@@ -131,30 +131,31 @@ fn tensor_post<S: CollectionState>(
             )
             .map_err(TCError::bad_request)?
         {
-            TensorReduceResult::Scalar(number) => S::from_value(Value::Number(number)),
-            TensorReduceResult::Tensor(tensor) => S::from_collection(Collection::Tensor(tensor)),
+            TensorReduceResult::Scalar(number) => S::from(Value::Number(number)),
+            TensorReduceResult::Tensor(tensor) => S::from(Collection::Tensor(tensor)),
         },
-        "broadcast_reduce" => S::from_collection(Collection::Tensor(tensor_op_result(
-            broadcast_reduce_sum(tensor, &shape_param(&params, "target_shape")?),
-        )?)),
-        "matmul" => S::from_collection(Collection::Tensor(tensor_op_result(batched_matmul(
+        "broadcast_reduce" => S::from(Collection::Tensor(tensor_op_result(broadcast_reduce_sum(
+            tensor,
+            &shape_param(&params, "target_shape")?,
+        ))?)),
+        "matmul" => S::from(Collection::Tensor(tensor_op_result(batched_matmul(
             tensor,
             &tensor_param(&params, "r")?,
         ))?)),
-        "transpose" => S::from_collection(Collection::Tensor(tensor_op_result(tensor_transpose(
+        "transpose" => S::from(Collection::Tensor(tensor_op_result(tensor_transpose(
             tensor,
             &shape_param(&params, "perm")?,
         ))?)),
-        "add" => S::from_collection(Collection::Tensor(tensor_op_result(broadcast_add(
+        "add" => S::from(Collection::Tensor(tensor_op_result(broadcast_add(
             tensor,
             &tensor_param(&params, "r")?,
         ))?)),
-        "sub" | "mul" | "div" | "and" | "or" | "xor" => S::from_collection(Collection::Tensor(
+        "sub" | "mul" | "div" | "and" | "or" | "xor" => S::from(Collection::Tensor(
             tensor
                 .binary_op(&tensor_param(&params, "r")?, path[0].as_str())
                 .map_err(TCError::bad_request)?,
         )),
-        "not" => S::from_collection(Collection::Tensor(
+        "not" => S::from(Collection::Tensor(
             tensor.unary_not().map_err(TCError::bad_request)?,
         )),
         _ => return Ok(None),
@@ -365,7 +366,7 @@ fn number_to_usize(number: Number, context: &str) -> TCResult<usize> {
 }
 fn tensor_truthy_state<S: CollectionState>(tensor: &Tensor, all: bool) -> TCResult<S> {
     let values = tensor.values_f64().map_err(TCError::bad_request)?;
-    Ok(S::from_value(Value::Number(Number::Bool(
+    Ok(S::from(Value::Number(Number::Bool(
         (if all {
             values.iter().all(|value| *value != 0.0)
         } else {

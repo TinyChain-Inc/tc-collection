@@ -1275,8 +1275,8 @@ fn slice_returns_in_range_rows_table() {
                 "slice should return only in-range rows [2, 5)"
             );
 
-            assert_eq!(slice.count(tx(11)).await, 3);
-            assert!(!slice.is_empty(tx(11)).await);
+            assert_eq!(slice.count(tx(11)).await.expect("count slice"), 3);
+            assert!(!slice.is_empty(tx(11)).await.expect("test slice"));
         })
     });
 }
@@ -1308,24 +1308,26 @@ fn select_projects_columns_table() {
             table.commit(tx(10)).expect("commit");
             table.finalize(tx(10)).await.expect("finalize");
 
-            let selection = table.select(&[id("label")]);
+            let selection = table
+                .select(&[id("id"), id("label")])
+                .expect("valid selection");
             let rows = selection.rows(tx(11)).await.expect("select rows");
             let collected = collect_rows(rows).await;
 
             assert_eq!(collected.len(), 2, "should have 2 projected rows");
             assert_eq!(
                 collected[0],
-                vec![Value::from("alpha")],
-                "first row should project label only"
+                vec![Value::from(1_u64), Value::from("alpha")],
+                "first row should preserve its key"
             );
             assert_eq!(
                 collected[1],
-                vec![Value::from("beta")],
-                "second row should project label only"
+                vec![Value::from(2_u64), Value::from("beta")],
+                "second row should preserve its key"
             );
 
-            assert_eq!(selection.count(tx(11)).await, 2);
-            assert!(!selection.is_empty(tx(11)).await);
+            assert_eq!(selection.count(tx(11)).await.expect("count selection"), 2);
+            assert!(!selection.is_empty(tx(11)).await.expect("test selection"));
         })
     });
 }
@@ -1353,7 +1355,7 @@ fn limit_caps_row_stream_table() {
 
             let limited = table.limit(3);
             assert_eq!(
-                limited.count(tx(11)).await,
+                limited.count(tx(11)).await.expect("count limited view"),
                 3,
                 "count should be capped at 3"
             );
@@ -1363,12 +1365,26 @@ fn limit_caps_row_stream_table() {
             assert_eq!(collected.len(), 3, "stream should yield exactly 3 rows");
 
             let limited_zero = table.limit(0);
-            assert_eq!(limited_zero.count(tx(11)).await, 0);
-            assert!(limited_zero.is_empty(tx(11)).await);
+            assert_eq!(
+                limited_zero
+                    .count(tx(11))
+                    .await
+                    .expect("count empty limited view"),
+                0
+            );
+            assert!(
+                limited_zero
+                    .is_empty(tx(11))
+                    .await
+                    .expect("test empty limited view")
+            );
 
             let limited_large = table.limit(100);
             assert_eq!(
-                limited_large.count(tx(11)).await,
+                limited_large
+                    .count(tx(11))
+                    .await
+                    .expect("count large limited view"),
                 10,
                 "limit larger than table should return all"
             );
@@ -1649,14 +1665,16 @@ fn view_composition_is_lazy_table() {
             table.commit(tx(10)).expect("commit");
             table.finalize(tx(10)).await.expect("finalize");
 
-            // Compose: slice [3, 7) -> limit 2 -> select ["label"]
+            // Compose: slice [3, 7) -> limit 2 -> select the key and label.
             let slice = table.slice(
                 range_in("id", Value::from(3_u64), Value::from(7_u64)),
                 &[],
                 false,
             );
             let limited = slice.limit(2);
-            let selection = limited.select(vec![id("label")]);
+            let selection = limited
+                .select(vec![id("id"), id("label")])
+                .expect("valid selection");
 
             let rows = selection.rows(tx(11)).await.expect("composed view rows");
             let collected = collect_rows(rows).await;
@@ -1664,17 +1682,21 @@ fn view_composition_is_lazy_table() {
             assert_eq!(collected.len(), 2, "limit should cap at 2 rows");
             assert_eq!(
                 collected[0],
-                vec![Value::from("item3")],
-                "first row should be id 3 with only label projected"
+                vec![Value::from(3_u64), Value::from("item3")],
+                "first row should be id 3"
             );
             assert_eq!(
                 collected[1],
-                vec![Value::from("item4")],
-                "second row should be id 4 with only label projected"
+                vec![Value::from(4_u64), Value::from("item4")],
+                "second row should be id 4"
             );
 
             // Also verify count on composed view
-            assert_eq!(limited.count(tx(11)).await, 2, "limited count should be 2");
+            assert_eq!(
+                limited.count(tx(11)).await.expect("count limited view"),
+                2,
+                "limited count should be 2"
+            );
         })
     });
 }
