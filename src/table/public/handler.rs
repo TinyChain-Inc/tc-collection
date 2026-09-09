@@ -17,19 +17,19 @@ use crate::table::Table;
 ///
 /// Holds a function pointer that extracts the schema `Value` from the table.
 /// Ported from v1 `SchemaHandler<'a, T>`.
-pub struct SchemaHandler<Txn> {
+pub struct SchemaHandler<Txn: crate::StorageContext> {
     table: Table<Txn>,
     schema_fn: fn(&Table<Txn>) -> Value,
 }
 
-impl<Txn> SchemaHandler<Txn> {
+impl<Txn: crate::StorageContext> SchemaHandler<Txn> {
     pub fn new(table: Table<Txn>, schema_fn: fn(&Table<Txn>) -> Value) -> Self {
         Self { table, schema_fn }
     }
 }
 
 /// Return all column definitions.
-pub fn column_schema<Txn>(table: &Table<Txn>) -> Value {
+pub fn column_schema<Txn: crate::StorageContext>(table: &Table<Txn>) -> Value {
     let columns = table
         .schema()
         .column_schema()
@@ -39,13 +39,13 @@ pub fn column_schema<Txn>(table: &Table<Txn>) -> Value {
 }
 
 /// Return the primary-key column definitions.
-pub fn key_columns<Txn>(table: &Table<Txn>) -> Value {
+pub fn key_columns<Txn: crate::StorageContext>(table: &Table<Txn>) -> Value {
     let key = table.schema().key_schema().map(Value::cast_from).collect();
     Value::Tuple(key)
 }
 
 /// Return the primary-key column names.
-pub fn key_names<Txn>(table: &Table<Txn>) -> Value {
+pub fn key_names<Txn: crate::StorageContext>(table: &Table<Txn>) -> Value {
     Value::Tuple(
         table
             .schema()
@@ -60,11 +60,11 @@ pub fn key_names<Txn>(table: &Table<Txn>) -> Value {
 ///
 /// Ported from v1 `ContainsHandler<Txn, FE>`.
 #[derive(Clone)]
-pub struct ContainsHandler<Txn> {
+pub struct ContainsHandler<Txn: crate::StorageContext> {
     table: Table<Txn>,
 }
 
-impl<Txn> From<Table<Txn>> for ContainsHandler<Txn> {
+impl<Txn: crate::StorageContext> From<Table<Txn>> for ContainsHandler<Txn> {
     fn from(table: Table<Txn>) -> Self {
         Self { table }
     }
@@ -74,33 +74,33 @@ impl<Txn> From<Table<Txn>> for ContainsHandler<Txn> {
 ///
 /// Ported from v1 `CountHandler<T>`.
 #[derive(Clone)]
-pub struct CountHandler<Txn> {
+pub struct CountHandler<Txn: crate::StorageContext> {
     table: Table<Txn>,
 }
 
 #[derive(Clone)]
-pub struct IsEmptyHandler<Txn> {
+pub struct IsEmptyHandler<Txn: crate::StorageContext> {
     table: Table<Txn>,
 }
 
-impl<Txn> From<Table<Txn>> for IsEmptyHandler<Txn> {
+impl<Txn: crate::StorageContext> From<Table<Txn>> for IsEmptyHandler<Txn> {
     fn from(table: Table<Txn>) -> Self {
         Self { table }
     }
 }
 
 #[derive(Clone)]
-pub struct InsertHandler<Txn> {
+pub struct InsertHandler<Txn: crate::StorageContext> {
     table: Table<Txn>,
 }
 
-impl<Txn> From<Table<Txn>> for InsertHandler<Txn> {
+impl<Txn: crate::StorageContext> From<Table<Txn>> for InsertHandler<Txn> {
     fn from(table: Table<Txn>) -> Self {
         Self { table }
     }
 }
 
-impl<Txn> From<Table<Txn>> for CountHandler<Txn> {
+impl<Txn: crate::StorageContext> From<Table<Txn>> for CountHandler<Txn> {
     fn from(table: Table<Txn>) -> Self {
         Self { table }
     }
@@ -110,11 +110,11 @@ impl<Txn> From<Table<Txn>> for CountHandler<Txn> {
 ///
 /// Ported from v1 `LimitHandler<T>`.
 #[derive(Clone)]
-pub struct LimitHandler<Txn> {
+pub struct LimitHandler<Txn: crate::StorageContext> {
     table: Table<Txn>,
 }
 
-impl<Txn> From<Table<Txn>> for LimitHandler<Txn> {
+impl<Txn: crate::StorageContext> From<Table<Txn>> for LimitHandler<Txn> {
     fn from(table: Table<Txn>) -> Self {
         Self { table }
     }
@@ -124,11 +124,11 @@ impl<Txn> From<Table<Txn>> for LimitHandler<Txn> {
 ///
 /// Ported from v1 `OrderHandler<T>`.
 #[derive(Clone)]
-pub struct OrderHandler<Txn> {
+pub struct OrderHandler<Txn: crate::StorageContext> {
     table: Table<Txn>,
 }
 
-impl<Txn> From<Table<Txn>> for OrderHandler<Txn> {
+impl<Txn: crate::StorageContext> From<Table<Txn>> for OrderHandler<Txn> {
     fn from(table: Table<Txn>) -> Self {
         Self { table }
     }
@@ -138,11 +138,11 @@ impl<Txn> From<Table<Txn>> for OrderHandler<Txn> {
 ///
 /// Ported from v1 `SelectHandler<T>`.
 #[derive(Clone)]
-pub struct SelectHandler<Txn> {
+pub struct SelectHandler<Txn: crate::StorageContext> {
     table: Table<Txn>,
 }
 
-impl<Txn> From<Table<Txn>> for SelectHandler<Txn> {
+impl<Txn: crate::StorageContext> From<Table<Txn>> for SelectHandler<Txn> {
     fn from(table: Table<Txn>) -> Self {
         Self { table }
     }
@@ -152,11 +152,11 @@ impl<Txn> From<Table<Txn>> for SelectHandler<Txn> {
 ///
 /// Ported from v1 `TableHandler<Txn, FE>`.
 #[derive(Clone)]
-pub struct TableHandler<Txn> {
+pub struct TableHandler<Txn: crate::StorageContext> {
     table: Table<Txn>,
 }
 
-impl<Txn> From<Table<Txn>> for TableHandler<Txn> {
+impl<Txn: crate::StorageContext> From<Table<Txn>> for TableHandler<Txn> {
     fn from(table: Table<Txn>) -> Self {
         Self { table }
     }

@@ -105,14 +105,14 @@ impl TryCastFrom<Vec<BTreeColumnSchema>> for BTreeSchema {
 }
 
 #[derive(Clone, Debug)]
-pub struct DecodedBTreePayload<Txn> {
+pub struct DecodedBTreePayload<Txn: crate::StorageContext> {
     pub schema: Vec<BTreeColumnSchema>,
     pub btree: BTree<Txn>,
 }
 
-struct BTreeRows<Txn>(std::marker::PhantomData<fn() -> Txn>);
+struct BTreeRows<Txn: crate::StorageContext>(std::marker::PhantomData<fn() -> Txn>);
 
-struct BTreeRowsContext<Txn> {
+struct BTreeRowsContext<Txn: crate::StorageContext> {
     btree: BTree<Txn>,
 }
 
@@ -120,18 +120,18 @@ fn decode_err(action: &str, err: impl std::fmt::Display) -> String {
     format!("{action}: {err}")
 }
 
-impl<Txn> de::FromStream for BTreeRows<Txn> {
+impl<Txn: crate::StorageContext> de::FromStream for BTreeRows<Txn> {
     type Context = BTreeRowsContext<Txn>;
 
     async fn from_stream<D: de::Decoder>(
         context: Self::Context,
         decoder: &mut D,
     ) -> Result<Self, D::Error> {
-        struct RowsVisitor<Txn> {
+        struct RowsVisitor<Txn: crate::StorageContext> {
             btree: BTree<Txn>,
         }
 
-        impl<Txn> de::Visitor for RowsVisitor<Txn> {
+        impl<Txn: crate::StorageContext> de::Visitor for RowsVisitor<Txn> {
             type Value = BTreeRows<Txn>;
 
             fn expecting() -> &'static str {

@@ -35,32 +35,32 @@ impl<T> CollectionFile for T where
 {
 }
 
-/// Collection-only file composition used by standalone callers and tests.
+/// Collection-only file type used by standalone callers and tests.
+///
+/// `CollectionNode` and `AsType` are both defined by dependency crates, so
+/// Rust's orphan rules prohibit implementing `AsType<CollectionNode>` directly
+/// for `CollectionNode`. This local newtype exists only to provide that required
+/// `freqfs` projection; it is not an extensible file-variant registry.
 #[derive(Clone)]
-pub enum PersistentFile {
-    Node(CollectionNode),
-}
+pub struct PersistentFile(CollectionNode);
 
 impl From<CollectionNode> for PersistentFile {
     fn from(node: CollectionNode) -> Self {
-        Self::Node(node)
+        Self(node)
     }
 }
 
 impl AsType<CollectionNode> for PersistentFile {
     fn as_type(&self) -> Option<&CollectionNode> {
-        let Self::Node(node) = self;
-        Some(node)
+        Some(&self.0)
     }
 
     fn as_type_mut(&mut self) -> Option<&mut CollectionNode> {
-        let Self::Node(node) = self;
-        Some(node)
+        Some(&mut self.0)
     }
 
     fn into_type(self) -> Option<CollectionNode> {
-        let Self::Node(node) = self;
-        Some(node)
+        Some(self.0)
     }
 }
 
@@ -70,22 +70,18 @@ impl FileLoad for PersistentFile {
         file: tokio::fs::File,
         metadata: std::fs::Metadata,
     ) -> std::io::Result<Self> {
-        CollectionNode::load(path, file, metadata)
-            .await
-            .map(Self::Node)
+        CollectionNode::load(path, file, metadata).await.map(Self)
     }
 }
 
 impl FileSave for PersistentFile {
     async fn save(&self, file: &mut tokio::fs::File) -> std::io::Result<u64> {
-        let Self::Node(node) = self;
-        node.save(file).await
+        self.0.save(file).await
     }
 }
 
 impl GetSize for PersistentFile {
     fn get_size(&self) -> usize {
-        let Self::Node(node) = self;
-        node.get_size()
+        self.0.get_size()
     }
 }

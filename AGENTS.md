@@ -9,11 +9,14 @@ are non-normative integration context when this repository is used as a submodul
 - Own BTree, Table, Tensor, and Collection values, local operations, routes,
   views, codecs, and deterministic transaction behavior.
 - Implement `Route` directly on each concrete collection and delegate the
-  `Collection` enum to it. Do not add route enums, adapter handlers, associated
-  handler types, or aggregate method switches.
-- Select each operation once in `Route`. A terminal handler must not retain an
-  unresolved path, repeat path dispatch, or forward to inherent methods which
-  merely duplicate its `Handler` verbs.
+  `Collection` enum to it. Select each operation once, retain no unresolved
+  path, and do not repeat traversal in a terminal handler. The parent workspace's
+  [native-routing contract](https://github.com/TinyChain-Inc/tcv2/blob/main/tc-ir/IR_INTERFACE_GUIDELINES.md#native-routing)
+  is non-normative integration context for these shared interfaces.
+- Represent each selected operation with a small terminal handler borrowing its
+  collection receiver. Do not clone the receiver into every handler or replace
+  the terminal types with an operation tag, aggregate method switch, adapter
+  handler, cross-collection route enum, or forwarding façade.
 - Exchange caller-owned native State through `CollectionState`. Delegate its
   conversions to canonical `From`/`TryCastFrom` implementations instead of
   duplicating universal State matching.
@@ -24,7 +27,9 @@ are non-normative integration context when this repository is used as a submodul
 - Receive bootstrap- or transaction-delegated storage/allocation handles. Never
   construct a cache, derive a transaction workspace path, or choose caller storage
   policy. Allocate transaction-local deltas from the delegated `StorageContext`;
-  do not add storage-mode enums, erased directory handles, or runtime downcasts.
+  store `BTreeLock` and `TableLock` with `StorageContext::File` directly; do not
+  add storage-mode enums, erased store traits, forwarding wrappers, erased
+  directory handles, or runtime downcasts.
 - Standalone named persistent collections are unsupported. Literal and
   transaction-local collections are owned by their enclosing request. Public
   hosting and durable ownership are outside this crate.

@@ -2,28 +2,29 @@ use destream::de;
 use safecast::TryCastFrom;
 use tc_value::{Value, ValueCollator};
 
-use super::{LocalTable, Table, TableSchema};
+use super::file::{TableFile, upsert};
+use super::{Table, TableSchema};
 
 #[derive(Clone, Debug)]
-pub struct DecodedTablePayload<Txn> {
+pub struct DecodedTablePayload<Txn: crate::StorageContext> {
     pub table: Table<Txn>,
 }
 
-struct Rows;
+struct Rows<Txn: crate::StorageContext>(std::marker::PhantomData<fn() -> Txn>);
 
-impl de::FromStream for Rows {
-    type Context = LocalTable;
+impl<Txn: crate::StorageContext> de::FromStream for Rows<Txn> {
+    type Context = TableFile<Txn::File>;
 
     async fn from_stream<D: de::Decoder>(
         table: Self::Context,
         decoder: &mut D,
     ) -> Result<Self, D::Error> {
-        struct Visitor {
-            table: LocalTable,
+        struct Visitor<Txn: crate::StorageContext> {
+            table: TableFile<Txn::File>,
         }
 
-        impl de::Visitor for Visitor {
-            type Value = Rows;
+        impl<Txn: crate::StorageContext> de::Visitor for Visitor<Txn> {
+            type Value = Rows<Txn>;
 
             fn expecting() -> &'static str {
                 "a sequence of Table rows"
@@ -46,16 +47,19 @@ impl de::FromStream for Rows {
                             schema.column_count()
                         )));
                     }
-                    self.table
-                        .upsert(row[..key_len].to_vec(), row[key_len..].to_vec())
-                        .await
-                        .map_err(de::Error::custom)?;
+                    upsert(
+                        &self.table,
+                        row[..key_len].to_vec(),
+                        row[key_len..].to_vec(),
+                    )
+                    .await
+                    .map_err(de::Error::custom)?;
                 }
-                Ok(Rows)
+                Ok(Rows(std::marker::PhantomData))
             }
         }
 
-        decoder.decode_seq(Visitor { table }).await
+        decoder.decode_seq(Visitor::<Txn> { table }).await
     }
 }
 
@@ -92,10 +96,10 @@ impl<Txn: crate::StorageContext> de::FromStream for DecodedTablePayload<Txn> {
                 let schema = TableSchema::try_cast_from(schema, |schema| {
                     de::Error::custom(format!("invalid Table schema: {schema:?}"))
                 })?;
-                let table = LocalTable::create(schema, ValueCollator::default(), self.dir)
+                let table = b_table::TableLock::create(schema, ValueCollator::default(), self.dir)
                     .map_err(de::Error::custom)?;
 
-                seq.next_element::<Rows>(table.clone())
+                seq.next_element::<Rows<Txn>>(table.clone())
                     .await?
                     .ok_or_else(|| de::Error::custom("missing Table rows"))?;
                 if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {

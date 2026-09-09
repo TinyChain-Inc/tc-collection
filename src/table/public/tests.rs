@@ -5,7 +5,7 @@ use super::selector::KeyOrRange;
 use crate::PersistentFile;
 use crate::StorageContext;
 use crate::btree::StorageConfig;
-use crate::table::{Column, LocalTable, PersistentTable, Table, TableSchema};
+use crate::table::{Column, PersistentTable, Table, TableSchema};
 use crate::test::run_async_test;
 use freqfs::Cache;
 use safecast::TryCastInto;
@@ -327,16 +327,19 @@ async fn make_local_table_with_data(txn: &MockTxn) -> Table<MockTxn> {
         .context()
         .await
         .expect("local table directory");
-    let table = LocalTable::create(simple_schema(), ValueCollator::default(), dir)
+    let table = b_table::TableLock::create(simple_schema(), ValueCollator::default(), dir)
         .expect("create local table");
-    table
-        .upsert(vec![Value::from(1_u64)], vec![Value::from("alpha")])
-        .await
-        .expect("upsert local row");
-    table
-        .upsert(vec![Value::from(2_u64)], vec![Value::from("beta")])
-        .await
-        .expect("upsert local row");
+    {
+        let mut table = table.write().await;
+        table
+            .upsert(vec![Value::from(1_u64)], vec![Value::from("alpha")])
+            .await
+            .expect("upsert local row");
+        table
+            .upsert(vec![Value::from(2_u64)], vec![Value::from("beta")])
+            .await
+            .expect("upsert local row");
+    }
     Table::Local(table)
 }
 

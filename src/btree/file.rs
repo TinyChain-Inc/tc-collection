@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
-use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 use b_tree::{BTreeLock, Range, Schema};
@@ -179,164 +178,96 @@ impl Schema for BTreeSchema {
     }
 }
 
-trait Store: Send + Sync {
-    fn key_schema(&self) -> BTreeSchema;
-    fn keys(
-        &self,
-        bounds: (Bound<Value>, Bound<Value>),
-        reverse: bool,
-    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<b_tree::Keys<Value>>> + Send + '_>>;
-    fn contains<'a>(
-        &'a self,
-        key: &'a [Value],
-    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<bool>> + Send + 'a>>;
-    fn insert(
-        &self,
-        key: Vec<Value>,
-    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + '_>>;
-    fn delete<'a>(
-        &'a self,
-        key: &'a [Value],
-    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>>;
+async fn key_stream_in<F: crate::CollectionFile>(
+    tree: &BTreeLock<BTreeSchema, ValueCollator, F>,
+    bounds: (Bound<Value>, Bound<Value>),
+    reverse: bool,
+) -> std::io::Result<b_tree::Keys<Value>> {
+    let view = tree.read().await;
+    let range = Range::with_bounds(Vec::<Value>::new(), bounds);
+    if reverse {
+        view.keys_rev(range).await
+    } else {
+        view.keys(range).await
+    }
 }
 
-struct FileStore<F> {
-    tree: BTreeLock<BTreeSchema, ValueCollator, F>,
+async fn contains_key<F: crate::CollectionFile>(
+    tree: &BTreeLock<BTreeSchema, ValueCollator, F>,
+    key: &[Value],
+) -> std::io::Result<bool> {
+    tree.read().await.contains(key).await
 }
 
-impl<F: crate::CollectionFile> Store for FileStore<F> {
-    fn key_schema(&self) -> BTreeSchema {
-        self.tree.schema().clone()
-    }
+async fn insert_key<F: crate::CollectionFile>(
+    tree: &BTreeLock<BTreeSchema, ValueCollator, F>,
+    key: Vec<Value>,
+) -> std::io::Result<()> {
+    tree.write().await.insert(key).await.map(|_| ())
+}
 
-    fn keys(
-        &self,
-        bounds: (Bound<Value>, Bound<Value>),
-        reverse: bool,
-    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<b_tree::Keys<Value>>> + Send + '_>>
-    {
-        Box::pin(async move {
-            let view = self.tree.read().await;
-            let range = Range::with_bounds(Vec::<Value>::new(), bounds);
-            if reverse {
-                view.keys_rev(range).await
-            } else {
-                view.keys(range).await
-            }
-        })
-    }
-
-    fn contains<'a>(
-        &'a self,
-        key: &'a [Value],
-    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<bool>> + Send + 'a>> {
-        Box::pin(async move { self.tree.read().await.contains(key).await })
-    }
-
-    fn insert(
-        &self,
-        key: Vec<Value>,
-    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + '_>> {
-        Box::pin(async move { self.tree.write().await.insert(key).await.map(drop) })
-    }
-
-    fn delete<'a>(
-        &'a self,
-        key: &'a [Value],
-    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
-        Box::pin(async move { self.tree.write().await.delete(key).await.map(drop) })
-    }
+async fn delete_key<F: crate::CollectionFile>(
+    tree: &BTreeLock<BTreeSchema, ValueCollator, F>,
+    key: &[Value],
+) -> std::io::Result<()> {
+    tree.write().await.delete(key).await.map(|_| ())
 }
 
 #[derive(Clone)]
-struct PersistentStore(Arc<dyn Store>);
-
-impl PersistentStore {
-    fn key_schema(&self) -> BTreeSchema {
-        self.0.key_schema()
-    }
-
-    fn from_dir<F: crate::CollectionFile>(
-        dir: DirLock<F>,
-        schema: BTreeSchema,
-    ) -> std::io::Result<Self> {
-        BTreeLock::load(schema, ValueCollator::default(), dir)
-            .map(|tree| Self(Arc::new(FileStore { tree })))
-    }
-
-    async fn key_stream_in(
-        &self,
-        bounds: (Bound<Value>, Bound<Value>),
-        reverse: bool,
-    ) -> std::io::Result<b_tree::Keys<Value>> {
-        self.0.keys(bounds, reverse).await
-    }
-
-    async fn contains_key(&self, key: &[Value]) -> std::io::Result<bool> {
-        self.0.contains(key).await
-    }
-    async fn insert_key(&self, key: Vec<Value>) -> std::io::Result<()> {
-        self.0.insert(key).await
-    }
-    async fn delete_key(&self, key: &[Value]) -> std::io::Result<()> {
-        self.0.delete(key).await
-    }
-
-    async fn apply_delta(&self, delta: &Delta) -> std::io::Result<()> {
-        let mut stream = delta
-            .inserts
-            .key_stream_in((Bound::Unbounded, Bound::Unbounded), false)
-            .await?;
-        while let Some(key) = stream.try_next().await? {
-            self.insert_key(key.to_vec()).await?;
-        }
-        let mut stream = delta
-            .deletes
-            .key_stream_in((Bound::Unbounded, Bound::Unbounded), false)
-            .await?;
-        while let Some(key) = stream.try_next().await? {
-            self.delete_key(&key).await?;
-        }
-        Ok(())
-    }
+struct Delta<F: crate::CollectionFile> {
+    inserts: BTreeLock<BTreeSchema, ValueCollator, F>,
+    deletes: BTreeLock<BTreeSchema, ValueCollator, F>,
 }
 
-#[derive(Clone)]
-struct Delta {
-    inserts: PersistentStore,
-    deletes: PersistentStore,
-}
-
-impl Delta {
+impl<F: crate::CollectionFile> Delta<F> {
     async fn insert(&self, key: Vec<Value>) -> std::io::Result<()> {
-        self.deletes.delete_key(&key).await?;
+        delete_key(&self.deletes, &key).await?;
 
-        self.inserts.insert_key(key).await
+        insert_key(&self.inserts, key).await
     }
 
     async fn delete(&self, key: Vec<Value>) -> std::io::Result<()> {
-        self.inserts.delete_key(&key).await?;
+        delete_key(&self.inserts, &key).await?;
 
-        self.deletes.insert_key(key).await
+        insert_key(&self.deletes, key).await
     }
 }
 
+async fn apply_delta<F: crate::CollectionFile>(
+    persistent: &BTreeLock<BTreeSchema, ValueCollator, F>,
+    delta: &Delta<F>,
+) -> std::io::Result<()> {
+    let mut stream =
+        key_stream_in(&delta.inserts, (Bound::Unbounded, Bound::Unbounded), false).await?;
+    while let Some(key) = stream.try_next().await? {
+        insert_key(persistent, key.to_vec()).await?;
+    }
+
+    let mut stream =
+        key_stream_in(&delta.deletes, (Bound::Unbounded, Bound::Unbounded), false).await?;
+    while let Some(key) = stream.try_next().await? {
+        delete_key(persistent, &key).await?;
+    }
+
+    Ok(())
+}
+
 #[derive(Clone)]
-struct State {
-    persistent: PersistentStore,
-    committed: BTreeMap<TxnId, Delta>,
-    pending: BTreeMap<TxnId, Delta>,
+struct State<F: crate::CollectionFile> {
+    persistent: BTreeLock<BTreeSchema, ValueCollator, F>,
+    committed: BTreeMap<TxnId, Delta<F>>,
+    pending: BTreeMap<TxnId, Delta<F>>,
     finalized: Option<TxnId>,
 }
 
 #[derive(Clone)]
-struct VisibleSnapshot {
-    persistent: PersistentStore,
-    deltas: Vec<Delta>,
+struct VisibleSnapshot<F: crate::CollectionFile> {
+    persistent: BTreeLock<BTreeSchema, ValueCollator, F>,
+    deltas: Vec<Delta<F>>,
 }
 
-pub struct BTree<Txn> {
-    state: Arc<RwLock<State>>,
+pub struct BTree<Txn: crate::StorageContext> {
+    state: Arc<RwLock<State<Txn::File>>>,
     semaphore: txn_lock::semaphore::Semaphore<
         TxnId,
         b_tree::Collator<ValueCollator>,
@@ -345,7 +276,7 @@ pub struct BTree<Txn> {
     txn: PhantomData<fn() -> Txn>,
 }
 
-impl<Txn> Clone for BTree<Txn> {
+impl<Txn: crate::StorageContext> Clone for BTree<Txn> {
     fn clone(&self) -> Self {
         Self {
             state: self.state.clone(),
@@ -356,14 +287,14 @@ impl<Txn> Clone for BTree<Txn> {
 }
 
 #[derive(Debug, Clone)]
-pub struct BTreeSlice<Txn> {
+pub struct BTreeSlice<Txn: crate::StorageContext> {
     btree: BTree<Txn>,
     lower: Bound<Value>,
     upper: Bound<Value>,
     reverse: bool,
 }
 
-impl<Txn> fmt::Debug for BTree<Txn> {
+impl<Txn: crate::StorageContext> fmt::Debug for BTree<Txn> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = self.state.read().expect("state read lock");
         f.debug_struct("BTree")
@@ -374,16 +305,13 @@ impl<Txn> fmt::Debug for BTree<Txn> {
     }
 }
 
-impl<Txn> BTree<Txn> {
+impl<Txn: crate::StorageContext> BTree<Txn> {
     /// Construct a transactional BTree with default unary-key schema.
-    pub fn new<F: crate::CollectionFile>(persistent_dir: DirLock<F>) -> Self {
+    pub fn new(persistent_dir: DirLock<Txn::File>) -> Self {
         Self::with_schema(persistent_dir, BTreeSchema::default())
     }
 
-    pub fn with_schema<F: crate::CollectionFile>(
-        persistent_dir: DirLock<F>,
-        schema: BTreeSchema,
-    ) -> Self {
+    pub fn with_schema(persistent_dir: DirLock<Txn::File>, schema: BTreeSchema) -> Self {
         let persistent = Self::load_store(persistent_dir.clone(), schema);
 
         let state = State {
@@ -421,7 +349,7 @@ impl<Txn> BTree<Txn> {
             state.persistent.clone()
         };
 
-        persistent.key_stream_in(bounds, reverse).await
+        key_stream_in(&persistent, bounds, reverse).await
     }
 
     /// Stream the keys visible to `txn_id` while retaining the range read permit.
@@ -437,27 +365,22 @@ impl<Txn> BTree<Txn> {
         let snapshot = self.visible_snapshot(txn_id);
         let collator = KeyStreamCollator::new(reverse);
 
-        let mut visible: BoxStream<'static, Result<Vec<Value>, std::io::Error>> = snapshot
-            .persistent
-            .key_stream_in(bounds.clone(), reverse)
-            .await
-            .map_err(background_error)?
-            .map_ok(|row| row.to_vec())
-            .boxed();
+        let mut visible: BoxStream<'static, Result<Vec<Value>, std::io::Error>> =
+            key_stream_in(&snapshot.persistent, bounds.clone(), reverse)
+                .await
+                .map_err(background_error)?
+                .map_ok(|row| row.to_vec())
+                .boxed();
 
         for delta in snapshot.deltas {
-            let deletes = delta
-                .deletes
-                .key_stream_in(bounds.clone(), reverse)
+            let deletes = key_stream_in(&delta.deletes, bounds.clone(), reverse)
                 .await
                 .map_err(background_error)?
                 .map_ok(|row| row.to_vec())
                 .boxed();
             visible = try_diff(collator, visible, deletes).boxed();
 
-            let inserts = delta
-                .inserts
-                .key_stream_in(bounds.clone(), reverse)
+            let inserts = key_stream_in(&delta.inserts, bounds.clone(), reverse)
                 .await
                 .map_err(background_error)?
                 .map_ok(|row| row.to_vec())
@@ -488,10 +411,10 @@ impl<Txn> BTree<Txn> {
         };
 
         let row = persistent
-            .key_schema()
+            .schema()
             .normalize_row(row)
             .map_err(invalid_input_error)?;
-        persistent.insert_key(row).await
+        insert_key(&persistent, row).await
     }
 
     pub async fn insert_row(&self, txn: &Txn, key: Vec<Value>) -> Result<(), txn_lock::Error>
@@ -536,29 +459,22 @@ impl<Txn> BTree<Txn> {
             .semaphore
             .try_write(txn_id, txn_lock::set::Range::All)?;
 
-        let mut state = self.state.write().expect("state write lock");
-
-        if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
-            drop(state);
-            self.release_txn_reservation(txn_id);
-            return Err(txn_lock::Error::Outdated);
-        }
-
-        if state.committed.contains_key(&txn_id) {
-            drop(state);
-            self.release_txn_reservation(txn_id);
-            return Ok(());
-        }
-
-        if let Some(delta) = state.pending.remove(&txn_id) {
-            state.committed.insert(txn_id, delta);
-        }
-
-        drop(state);
+        let result = {
+            let mut state = self.state.write().expect("state write lock");
+            if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
+                Err(txn_lock::Error::Outdated)
+            } else if state.committed.contains_key(&txn_id) {
+                Ok(())
+            } else {
+                if let Some(delta) = state.pending.remove(&txn_id) {
+                    state.committed.insert(txn_id, delta);
+                }
+                Ok(())
+            }
+        };
         // Release waiters blocked on this txn's reservations.
         self.release_txn_reservation(txn_id);
-
-        Ok(())
+        result
     }
 
     /// Roll back the pending delta at `txn_id`.
@@ -570,27 +486,20 @@ impl<Txn> BTree<Txn> {
             .semaphore
             .try_write(txn_id, txn_lock::set::Range::All)?;
 
-        let mut state = self.state.write().expect("state write lock");
-
-        if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
-            drop(state);
-            self.release_txn_reservation(txn_id);
-            return Err(txn_lock::Error::Outdated);
-        }
-
-        if state.committed.contains_key(&txn_id) {
-            drop(state);
-            self.release_txn_reservation(txn_id);
-            return Err(txn_lock::Error::Conflict);
-        }
-
-        state.pending.remove(&txn_id);
-
-        drop(state);
+        let result = {
+            let mut state = self.state.write().expect("state write lock");
+            if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
+                Err(txn_lock::Error::Outdated)
+            } else if state.committed.contains_key(&txn_id) {
+                Err(txn_lock::Error::Conflict)
+            } else {
+                state.pending.remove(&txn_id);
+                Ok(())
+            }
+        };
         // Rollback completion unblocks later readers/writers on overlapping ranges.
         self.release_txn_reservation(txn_id);
-
-        Ok(())
+        result
     }
 
     /// Finalize all committed deltas up to `txn_id` into persistent state.
@@ -623,8 +532,7 @@ impl<Txn> BTree<Txn> {
         };
 
         for delta in &committed_to_apply {
-            persistent
-                .apply_delta(delta)
+            apply_delta(&persistent, delta)
                 .await
                 .map_err(background_error)?;
         }
@@ -751,18 +659,15 @@ impl<Txn> BTree<Txn> {
         let snapshot = self.visible_snapshot(txn_id);
         let collator = KeyStreamCollator::new(reverse);
 
-        let mut visible: BoxStream<'_, Result<Vec<Value>, std::io::Error>> = snapshot
-            .persistent
-            .key_stream_in(bounds.clone(), reverse)
-            .await
-            .expect("stream persistent keys")
-            .map_ok(|row| row.to_vec())
-            .boxed();
+        let mut visible: BoxStream<'_, Result<Vec<Value>, std::io::Error>> =
+            key_stream_in(&snapshot.persistent, bounds.clone(), reverse)
+                .await
+                .expect("stream persistent keys")
+                .map_ok(|row| row.to_vec())
+                .boxed();
 
         for delta in &snapshot.deltas {
-            let deletes = delta
-                .deletes
-                .key_stream_in(bounds.clone(), reverse)
+            let deletes = key_stream_in(&delta.deletes, bounds.clone(), reverse)
                 .await
                 .expect("stream delete delta keys")
                 .map_ok(|row| row.to_vec())
@@ -770,9 +675,7 @@ impl<Txn> BTree<Txn> {
 
             visible = try_diff(collator, visible, deletes).boxed();
 
-            let inserts = delta
-                .inserts
-                .key_stream_in(bounds.clone(), reverse)
+            let inserts = key_stream_in(&delta.inserts, bounds.clone(), reverse)
                 .await
                 .expect("stream insert delta keys")
                 .map_ok(|row| row.to_vec())
@@ -788,7 +691,7 @@ impl<Txn> BTree<Txn> {
         }
     }
 
-    fn visible_snapshot(&self, txn_id: TxnId) -> VisibleSnapshot {
+    fn visible_snapshot(&self, txn_id: TxnId) -> VisibleSnapshot<Txn::File> {
         let state = self.state.read().expect("state read lock");
         let mut deltas = state
             .committed
@@ -829,26 +732,20 @@ impl<Txn> BTree<Txn> {
         self.semaphore.finalize(&txn_id, true);
     }
 
-    async fn is_row_visible(&self, snapshot: &VisibleSnapshot, key: &[Value]) -> bool {
-        let mut visible = snapshot
-            .persistent
-            .contains_key(key)
+    async fn is_row_visible(&self, snapshot: &VisibleSnapshot<Txn::File>, key: &[Value]) -> bool {
+        let mut visible = contains_key(&snapshot.persistent, key)
             .await
             .expect("check persistent visibility");
 
         for delta in &snapshot.deltas {
-            if delta
-                .deletes
-                .contains_key(key)
+            if contains_key(&delta.deletes, key)
                 .await
                 .expect("check delete delta visibility")
             {
                 visible = false;
             }
 
-            if delta
-                .inserts
-                .contains_key(key)
+            if contains_key(&delta.inserts, key)
                 .await
                 .expect("check insert delta visibility")
             {
@@ -859,7 +756,10 @@ impl<Txn> BTree<Txn> {
         visible
     }
 
-    fn assert_writable_state(state: &State, txn_id: TxnId) -> Result<(), txn_lock::Error> {
+    fn assert_writable_state(
+        state: &State<Txn::File>,
+        txn_id: TxnId,
+    ) -> Result<(), txn_lock::Error> {
         if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
             return Err(txn_lock::Error::Outdated);
         }
@@ -872,16 +772,14 @@ impl<Txn> BTree<Txn> {
     }
 
     fn load_store(
-        persistent_dir: DirLock<impl crate::CollectionFile>,
+        persistent_dir: DirLock<Txn::File>,
         schema: BTreeSchema,
-    ) -> PersistentStore {
-        PersistentStore::from_dir(persistent_dir, schema).expect("load persistent BTree store")
+    ) -> BTreeLock<BTreeSchema, ValueCollator, Txn::File> {
+        BTreeLock::load(schema, ValueCollator::default(), persistent_dir)
+            .expect("load persistent BTree store")
     }
 
-    async fn pending_delta_for_txn(&self, txn: &Txn) -> Result<Delta, txn_lock::Error>
-    where
-        Txn: crate::StorageContext,
-    {
+    async fn pending_delta_for_txn(&self, txn: &Txn) -> Result<Delta<Txn::File>, txn_lock::Error> {
         let txn_id = txn.id();
         let key_schema = {
             let state = self.state.write().expect("state write lock");
@@ -891,7 +789,7 @@ impl<Txn> BTree<Txn> {
                 return Ok(pending);
             }
 
-            state.persistent.key_schema()
+            state.persistent.schema().clone()
         };
 
         let txn_dir = txn
@@ -912,9 +810,10 @@ impl<Txn> BTree<Txn> {
         };
 
         let delta = Delta {
-            inserts: PersistentStore::from_dir(inserts, key_schema.clone())
+            inserts: BTreeLock::load(key_schema.clone(), ValueCollator::default(), inserts)
                 .map_err(background_error)?,
-            deletes: PersistentStore::from_dir(deletes, key_schema).map_err(background_error)?,
+            deletes: BTreeLock::load(key_schema, ValueCollator::default(), deletes)
+                .map_err(background_error)?,
         };
 
         let mut state = self.state.write().expect("state write lock");
@@ -937,7 +836,7 @@ impl<Txn> BTree<Txn> {
     }
 }
 
-impl<Txn> BTreeSlice<Txn> {
+impl<Txn: crate::StorageContext> BTreeSlice<Txn> {
     pub async fn count(&self, txn_id: TxnId) -> u64 {
         self.btree
             .count_in(txn_id, (self.lower.clone(), self.upper.clone()))
@@ -970,7 +869,7 @@ impl<Txn> BTreeSlice<Txn> {
     }
 }
 
-impl<Txn> Transact for BTree<Txn> {
+impl<Txn: crate::StorageContext> Transact for BTree<Txn> {
     async fn commit(&self, txn_id: TxnId) -> tc_error::TCResult<()> {
         BTree::commit(self, txn_id).map_err(Into::into)
     }

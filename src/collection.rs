@@ -11,14 +11,14 @@ use crate::table::{PersistentTable, Table};
 use crate::tensor::Tensor;
 
 #[derive(Debug)]
-pub struct BTreeView<Txn> {
+pub struct BTreeView<Txn: crate::StorageContext> {
     pub schema: Vec<BTreeColumnSchema>,
     pub btree: BTree<Txn>,
     pub bounds: (Bound<Value>, Bound<Value>),
     pub reverse: bool,
 }
 
-impl<Txn> Clone for BTreeView<Txn> {
+impl<Txn: crate::StorageContext> Clone for BTreeView<Txn> {
     fn clone(&self) -> Self {
         Self {
             schema: self.schema.clone(),
@@ -29,7 +29,7 @@ impl<Txn> Clone for BTreeView<Txn> {
     }
 }
 
-impl<Txn> BTreeView<Txn> {
+impl<Txn: crate::StorageContext> BTreeView<Txn> {
     pub fn new(schema: Vec<BTreeColumnSchema>, btree: BTree<Txn>) -> Self {
         Self {
             schema,
@@ -59,13 +59,13 @@ impl<Txn> BTreeView<Txn> {
 }
 
 #[derive(Debug)]
-pub enum Collection<Txn> {
+pub enum Collection<Txn: crate::StorageContext> {
     BTree(Box<BTreeView<Txn>>),
     Table(Box<Table<Txn>>),
     Tensor(Tensor),
 }
 
-impl<Txn: Clone> Clone for Collection<Txn> {
+impl<Txn: crate::StorageContext> Clone for Collection<Txn> {
     fn clone(&self) -> Self {
         match self {
             Self::BTree(btree) => Self::BTree(Box::new((**btree).clone())),
@@ -75,7 +75,7 @@ impl<Txn: Clone> Clone for Collection<Txn> {
     }
 }
 
-impl<Txn> From<PersistentTable<Txn>> for Collection<Txn> {
+impl<Txn: crate::StorageContext> From<PersistentTable<Txn>> for Collection<Txn> {
     fn from(table: PersistentTable<Txn>) -> Self {
         Self::Table(Box::new(table.into()))
     }
@@ -145,7 +145,7 @@ fn min_value(left: Value, right: Value) -> Value {
     }
 }
 
-impl<Txn> TryCastFrom<Collection<Txn>> for Tensor {
+impl<Txn: crate::StorageContext> TryCastFrom<Collection<Txn>> for Tensor {
     fn can_cast_from(collection: &Collection<Txn>) -> bool {
         matches!(collection, Collection::Tensor(_))
     }
@@ -158,13 +158,13 @@ impl<Txn> TryCastFrom<Collection<Txn>> for Tensor {
     }
 }
 
-impl<Txn> From<Table<Txn>> for Collection<Txn> {
+impl<Txn: crate::StorageContext> From<Table<Txn>> for Collection<Txn> {
     fn from(table: Table<Txn>) -> Self {
         Self::Table(Box::new(table))
     }
 }
 
-impl<Txn> Collection<Txn> {
+impl<Txn: crate::StorageContext> Collection<Txn> {
     pub fn as_btree(&self) -> Option<&BTree<Txn>> {
         match self {
             Self::BTree(btree) => Some(&btree.btree),
@@ -194,7 +194,7 @@ impl<Txn> Collection<Txn> {
     }
 }
 
-impl<Txn> Transact for Collection<Txn> {
+impl<Txn: crate::StorageContext> Transact for Collection<Txn> {
     async fn commit(&self, txn_id: TxnId) -> tc_error::TCResult<()> {
         match self {
             Self::BTree(btree) => Transact::commit(&btree.btree, txn_id).await?,
