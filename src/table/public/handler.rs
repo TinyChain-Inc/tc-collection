@@ -183,235 +183,317 @@ fn value_from_state<State: CollectionState>(state: State, expected: &str) -> TCR
         .try_cast_into(|state| bad_request!("expected {expected}, not {state:?}"))
 }
 
-#[tc_ir::async_trait]
-impl<State, Txn> tc_ir::Handler<State> for TableHandler<Txn>
+impl<'a, State, Txn> tc_ir::Handler<'a, State> for TableHandler<Txn>
 where
     State: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
 {
-    async fn get(&self, txn: &Txn, request: Scalar) -> TCResult<State> {
-        let txn_id = txn.id();
-        let table = self.table.clone();
-        let value: Value =
-            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
-        match KeyOrRange::try_from_value(table.schema(), value)? {
-            KeyOrRange::All => Ok(State::from(table)),
-            KeyOrRange::Range(range) => {
+    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, State>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, request| {
+            Box::pin(async move {
+                let txn_id = txn.id();
+                let table = self.table.clone();
+                let value: Value =
+                    request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+                match KeyOrRange::try_from_value(table.schema(), value)? {
+                    KeyOrRange::All => Ok(State::from(table)),
+                    KeyOrRange::Range(range) => {
+                        let slice = table.slice(range, &[], false)?;
+                        Ok(State::from(Table::from(slice)))
+                    }
+                    KeyOrRange::Key(key) => match table.read_row(txn_id, &key).await? {
+                        Some(row) => Ok(State::from(Value::Tuple(row.into_vec()))),
+                        None => Ok(State::from(Value::None)),
+                    },
+                }
+            })
+        }))
+    }
+
+    fn put<'txn>(self: Box<Self>) -> Option<tc_ir::PutHandler<'a, 'txn, State>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, key, value| {
+            Box::pin(async move {
+                let table = self.table.clone();
+                let key: Value =
+                    key.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+                let value = value.into_scalar()?;
+                match KeyOrRange::try_from_value(table.schema(), key)? {
+                    KeyOrRange::All => {
+                        table
+                            .update(txn, Range::default(), update_values(value)?)
+                            .await
+                    }
+                    KeyOrRange::Range(range) => {
+                        table.update(txn, range, update_values(value)?).await
+                    }
+                    KeyOrRange::Key(key) => {
+                        let value: Value =
+                            value.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+                        let values = match value {
+                            Value::Tuple(values) => values,
+                            value => vec![value],
+                        };
+                        table.upsert_row(txn, key, values).await
+                    }
+                }
+            })
+        }))
+    }
+
+    fn post<'txn>(self: Box<Self>) -> Option<tc_ir::PostHandler<'a, 'txn, State>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |_txn, request| {
+            Box::pin(async move {
+                let table = self.table.clone();
+                let value = Value::Tuple(
+                    request
+                        .into_iter()
+                        .map(|(id, state)| {
+                            value_from_state(state, "a Table bound").map(|value| {
+                                Value::Tuple(vec![Value::String(id.to_string()), value])
+                            })
+                        })
+                        .collect::<TCResult<_>>()?,
+                );
+                let range = cast_into_range(table.schema(), value)?;
                 let slice = table.slice(range, &[], false)?;
                 Ok(State::from(Table::from(slice)))
-            }
-            KeyOrRange::Key(key) => match table.read_row(txn_id, &key).await? {
-                Some(row) => Ok(State::from(Value::Tuple(row.into_vec()))),
-                None => Ok(State::from(Value::None)),
-            },
-        }
+            })
+        }))
     }
 
-    async fn put(&self, txn: &Txn, key: Scalar, value: State) -> TCResult<()> {
-        let table = self.table.clone();
-        let key: Value = key.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
-        let value = value.into_scalar()?;
-        match KeyOrRange::try_from_value(table.schema(), key)? {
-            KeyOrRange::All => {
-                table
-                    .update(txn, Range::default(), update_values(value)?)
-                    .await
-            }
-            KeyOrRange::Range(range) => table.update(txn, range, update_values(value)?).await,
-            KeyOrRange::Key(key) => {
+    fn delete<'txn>(self: Box<Self>) -> Option<tc_ir::DeleteHandler<'a, 'txn, State>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, request| {
+            Box::pin(async move {
+                let table = self.table.clone();
                 let value: Value =
-                    value.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
-                let values = match value {
-                    Value::Tuple(values) => values,
-                    value => vec![value],
+                    request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+                match KeyOrRange::try_from_value(table.schema(), value)? {
+                    KeyOrRange::All => table.truncate(txn, Range::default()).await,
+                    KeyOrRange::Key(key) => table.delete_row(txn, key).await,
+                    KeyOrRange::Range(range) => table.truncate(txn, range).await,
+                }
+            })
+        }))
+    }
+}
+
+impl<'a, State, Txn> tc_ir::Handler<'a, State> for ContainsHandler<Txn>
+where
+    State: CollectionState<Txn = Txn>,
+    Txn: crate::StorageContext,
+{
+    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, State>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, request| {
+            Box::pin(async move {
+                let txn_id = txn.id();
+                let table = self.table.clone();
+                let value: Value =
+                    request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+                let filled = match KeyOrRange::try_from_value(table.schema(), value)? {
+                    KeyOrRange::All => !table.is_empty(txn_id).await?,
+                    KeyOrRange::Key(key) => table.contains_row(txn_id, &key).await?,
+                    KeyOrRange::Range(range) => {
+                        let slice = table.slice(range, &[], false)?;
+                        !slice.is_empty(txn_id).await?
+                    }
                 };
-                table.upsert_row(txn, key, values).await
-            }
-        }
-    }
-
-    async fn post(&self, _txn: &Txn, request: Map<State>) -> TCResult<State> {
-        let table = self.table.clone();
-        let value = Value::Tuple(
-            request
-                .into_iter()
-                .map(|(id, state)| {
-                    value_from_state(state, "a Table bound")
-                        .map(|value| Value::Tuple(vec![Value::String(id.to_string()), value]))
-                })
-                .collect::<TCResult<_>>()?,
-        );
-        let range = cast_into_range(table.schema(), value)?;
-        let slice = table.slice(range, &[], false)?;
-        Ok(State::from(Table::from(slice)))
-    }
-
-    async fn delete(&self, txn: &Txn, request: Scalar) -> TCResult<()> {
-        let table = self.table.clone();
-        let value: Value =
-            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
-        match KeyOrRange::try_from_value(table.schema(), value)? {
-            KeyOrRange::All => table.truncate(txn, Range::default()).await,
-            KeyOrRange::Key(key) => table.delete_row(txn, key).await,
-            KeyOrRange::Range(range) => table.truncate(txn, range).await,
-        }
+                Ok(State::from(Value::from(filled)))
+            })
+        }))
     }
 }
 
-#[tc_ir::async_trait]
-impl<State, Txn> tc_ir::Handler<State> for ContainsHandler<Txn>
+impl<'a, State, Txn> tc_ir::Handler<'a, State> for CountHandler<Txn>
 where
     State: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
 {
-    async fn get(&self, txn: &Txn, request: Scalar) -> TCResult<State> {
-        let txn_id = txn.id();
-        let table = self.table.clone();
-        let value: Value =
-            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
-        let filled = match KeyOrRange::try_from_value(table.schema(), value)? {
-            KeyOrRange::All => !table.is_empty(txn_id).await?,
-            KeyOrRange::Key(key) => table.contains_row(txn_id, &key).await?,
-            KeyOrRange::Range(range) => {
-                let slice = table.slice(range, &[], false)?;
-                !slice.is_empty(txn_id).await?
-            }
-        };
-        Ok(State::from(Value::from(filled)))
+    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, State>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, request| {
+            Box::pin(async move {
+                let txn_id = txn.id();
+                let table = self.table.clone();
+                let value: Value =
+                    request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+                let count: u64 = match KeyOrRange::try_from_value(table.schema(), value)? {
+                    KeyOrRange::All => table.count(txn_id).await?,
+                    KeyOrRange::Key(key) => u64::from(table.contains_row(txn_id, &key).await?),
+                    KeyOrRange::Range(range) => {
+                        let slice = table.slice(range, &[], false)?;
+                        slice.count(txn_id).await?
+                    }
+                };
+                Ok(State::from(count))
+            })
+        }))
     }
 }
 
-#[tc_ir::async_trait]
-impl<State, Txn> tc_ir::Handler<State> for CountHandler<Txn>
+impl<'a, State, Txn> tc_ir::Handler<'a, State> for IsEmptyHandler<Txn>
 where
     State: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
 {
-    async fn get(&self, txn: &Txn, request: Scalar) -> TCResult<State> {
-        let txn_id = txn.id();
-        let table = self.table.clone();
-        let value: Value =
-            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
-        let count: u64 = match KeyOrRange::try_from_value(table.schema(), value)? {
-            KeyOrRange::All => table.count(txn_id).await?,
-            KeyOrRange::Key(key) => u64::from(table.contains_row(txn_id, &key).await?),
-            KeyOrRange::Range(range) => {
-                let slice = table.slice(range, &[], false)?;
-                slice.count(txn_id).await?
-            }
-        };
-        Ok(State::from(count))
+    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, State>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, request| {
+            Box::pin(async move {
+                let txn_id = txn.id();
+                let table = self.table.clone();
+                let value: Value =
+                    request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+                let empty = match KeyOrRange::try_from_value(table.schema(), value)? {
+                    KeyOrRange::All => table.is_empty(txn_id).await?,
+                    KeyOrRange::Key(key) => !table.contains_row(txn_id, &key).await?,
+                    KeyOrRange::Range(range) => {
+                        table.slice(range, &[], false)?.is_empty(txn_id).await?
+                    }
+                };
+                Ok(State::from(Value::from(empty)))
+            })
+        }))
     }
 }
 
-#[tc_ir::async_trait]
-impl<State, Txn> tc_ir::Handler<State> for IsEmptyHandler<Txn>
+impl<'a, State, Txn> tc_ir::Handler<'a, State> for InsertHandler<Txn>
 where
     State: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
 {
-    async fn get(&self, txn: &Txn, request: Scalar) -> TCResult<State> {
-        let txn_id = txn.id();
-        let table = self.table.clone();
-        let value: Value =
-            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
-        let empty = match KeyOrRange::try_from_value(table.schema(), value)? {
-            KeyOrRange::All => table.is_empty(txn_id).await?,
-            KeyOrRange::Key(key) => !table.contains_row(txn_id, &key).await?,
-            KeyOrRange::Range(range) => table.slice(range, &[], false)?.is_empty(txn_id).await?,
-        };
-        Ok(State::from(Value::from(empty)))
+    fn post<'txn>(self: Box<Self>) -> Option<tc_ir::PostHandler<'a, 'txn, State>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, mut request| {
+            Box::pin(async move {
+                let table = self.table.clone();
+                let key = value_from_state(request.require("key")?, "a Table key")?;
+                let key: Vec<Value> =
+                    key.try_cast_into(|value| bad_request!("expected a Table key, not {value:?}"))?;
+                let values = value_from_state(request.require("values")?, "Table values")?;
+                let values: Vec<Value> = values
+                    .try_cast_into(|value| bad_request!("expected Table values, not {value:?}"))?;
+                table.insert_row(txn, key, values).await?;
+                Ok(State::from(Value::None))
+            })
+        }))
     }
 }
 
-#[tc_ir::async_trait]
-impl<State, Txn> tc_ir::Handler<State> for InsertHandler<Txn>
+impl<'a, State, Txn> tc_ir::Handler<'a, State> for LimitHandler<Txn>
 where
     State: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
 {
-    async fn post(&self, txn: &Txn, mut request: Map<State>) -> TCResult<State> {
-        let table = self.table.clone();
-        let key = value_from_state(request.require("key")?, "a Table key")?;
-        let key: Vec<Value> =
-            key.try_cast_into(|value| bad_request!("expected a Table key, not {value:?}"))?;
-        let values = value_from_state(request.require("values")?, "Table values")?;
-        let values: Vec<Value> =
-            values.try_cast_into(|value| bad_request!("expected Table values, not {value:?}"))?;
-        table.insert_row(txn, key, values).await?;
-        Ok(State::from(Value::None))
+    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, State>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |_txn, request| {
+            Box::pin(async move {
+                let table = self.table.clone();
+                let value: Value =
+                    request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+                let Value::Number(limit) = value else {
+                    return Err(bad_request!(
+                        "limit must be a positive integer, not {value:?}"
+                    ));
+                };
+                Ok(State::from(Table::from(
+                    table.limit(u64::cast_from(limit))?,
+                )))
+            })
+        }))
     }
 }
 
-#[tc_ir::async_trait]
-impl<State, Txn> tc_ir::Handler<State> for LimitHandler<Txn>
+impl<'a, State, Txn> tc_ir::Handler<'a, State> for OrderHandler<Txn>
 where
     State: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
 {
-    async fn get(&self, _txn: &Txn, request: Scalar) -> TCResult<State> {
-        let table = self.table.clone();
-        let value: Value =
-            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
-        let Value::Number(limit) = value else {
-            return Err(bad_request!(
-                "limit must be a positive integer, not {value:?}"
-            ));
-        };
-        Ok(State::from(Table::from(
-            table.limit(u64::cast_from(limit))?,
-        )))
+    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, State>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |_txn, request| {
+            Box::pin(async move {
+                let table = self.table.clone();
+                let value: Value =
+                    request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+                let (columns, reverse): (Vec<Id>, bool) = if value.matches::<(Vec<Id>, bool)>() {
+                    value.try_cast_into(|v| bad_request!("invalid order request: {v:?}"))?
+                } else {
+                    let columns =
+                        value.try_cast_into(|v| bad_request!("invalid column list: {v:?}"))?;
+                    (columns, false)
+                };
+                Ok(State::from(Table::from(table.order_by(&columns, reverse)?)))
+            })
+        }))
     }
 }
 
-#[tc_ir::async_trait]
-impl<State, Txn> tc_ir::Handler<State> for OrderHandler<Txn>
+impl<'a, State, Txn> tc_ir::Handler<'a, State> for SelectHandler<Txn>
 where
     State: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
 {
-    async fn get(&self, _txn: &Txn, request: Scalar) -> TCResult<State> {
-        let table = self.table.clone();
-        let value: Value =
-            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
-        let (columns, reverse): (Vec<Id>, bool) = if value.matches::<(Vec<Id>, bool)>() {
-            value.try_cast_into(|v| bad_request!("invalid order request: {v:?}"))?
-        } else {
-            let columns = value.try_cast_into(|v| bad_request!("invalid column list: {v:?}"))?;
-            (columns, false)
-        };
-        Ok(State::from(Table::from(table.order_by(&columns, reverse)?)))
+    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, State>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |_txn, request| {
+            Box::pin(async move {
+                let table = self.table.clone();
+                let value: Value =
+                    request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+                let columns: Vec<Id> =
+                    value.try_cast_into(|v| bad_request!("invalid column list: {v:?}"))?;
+                Ok(State::from(Table::from(table.select(&columns)?)))
+            })
+        }))
     }
 }
 
-#[tc_ir::async_trait]
-impl<State, Txn> tc_ir::Handler<State> for SelectHandler<Txn>
+impl<'a, State, Txn> tc_ir::Handler<'a, State> for SchemaHandler<Txn>
 where
     State: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
 {
-    async fn get(&self, _txn: &Txn, request: Scalar) -> TCResult<State> {
-        let table = self.table.clone();
-        let value: Value =
-            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
-        let columns: Vec<Id> =
-            value.try_cast_into(|v| bad_request!("invalid column list: {v:?}"))?;
-        Ok(State::from(Table::from(table.select(&columns)?)))
-    }
-}
-
-#[tc_ir::async_trait]
-impl<State, Txn> tc_ir::Handler<State> for SchemaHandler<Txn>
-where
-    State: CollectionState<Txn = Txn>,
-    Txn: crate::StorageContext,
-{
-    async fn get(&self, _txn: &Txn, request: Scalar) -> TCResult<State> {
-        let value: Value =
-            request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
-        if value != Value::None {
-            return Err(bad_request!("this route takes no parameters"));
-        }
-        Ok(State::from((self.schema_fn)(&self.table)))
+    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, State>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |_txn, request| {
+            Box::pin(async move {
+                let value: Value =
+                    request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+                if value != Value::None {
+                    return Err(bad_request!("this route takes no parameters"));
+                }
+                Ok(State::from((self.schema_fn)(&self.table)))
+            })
+        }))
     }
 }

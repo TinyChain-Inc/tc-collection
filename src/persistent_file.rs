@@ -1,45 +1,66 @@
-//! Persistent file adapter for on-disk collection node loading/saving.
-//!
-//! This type wraps `b_tree::Node` for use with `freqfs` and is shared by
-//! BTree, Table, and other collection types — it is not specific to any
-//! one collection variant.
-
-use std::fs::Metadata;
+//! The collection-owned file contract used by persistent BTree and Table nodes.
 
 use freqfs::{FileLoad, FileSave};
+use get_size::GetSize;
 use safecast::AsType;
 use tc_value::Value;
 
-type NodeFile = b_tree::Node<Vec<Vec<Value>>>;
+/// The only file value owned by `tc-collection`.
+pub type CollectionNode = b_tree::Node<Vec<Vec<Value>>>;
 
-#[derive(Clone)]
-pub enum PersistentFile {
-    Node(NodeFile),
+/// A caller-owned file composition capable of containing collection nodes.
+pub trait CollectionFile:
+    Clone
+    + FileLoad
+    + FileSave
+    + GetSize
+    + AsType<CollectionNode>
+    + From<CollectionNode>
+    + Send
+    + Sync
+    + 'static
+{
 }
 
-impl From<NodeFile> for PersistentFile {
-    fn from(node: NodeFile) -> Self {
+impl<T> CollectionFile for T where
+    T: Clone
+        + FileLoad
+        + FileSave
+        + GetSize
+        + AsType<CollectionNode>
+        + From<CollectionNode>
+        + Send
+        + Sync
+        + 'static
+{
+}
+
+/// Collection-only file composition used by standalone callers and tests.
+#[derive(Clone)]
+pub enum PersistentFile {
+    Node(CollectionNode),
+}
+
+impl From<CollectionNode> for PersistentFile {
+    fn from(node: CollectionNode) -> Self {
         Self::Node(node)
     }
 }
 
-impl AsType<NodeFile> for PersistentFile {
-    fn as_type(&self) -> Option<&NodeFile> {
-        match self {
-            Self::Node(node) => Some(node),
-        }
+impl AsType<CollectionNode> for PersistentFile {
+    fn as_type(&self) -> Option<&CollectionNode> {
+        let Self::Node(node) = self;
+        Some(node)
     }
 
-    fn as_type_mut(&mut self) -> Option<&mut NodeFile> {
-        match self {
-            Self::Node(node) => Some(node),
-        }
+    fn as_type_mut(&mut self) -> Option<&mut CollectionNode> {
+        let Self::Node(node) = self;
+        Some(node)
     }
 
-    fn into_type(self) -> Option<NodeFile> {
-        match self {
-            Self::Node(node) => Some(node),
-        }
+    fn into_type(self) -> Option<CollectionNode> {
+        let Self::Node(node) = self;
+        Some(node)
     }
 }
 
@@ -47,16 +68,24 @@ impl FileLoad for PersistentFile {
     async fn load(
         path: &std::path::Path,
         file: tokio::fs::File,
-        metadata: Metadata,
+        metadata: std::fs::Metadata,
     ) -> std::io::Result<Self> {
-        NodeFile::load(path, file, metadata).await.map(Self::Node)
+        CollectionNode::load(path, file, metadata)
+            .await
+            .map(Self::Node)
     }
 }
 
 impl FileSave for PersistentFile {
     async fn save(&self, file: &mut tokio::fs::File) -> std::io::Result<u64> {
-        match self {
-            Self::Node(node) => node.save(file).await,
-        }
+        let Self::Node(node) = self;
+        node.save(file).await
+    }
+}
+
+impl GetSize for PersistentFile {
+    fn get_size(&self) -> usize {
+        let Self::Node(node) = self;
+        node.get_size()
     }
 }

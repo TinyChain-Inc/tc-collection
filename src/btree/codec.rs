@@ -4,10 +4,10 @@ use destream::{
 };
 use number_general::Number;
 use safecast::TryCastFrom;
-use tc_ir::NativeClass;
+use tc_value::class::NativeClass;
 use tc_value::{Value, ValueType};
 
-use super::{BTree, BTreeSchema, PersistentFile};
+use super::{BTree, BTreeSchema};
 
 #[derive(Clone, Debug)]
 pub struct BTreeColumnSchema {
@@ -175,12 +175,12 @@ impl<Txn: crate::StorageContext> de::FromStream for DecodedBTreePayload<Txn> {
             de::Error::custom(decode_err("failed to allocate BTree literal", err))
         })?;
 
-        struct PayloadVisitor<Txn> {
-            persistent_dir: freqfs::DirLock<PersistentFile>,
+        struct PayloadVisitor<Txn: crate::StorageContext> {
+            persistent_dir: freqfs::DirLock<Txn::File>,
             txn: std::marker::PhantomData<fn() -> Txn>,
         }
 
-        impl<Txn> de::Visitor for PayloadVisitor<Txn> {
+        impl<Txn: crate::StorageContext> de::Visitor for PayloadVisitor<Txn> {
             type Value = DecodedBTreePayload<Txn>;
 
             fn expecting() -> &'static str {
@@ -199,7 +199,7 @@ impl<Txn: crate::StorageContext> de::FromStream for DecodedBTreePayload<Txn> {
                 let btree_schema = BTreeSchema::try_cast_from(schema.clone(), |schema| {
                     de::Error::custom(format!("invalid BTree schema: {schema:?}"))
                 })?;
-                let btree = BTree::literal(self.persistent_dir, btree_schema);
+                let btree = BTree::with_schema(self.persistent_dir, btree_schema);
                 seq.next_element::<BTreeRows<Txn>>(BTreeRowsContext {
                     btree: btree.clone(),
                 })

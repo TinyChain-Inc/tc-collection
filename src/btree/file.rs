@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 use b_tree::{BTreeLock, Range, Schema};
@@ -10,12 +11,9 @@ use collate::{Collate, try_diff, try_merge};
 use freqfs::DirLock;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-use tc_error::{TCError, TCResult};
+use tc_error::TCError;
 use tc_ir::{Transact, TxnId};
 use tc_value::{Value, ValueCollator, ValueType};
-
-use super::PersistentFile;
-use crate::CollectionDir;
 
 const UNARY_KEY_ARITY: usize = 1;
 
@@ -181,19 +179,89 @@ impl Schema for BTreeSchema {
     }
 }
 
-#[derive(Clone)]
-struct PersistentStore {
-    tree: BTreeLock<BTreeSchema, ValueCollator, PersistentFile>,
+trait Store: Send + Sync {
+    fn key_schema(&self) -> BTreeSchema;
+    fn keys(
+        &self,
+        bounds: (Bound<Value>, Bound<Value>),
+        reverse: bool,
+    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<b_tree::Keys<Value>>> + Send + '_>>;
+    fn contains<'a>(
+        &'a self,
+        key: &'a [Value],
+    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<bool>> + Send + 'a>>;
+    fn insert(
+        &self,
+        key: Vec<Value>,
+    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + '_>>;
+    fn delete<'a>(
+        &'a self,
+        key: &'a [Value],
+    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>>;
 }
 
-impl PersistentStore {
+struct FileStore<F> {
+    tree: BTreeLock<BTreeSchema, ValueCollator, F>,
+}
+
+impl<F: crate::CollectionFile> Store for FileStore<F> {
     fn key_schema(&self) -> BTreeSchema {
         self.tree.schema().clone()
     }
 
-    fn from_dir(dir: DirLock<PersistentFile>, schema: BTreeSchema) -> std::io::Result<Self> {
-        let tree = BTreeLock::load(schema, ValueCollator::default(), dir)?;
-        Ok(Self { tree })
+    fn keys(
+        &self,
+        bounds: (Bound<Value>, Bound<Value>),
+        reverse: bool,
+    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<b_tree::Keys<Value>>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let view = self.tree.read().await;
+            let range = Range::with_bounds(Vec::<Value>::new(), bounds);
+            if reverse {
+                view.keys_rev(range).await
+            } else {
+                view.keys(range).await
+            }
+        })
+    }
+
+    fn contains<'a>(
+        &'a self,
+        key: &'a [Value],
+    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<bool>> + Send + 'a>> {
+        Box::pin(async move { self.tree.read().await.contains(key).await })
+    }
+
+    fn insert(
+        &self,
+        key: Vec<Value>,
+    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + '_>> {
+        Box::pin(async move { self.tree.write().await.insert(key).await.map(drop) })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        key: &'a [Value],
+    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
+        Box::pin(async move { self.tree.write().await.delete(key).await.map(drop) })
+    }
+}
+
+#[derive(Clone)]
+struct PersistentStore(Arc<dyn Store>);
+
+impl PersistentStore {
+    fn key_schema(&self) -> BTreeSchema {
+        self.0.key_schema()
+    }
+
+    fn from_dir<F: crate::CollectionFile>(
+        dir: DirLock<F>,
+        schema: BTreeSchema,
+    ) -> std::io::Result<Self> {
+        BTreeLock::load(schema, ValueCollator::default(), dir)
+            .map(|tree| Self(Arc::new(FileStore { tree })))
     }
 
     async fn key_stream_in(
@@ -201,52 +269,34 @@ impl PersistentStore {
         bounds: (Bound<Value>, Bound<Value>),
         reverse: bool,
     ) -> std::io::Result<b_tree::Keys<Value>> {
-        let view = self.tree.read().await;
-        let range = Range::with_bounds(Vec::<Value>::new(), bounds);
-
-        if reverse {
-            view.keys_rev(range).await
-        } else {
-            view.keys(range).await
-        }
+        self.0.keys(bounds, reverse).await
     }
 
     async fn contains_key(&self, key: &[Value]) -> std::io::Result<bool> {
-        let view = self.tree.read().await;
-        view.contains(key).await
+        self.0.contains(key).await
     }
-
     async fn insert_key(&self, key: Vec<Value>) -> std::io::Result<()> {
-        let mut view = self.tree.write().await;
-        let _ = view.insert(key).await?;
-        Ok(())
+        self.0.insert(key).await
     }
-
     async fn delete_key(&self, key: &[Value]) -> std::io::Result<()> {
-        let mut view = self.tree.write().await;
-        let _ = view.delete(key).await?;
-        Ok(())
+        self.0.delete(key).await
     }
 
     async fn apply_delta(&self, delta: &Delta) -> std::io::Result<()> {
-        let mut view = self.tree.write().await;
-
-        {
-            let insert_view = delta.inserts.tree.read().await;
-            let mut stream = insert_view.keys(Range::<Value>::default()).await?;
-            while let Some(key) = stream.try_next().await? {
-                let _ = view.insert(key.to_vec()).await?;
-            }
+        let mut stream = delta
+            .inserts
+            .key_stream_in((Bound::Unbounded, Bound::Unbounded), false)
+            .await?;
+        while let Some(key) = stream.try_next().await? {
+            self.insert_key(key.to_vec()).await?;
         }
-
-        {
-            let delete_view = delta.deletes.tree.read().await;
-            let mut stream = delete_view.keys(Range::<Value>::default()).await?;
-            while let Some(key) = stream.try_next().await? {
-                let _ = view.delete(&key).await?;
-            }
+        let mut stream = delta
+            .deletes
+            .key_stream_in((Bound::Unbounded, Bound::Unbounded), false)
+            .await?;
+        while let Some(key) = stream.try_next().await? {
+            self.delete_key(&key).await?;
         }
-
         Ok(())
     }
 }
@@ -287,7 +337,6 @@ struct VisibleSnapshot {
 
 pub struct BTree<Txn> {
     state: Arc<RwLock<State>>,
-    dir: CollectionDir,
     semaphore: txn_lock::semaphore::Semaphore<
         TxnId,
         b_tree::Collator<ValueCollator>,
@@ -300,7 +349,6 @@ impl<Txn> Clone for BTree<Txn> {
     fn clone(&self) -> Self {
         Self {
             state: self.state.clone(),
-            dir: self.dir.clone(),
             semaphore: self.semaphore.clone(),
             txn: PhantomData,
         }
@@ -328,11 +376,14 @@ impl<Txn> fmt::Debug for BTree<Txn> {
 
 impl<Txn> BTree<Txn> {
     /// Construct a transactional BTree with default unary-key schema.
-    pub fn new(persistent_dir: DirLock<PersistentFile>) -> Self {
+    pub fn new<F: crate::CollectionFile>(persistent_dir: DirLock<F>) -> Self {
         Self::with_schema(persistent_dir, BTreeSchema::default())
     }
 
-    pub fn with_schema(persistent_dir: DirLock<PersistentFile>, schema: BTreeSchema) -> Self {
+    pub fn with_schema<F: crate::CollectionFile>(
+        persistent_dir: DirLock<F>,
+        schema: BTreeSchema,
+    ) -> Self {
         let persistent = Self::load_store(persistent_dir.clone(), schema);
 
         let state = State {
@@ -344,40 +395,11 @@ impl<Txn> BTree<Txn> {
 
         Self {
             state: Arc::new(RwLock::new(state)),
-            dir: CollectionDir::Transaction,
             semaphore: txn_lock::semaphore::Semaphore::new(b_tree::Collator::new(
                 ValueCollator::default(),
             )),
             txn: PhantomData,
         }
-    }
-
-    pub fn literal(persistent_dir: DirLock<PersistentFile>, schema: BTreeSchema) -> Self {
-        let mut btree = Self::with_schema(persistent_dir.clone(), schema);
-        btree.dir = CollectionDir::literal(persistent_dir);
-        btree
-    }
-
-    pub fn named(
-        uri: &pathlink::Link,
-        persistent_dir: DirLock<PersistentFile>,
-        schema: BTreeSchema,
-    ) -> TCResult<Self> {
-        let dir = CollectionDir::named(uri, "btree")?;
-        let persistent = Self::load_store(persistent_dir, schema);
-        Ok(Self {
-            state: Arc::new(RwLock::new(State {
-                persistent,
-                committed: BTreeMap::new(),
-                pending: BTreeMap::new(),
-                finalized: None,
-            })),
-            dir,
-            semaphore: txn_lock::semaphore::Semaphore::new(b_tree::Collator::new(
-                ValueCollator::default(),
-            )),
-            txn: PhantomData,
-        })
     }
 
     pub fn finalized(&self) -> Option<TxnId> {
@@ -849,7 +871,10 @@ impl<Txn> BTree<Txn> {
         Ok(())
     }
 
-    fn load_store(persistent_dir: DirLock<PersistentFile>, schema: BTreeSchema) -> PersistentStore {
+    fn load_store(
+        persistent_dir: DirLock<impl crate::CollectionFile>,
+        schema: BTreeSchema,
+    ) -> PersistentStore {
         PersistentStore::from_dir(persistent_dir, schema).expect("load persistent BTree store")
     }
 
@@ -869,7 +894,11 @@ impl<Txn> BTree<Txn> {
             state.persistent.key_schema()
         };
 
-        let txn_dir = self.dir.resolve(txn).await.map_err(background_error)?;
+        let txn_dir = txn
+            .subcontext_unique()
+            .context()
+            .await
+            .map_err(background_error)?;
 
         let (inserts, deletes) = {
             let mut txn_dir = txn_dir.write().await;
@@ -896,7 +925,6 @@ impl<Txn> BTree<Txn> {
         }
 
         state.pending.insert(txn_id, delta.clone());
-
         Ok(delta)
     }
 

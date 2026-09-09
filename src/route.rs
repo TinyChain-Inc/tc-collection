@@ -1,7 +1,8 @@
 use pathlink::Link;
 use tc_error::TCResult;
-use tc_ir::{Map, NativeClass, Scalar};
+use tc_ir::{Map, Scalar};
 use tc_value::Value;
+use tc_value::class::NativeClass;
 
 use crate::Collection;
 use crate::class::CollectionType;
@@ -37,7 +38,10 @@ where
     S: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
 {
-    fn route(&self, path: &[pathlink::PathSegment]) -> Option<Box<dyn tc_ir::Handler<S> + '_>> {
+    fn route<'a>(
+        &'a self,
+        path: &[pathlink::PathSegment],
+    ) -> Option<Box<dyn tc_ir::Handler<'a, S> + 'a>> {
         match self {
             Self::BTree(view) => tc_ir::Route::route(view.as_ref(), path),
             Self::Table(table) => tc_ir::Route::route(table.as_ref(), path),
@@ -210,6 +214,7 @@ mod tests {
     }
 
     impl crate::StorageContext for TestTxn {
+        type File = crate::PersistentFile;
         fn context(
             &self,
         ) -> impl std::future::Future<Output = TCResult<freqfs::DirLock<crate::PersistentFile>>> + Send
@@ -282,11 +287,9 @@ mod tests {
 
         let route = tc_ir::Route::<TestState>::route(&tensor, &[segment("reshape")])
             .expect("reshape route");
-        let err = route
-            .get(
-                &TestTxn::new(),
-                Scalar::Value(Value::String("invalid".into())),
-            )
+        let get = route.get().expect("GET handler");
+        let txn = TestTxn::new();
+        let err = get(&txn, Scalar::Value(Value::String("invalid".into())))
             .await
             .expect_err("invalid reshape request");
         assert!(!err.to_string().is_empty());
@@ -299,11 +302,9 @@ mod tests {
 
         let route = tc_ir::Route::<TestState>::route(&view, &[segment("contains")])
             .expect("contains route");
-        let err = route
-            .get(
-                &TestTxn::new(),
-                Scalar::Value(Value::String("not a BTree row".into())),
-            )
+        let get = route.get().expect("GET handler");
+        let txn = TestTxn::new();
+        let err = get(&txn, Scalar::Value(Value::String("not a BTree row".into())))
             .await
             .expect_err("invalid BTree row");
         assert!(!err.to_string().is_empty());

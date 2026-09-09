@@ -50,12 +50,7 @@ impl<Txn> TableSource<Txn> {
                 .await
                 .map_err(tc_error::TCError::from),
             Self::Local(table) => {
-                let rows = table
-                    .clone()
-                    .into_read()
-                    .await
-                    .rows(range, &order, reverse, None)
-                    .await?;
+                let rows = table.row_stream(range, &order, reverse).await?;
                 Ok(Rows::local(rows))
             }
         }
@@ -64,24 +59,14 @@ impl<Txn> TableSource<Txn> {
     async fn count(&self, txn_id: TxnId, range: Range<Id, Value>) -> tc_error::TCResult<u64> {
         match self {
             Self::File(table) => Ok(table.count_in(txn_id, range).await),
-            Self::Local(table) => table
-                .read()
-                .await
-                .count(range)
-                .await
-                .map_err(tc_error::TCError::from),
+            Self::Local(table) => table.count(range).await.map_err(tc_error::TCError::from),
         }
     }
 
     async fn is_empty(&self, txn_id: TxnId, range: Range<Id, Value>) -> tc_error::TCResult<bool> {
         match self {
             Self::File(table) => Ok(table.is_empty_in(txn_id, range).await),
-            Self::Local(table) => table
-                .read()
-                .await
-                .is_empty(range)
-                .await
-                .map_err(tc_error::TCError::from),
+            Self::Local(table) => table.is_empty(range).await.map_err(tc_error::TCError::from),
         }
     }
 }
@@ -320,38 +305,33 @@ async fn rewrite_local<Txn: crate::StorageContext>(
     .map_err(tc_error::TCError::from)?;
     let key_len = schema.key().len();
 
-    let mut rows = table
-        .clone()
-        .into_read()
-        .await
-        .rows(range, &[], false, None)
-        .await
-        .map_err(tc_error::TCError::from)?;
-    while let Some(row) = rows.try_next().await.map_err(tc_error::TCError::from)? {
-        let mut row = row.into_vec();
-        if let Some(updates) = updates.as_ref() {
-            for (i, name) in schema.values().iter().enumerate() {
-                if let Some(value) = updates.get(name) {
-                    row[key_len + i] = value.clone();
+    {
+        let mut rows = table
+            .row_stream(range, &[], false)
+            .await
+            .map_err(tc_error::TCError::from)?;
+        while let Some(row) = rows.try_next().await.map_err(tc_error::TCError::from)? {
+            let mut row = row.into_vec();
+            if let Some(updates) = updates.as_ref() {
+                for (i, name) in schema.values().iter().enumerate() {
+                    if let Some(value) = updates.get(name) {
+                        row[key_len + i] = value.clone();
+                    }
                 }
             }
-        }
 
-        let values = row.split_off(key_len);
-        temp.write().await.upsert(row, values).await?;
+            let values = row.split_off(key_len);
+            temp.upsert(row, values).await?;
+        }
     }
-    drop(rows);
 
     let mut staged = temp
-        .into_read()
-        .await
-        .into_rows()
+        .row_stream(Range::default(), &[], false)
         .await
         .map_err(tc_error::TCError::from)?;
     while let Some(row) = staged.try_next().await.map_err(tc_error::TCError::from)? {
         let mut row = row.into_vec();
         let values = row.split_off(key_len);
-        let mut table = table.write().await;
         table
             .delete_row(&row)
             .await

@@ -35,7 +35,6 @@ impl de::FromStream for Rows {
             ) -> Result<Self::Value, A::Error> {
                 let schema = self.table.schema().clone();
                 let key_len = schema.key().len();
-                let mut table = self.table.write().await;
                 while let Some(row) = seq.next_element::<Value>(()).await? {
                     let Value::Tuple(row) = row else {
                         return Err(de::Error::custom("table row must be a tuple"));
@@ -47,7 +46,7 @@ impl de::FromStream for Rows {
                             schema.column_count()
                         )));
                     }
-                    table
+                    self.table
                         .upsert(row[..key_len].to_vec(), row[key_len..].to_vec())
                         .await
                         .map_err(de::Error::custom)?;
@@ -70,12 +69,12 @@ impl<Txn: crate::StorageContext> de::FromStream for DecodedTablePayload<Txn> {
         let txn = txn.subcontext_unique();
         let dir = txn.context().await.map_err(de::Error::custom)?;
 
-        struct Visitor<Txn> {
-            dir: freqfs::DirLock<crate::PersistentFile>,
+        struct Visitor<Txn: crate::StorageContext> {
+            dir: freqfs::DirLock<Txn::File>,
             txn: std::marker::PhantomData<fn() -> Txn>,
         }
 
-        impl<Txn> de::Visitor for Visitor<Txn> {
+        impl<Txn: crate::StorageContext> de::Visitor for Visitor<Txn> {
             type Value = DecodedTablePayload<Txn>;
 
             fn expecting() -> &'static str {

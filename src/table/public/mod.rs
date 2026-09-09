@@ -22,7 +22,10 @@ where
     State: crate::CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
 {
-    fn route(&self, path: &[pathlink::PathSegment]) -> Option<Box<dyn tc_ir::Handler<State> + '_>> {
+    fn route<'a>(
+        &'a self,
+        path: &[pathlink::PathSegment],
+    ) -> Option<Box<dyn tc_ir::Handler<'a, State> + 'a>> {
         route_owned(self.clone(), path)
     }
 }
@@ -30,12 +33,12 @@ where
 fn route_owned<'a, State, Txn>(
     table: Table<Txn>,
     path: &[pathlink::PathSegment],
-) -> Option<Box<dyn tc_ir::Handler<State> + 'a>>
+) -> Option<Box<dyn tc_ir::Handler<'a, State> + 'a>>
 where
     State: crate::CollectionState<Txn = Txn>,
     Txn: crate::StorageContext + 'a,
 {
-    let handler: Box<dyn tc_ir::Handler<State> + 'a> = if path.is_empty() {
+    let handler: Box<dyn tc_ir::Handler<'a, State> + 'a> = if path.is_empty() {
         Box::new(TableHandler::from(table.clone()))
     } else if path.len() == 1 {
         match path[0].as_str() {
@@ -71,7 +74,7 @@ where
 pub fn route<'a, State: crate::CollectionState>(
     table: &'a (impl Clone + Into<Table<State::Txn>>),
     path: &[pathlink::PathSegment],
-) -> Option<Box<dyn tc_ir::Handler<State> + 'a>> {
+) -> Option<Box<dyn tc_ir::Handler<'a, State> + 'a>> {
     route_owned(table.clone().into(), path)
 }
 

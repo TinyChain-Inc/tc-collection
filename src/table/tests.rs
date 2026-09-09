@@ -54,6 +54,7 @@ impl Transaction for TestTxn {
 }
 
 impl crate::StorageContext for TestTxn {
+    type File = PersistentFile;
     fn context(
         &self,
     ) -> impl std::future::Future<Output = tc_error::TCResult<freqfs::DirLock<PersistentFile>>> + Send

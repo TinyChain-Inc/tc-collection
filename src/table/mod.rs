@@ -13,7 +13,7 @@ mod stream;
 mod view;
 
 pub use codec::DecodedTablePayload;
-pub use file::PersistentTable;
+pub use file::{LocalTable, PersistentTable};
 pub use schema::{Column, TableIndexSchema, TableSchema};
 pub use stream::Rows;
 pub use view::{Limited, Selection, TableSlice};
@@ -23,14 +23,7 @@ use futures::{StreamExt, stream::BoxStream};
 use tc_error::{TCError, TCResult};
 use tc_ir::TxnId;
 use tc_ir::{Id, Map};
-use tc_value::{Value, ValueCollator};
-
-/// A transaction-local table backed directly by `b-table`.
-///
-/// Its directory is owned by the enclosing transaction workspace, but its
-/// reads and writes do not participate in the persistent transaction protocol.
-pub type LocalTable =
-    b_table::TableLock<TableSchema, TableIndexSchema, ValueCollator, crate::PersistentFile>;
+use tc_value::Value;
 
 /// A relational database table, or a view of one.
 ///
@@ -104,7 +97,7 @@ impl<Txn> Table<Txn> {
                 .rows(txn_id, Range::default(), Vec::new(), false)
                 .await?
                 .boxed(),
-            Self::Local(table) => table.clone().into_read().await.into_rows().await?,
+            Self::Local(table) => table.row_stream(Range::default(), &[], false).await?,
             Self::Slice(table) => table.rows(txn_id).await?.boxed(),
             Self::Limited(table) => table.rows(txn_id).await?.boxed(),
             Self::Selection(table) => table.rows(txn_id).await?.boxed(),
@@ -154,7 +147,7 @@ impl<Txn> Table<Txn> {
     ) -> TCResult<Option<Row<Value>>> {
         match self {
             Self::File(table) => Ok(table.read_row(txn_id, key).await),
-            Self::Local(table) => table.read().await.get_row(key).await.map_err(TCError::from),
+            Self::Local(table) => table.get_row(key).await.map_err(TCError::from),
             _ => Err(TCError::bad_request(
                 "cannot read a row from this Table view",
             )),
@@ -165,8 +158,6 @@ impl<Txn> Table<Txn> {
         match self {
             Self::File(table) => Ok(table.contains_row(txn_id, key).await),
             Self::Local(table) => table
-                .read()
-                .await
                 .get_row(key)
                 .await
                 .map(|row| row.is_some())
@@ -180,12 +171,7 @@ impl<Txn> Table<Txn> {
     pub(crate) async fn count(&self, txn_id: TxnId) -> TCResult<u64> {
         match self {
             Self::File(table) => Ok(table.count(txn_id).await),
-            Self::Local(table) => table
-                .read()
-                .await
-                .count(Range::default())
-                .await
-                .map_err(TCError::from),
+            Self::Local(table) => table.count(Range::default()).await.map_err(TCError::from),
             Self::Slice(table) => table.count(txn_id).await,
             Self::Limited(table) => table.count(txn_id).await,
             Self::Selection(table) => table.count(txn_id).await,
@@ -196,8 +182,6 @@ impl<Txn> Table<Txn> {
         match self {
             Self::File(table) => Ok(table.is_empty(txn_id).await),
             Self::Local(table) => table
-                .read()
-                .await
                 .is_empty(Range::default())
                 .await
                 .map_err(TCError::from),
@@ -222,9 +206,8 @@ impl<Txn> Table<Txn> {
                 .await
                 .map_err(TCError::from),
             Self::Local(table) => {
-                let mut table = table.write().await;
                 table.delete_row(&key).await.map_err(TCError::from)?;
-                table.upsert(key, values).await.map(|_| ())
+                table.upsert(key, values).await.map_err(TCError::from)
             }
             _ => Err(TCError::bad_request("cannot mutate a Table view")),
         }
@@ -242,13 +225,12 @@ impl<Txn> Table<Txn> {
         match self {
             Self::File(table) => table.insert_row(txn, key, values).await,
             Self::Local(table) => {
-                let mut table = table.write().await;
                 if table.get_row(&key).await.map_err(TCError::from)?.is_some() {
                     return Err(TCError::bad_request(format!(
                         "cannot insert Table row: key {key:?} already exists"
                     )));
                 }
-                table.upsert(key, values).await.map(|_| ())
+                table.upsert(key, values).await.map_err(TCError::from)
             }
             _ => Err(TCError::bad_request("cannot insert into a Table view")),
         }
@@ -261,8 +243,6 @@ impl<Txn> Table<Txn> {
         match self {
             Self::File(table) => table.delete_row(txn, key).await.map_err(TCError::from),
             Self::Local(table) => table
-                .write()
-                .await
                 .delete_row(&key)
                 .await
                 .map(|_| ())

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 use b_table::{Range, Row, TableLock};
@@ -15,7 +16,6 @@ use super::schema::{TableIndexSchema, TableSchema};
 use super::stream::Rows;
 use super::view::{Limited, Selection, TableSlice};
 use crate::btree::StorageConfig;
-use crate::{CollectionDir, PersistentFile};
 
 fn background_error(err: impl fmt::Display) -> txn_lock::Error {
     txn_lock::Error::Background(err.to_string())
@@ -85,77 +85,183 @@ impl Collate for RowCollator {
     }
 }
 
-type TableVersion = TableLock<TableSchema, TableIndexSchema, ValueCollator, PersistentFile>;
+type RowsResult = std::io::Result<BoxStream<'static, Result<Row<Value>, std::io::Error>>>;
+type GetRowFuture<'a> =
+    Pin<Box<dyn std::future::Future<Output = std::io::Result<Option<Row<Value>>>> + Send + 'a>>;
 
-#[derive(Clone)]
-struct TableStore {
-    table: TableVersion,
+trait Store: Send + Sync {
+    fn schema(&self) -> &TableSchema;
+    fn sync(&self) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + '_>>;
+    fn rows(
+        &self,
+        range: Range<tc_ir::Id, Value>,
+        order: Vec<tc_ir::Id>,
+        reverse: bool,
+    ) -> Pin<Box<dyn std::future::Future<Output = RowsResult> + Send + '_>>;
+    fn get<'a>(&'a self, key: &'a [Value]) -> GetRowFuture<'a>;
+    fn upsert(
+        &self,
+        key: Vec<Value>,
+        values: Vec<Value>,
+    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + '_>>;
+    fn delete<'a>(
+        &'a self,
+        key: &'a [Value],
+    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>>;
+    fn count(
+        &self,
+        range: Range<tc_ir::Id, Value>,
+    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<u64>> + Send + '_>>;
+    fn is_empty(
+        &self,
+        range: Range<tc_ir::Id, Value>,
+    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<bool>> + Send + '_>>;
 }
 
-impl TableStore {
+struct FileStore<F> {
+    table: TableLock<TableSchema, TableIndexSchema, ValueCollator, F>,
+}
+
+impl<F: crate::CollectionFile> Store for FileStore<F> {
     fn schema(&self) -> &TableSchema {
         self.table.schema()
     }
+    fn sync(&self) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + '_>> {
+        Box::pin(self.table.sync())
+    }
+    fn rows(
+        &self,
+        range: Range<tc_ir::Id, Value>,
+        order: Vec<tc_ir::Id>,
+        reverse: bool,
+    ) -> Pin<Box<dyn std::future::Future<Output = RowsResult> + Send + '_>> {
+        Box::pin(async move {
+            let view = self.table.read().await;
+            view.rows(range, &order, reverse, None)
+                .await
+                .map(|rows| Box::pin(rows) as _)
+        })
+    }
+    fn get<'a>(
+        &'a self,
+        key: &'a [Value],
+    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<Option<Row<Value>>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let range = self
+                .schema()
+                .range_from_key(key)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            self.table
+                .read()
+                .await
+                .rows(range, &[], false, None)
+                .await?
+                .try_next()
+                .await
+        })
+    }
+    fn upsert(
+        &self,
+        key: Vec<Value>,
+        values: Vec<Value>,
+    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            self.table
+                .write()
+                .await
+                .upsert(key, values)
+                .await
+                .map(drop)
+                .map_err(std::io::Error::other)
+        })
+    }
+    fn delete<'a>(
+        &'a self,
+        key: &'a [Value],
+    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
+        Box::pin(async move { self.table.write().await.delete_row(key).await.map(drop) })
+    }
+    fn count(
+        &self,
+        range: Range<tc_ir::Id, Value>,
+    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<u64>> + Send + '_>> {
+        Box::pin(async move { self.table.read().await.count(range).await })
+    }
+    fn is_empty(
+        &self,
+        range: Range<tc_ir::Id, Value>,
+    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<bool>> + Send + '_>> {
+        Box::pin(async move { self.table.read().await.is_empty(range).await })
+    }
+}
 
-    fn from_dir(
-        dir: DirLock<PersistentFile>,
+#[derive(Clone)]
+pub struct LocalTable(Arc<dyn Store>);
+
+impl LocalTable {
+    pub fn schema(&self) -> &TableSchema {
+        self.0.schema()
+    }
+    fn from_dir<F: crate::CollectionFile>(
+        dir: DirLock<F>,
         schema: TableSchema,
-        _storage: StorageConfig,
+        _: StorageConfig,
     ) -> std::io::Result<Self> {
-        let table = TableLock::load(schema, ValueCollator::default(), dir)?;
-        Ok(Self { table })
+        TableLock::load(schema, ValueCollator::default(), dir)
+            .map(|table| Self(Arc::new(FileStore { table })))
     }
-
+    pub fn create<F: crate::CollectionFile>(
+        schema: TableSchema,
+        _: ValueCollator,
+        dir: DirLock<F>,
+    ) -> std::io::Result<Self> {
+        TableLock::create(schema, ValueCollator::default(), dir)
+            .map(|table| Self(Arc::new(FileStore { table })))
+    }
     async fn sync(&self) -> std::io::Result<()> {
-        self.table.sync().await
+        self.0.sync().await
     }
-
-    async fn row_stream(
+    pub async fn row_stream(
         &self,
         range: Range<tc_ir::Id, Value>,
         order: &[tc_ir::Id],
         reverse: bool,
-    ) -> std::io::Result<BoxStream<'static, Result<Row<Value>, std::io::Error>>> {
-        let view = self.table.read().await;
-        let rows = view.rows(range, order, reverse, None).await?;
-        Ok(Box::pin(rows))
+    ) -> RowsResult {
+        self.0.rows(range, order.to_vec(), reverse).await
     }
-
-    async fn get_row(&self, key: &[Value]) -> std::io::Result<Option<Row<Value>>> {
-        let schema = self.schema().clone();
-        let range = schema
-            .range_from_key(key)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        let view = self.table.read().await;
-        let mut rows = view.rows(range, &[], false, None).await?;
-        rows.try_next().await
+    pub async fn get_row(&self, key: &[Value]) -> std::io::Result<Option<Row<Value>>> {
+        self.0.get(key).await
     }
-
-    async fn upsert_row(&self, key: Vec<Value>, values: Vec<Value>) -> std::io::Result<()> {
-        let mut view = self.table.write().await;
-        view.upsert(key, values)
-            .await
-            .map_err(std::io::Error::other)?;
-        Ok(())
+    pub async fn upsert(&self, key: Vec<Value>, values: Vec<Value>) -> std::io::Result<()> {
+        self.0.upsert(key, values).await
     }
-
-    async fn delete_row(&self, key: &[Value]) -> std::io::Result<()> {
-        let mut view = self.table.write().await;
-        view.delete_row(key).await?;
-        Ok(())
+    pub async fn delete_row(&self, key: &[Value]) -> std::io::Result<()> {
+        self.0.delete(key).await
+    }
+    pub async fn count(&self, range: Range<tc_ir::Id, Value>) -> std::io::Result<u64> {
+        self.0.count(range).await
+    }
+    pub async fn is_empty(&self, range: Range<tc_ir::Id, Value>) -> std::io::Result<bool> {
+        self.0.is_empty(range).await
     }
 
     async fn apply_delta(&self, delta: &Delta) -> std::io::Result<()> {
-        {
-            let inserts_read = delta.inserts.table.read().await;
-            let mut view = self.table.write().await;
-            view.merge(inserts_read).await?;
+        let key_len = self.schema().key().len();
+        let mut inserts = delta
+            .inserts
+            .row_stream(Range::default(), &[], false)
+            .await?;
+        while let Some(row) = inserts.try_next().await? {
+            self.upsert(row[..key_len].to_vec(), row[key_len..].to_vec())
+                .await?;
         }
-
-        {
-            let deletes_read = delta.deletes.table.read().await;
-            let mut view = self.table.write().await;
-            view.delete_all(deletes_read).await?;
+        let mut deletes = delta
+            .deletes
+            .row_stream(Range::default(), &[], false)
+            .await?;
+        while let Some(row) = deletes.try_next().await? {
+            self.delete_row(&row[..key_len]).await?;
         }
 
         Ok(())
@@ -164,15 +270,15 @@ impl TableStore {
 
 #[derive(Clone)]
 struct Delta {
-    inserts: TableStore,
-    deletes: TableStore,
+    inserts: LocalTable,
+    deletes: LocalTable,
 }
 
 impl Delta {
     async fn upsert(&self, key: Vec<Value>, values: Vec<Value>) -> std::io::Result<()> {
         self.deletes.delete_row(&key).await?;
         self.inserts.delete_row(&key).await?;
-        self.inserts.upsert_row(key, values).await
+        self.inserts.upsert(key, values).await
     }
 
     async fn delete_from_inserts(&self, key: &[Value]) -> std::io::Result<()> {
@@ -180,7 +286,7 @@ impl Delta {
     }
 
     async fn add_to_deletes(&self, key: &[Value], values: Vec<Value>) -> std::io::Result<()> {
-        self.deletes.upsert_row(key.to_vec(), values).await
+        self.deletes.upsert(key.to_vec(), values).await
     }
 
     async fn get_inserted_row(&self, key: &[Value]) -> std::io::Result<Option<Row<Value>>> {
@@ -257,7 +363,7 @@ impl Delta {
 
 #[derive(Clone)]
 struct State {
-    persistent: TableStore,
+    persistent: LocalTable,
     committed: BTreeMap<TxnId, Delta>,
     pending: BTreeMap<TxnId, Delta>,
     finalized: Option<TxnId>,
@@ -265,13 +371,12 @@ struct State {
 
 #[derive(Clone)]
 struct VisibleSnapshot {
-    persistent: TableStore,
+    persistent: LocalTable,
     deltas: Vec<Delta>,
 }
 
 pub struct PersistentTable<Txn> {
     state: Arc<RwLock<State>>,
-    dir: CollectionDir,
     semaphore: txn_lock::semaphore::Semaphore<
         TxnId,
         b_tree::Collator<ValueCollator>,
@@ -285,7 +390,6 @@ impl<Txn> Clone for PersistentTable<Txn> {
     fn clone(&self) -> Self {
         Self {
             state: self.state.clone(),
-            dir: self.dir.clone(),
             semaphore: self.semaphore.clone(),
             schema: self.schema.clone(),
             txn: PhantomData,
@@ -305,7 +409,7 @@ impl<Txn> fmt::Debug for PersistentTable<Txn> {
 }
 
 impl<Txn> PersistentTable<Txn> {
-    pub fn new(persistent_dir: DirLock<PersistentFile>, schema: TableSchema) -> Self {
+    pub fn new<F: crate::CollectionFile>(persistent_dir: DirLock<F>, schema: TableSchema) -> Self {
         let persistent = Self::load_store(persistent_dir.clone(), schema.clone());
 
         let state = State {
@@ -317,36 +421,12 @@ impl<Txn> PersistentTable<Txn> {
 
         Self {
             state: Arc::new(RwLock::new(state)),
-            dir: CollectionDir::Transaction,
             semaphore: txn_lock::semaphore::Semaphore::new(b_tree::Collator::new(
                 ValueCollator::default(),
             )),
             schema,
             txn: PhantomData,
         }
-    }
-
-    pub fn named(
-        uri: &pathlink::Link,
-        persistent_dir: DirLock<PersistentFile>,
-        schema: TableSchema,
-    ) -> tc_error::TCResult<Self> {
-        let dir = CollectionDir::named(uri, "table")?;
-        let persistent = Self::load_store(persistent_dir, schema.clone());
-        Ok(Self {
-            state: Arc::new(RwLock::new(State {
-                persistent,
-                committed: BTreeMap::new(),
-                pending: BTreeMap::new(),
-                finalized: None,
-            })),
-            dir,
-            semaphore: txn_lock::semaphore::Semaphore::new(b_tree::Collator::new(
-                ValueCollator::default(),
-            )),
-            schema,
-            txn: PhantomData,
-        })
     }
 
     pub fn schema(&self) -> &TableSchema {
@@ -360,8 +440,8 @@ impl<Txn> PersistentTable<Txn> {
     /// Sync the canonical (persistent) state to disk.
     ///
     /// This flushes any in-memory modifications to the filesystem so they
-    /// survive a restart. Pending and committed deltas are not synced —
-    /// Chain owns replay durability for those.
+    /// survive a restart. Pending and committed deltas are not synced; their
+    /// durable ordering and replay belong to the caller.
     pub async fn sync(&self) -> std::io::Result<()> {
         let persistent = {
             let state = self.state.read().expect("state read lock");
@@ -889,9 +969,12 @@ impl<Txn> PersistentTable<Txn> {
         Ok(())
     }
 
-    fn load_store(persistent_dir: DirLock<PersistentFile>, schema: TableSchema) -> TableStore {
+    fn load_store(
+        persistent_dir: DirLock<impl crate::CollectionFile>,
+        schema: TableSchema,
+    ) -> LocalTable {
         let storage = *schema.storage();
-        TableStore::from_dir(persistent_dir, schema, storage).expect("load persistent Table store")
+        LocalTable::from_dir(persistent_dir, schema, storage).expect("load persistent Table store")
     }
 
     async fn pending_delta_for_txn(&self, txn: &Txn) -> Result<Delta, txn_lock::Error>
@@ -913,7 +996,11 @@ impl<Txn> PersistentTable<Txn> {
             )
         };
 
-        let txn_dir = self.dir.resolve(txn).await.map_err(background_error)?;
+        let txn_dir = txn
+            .subcontext_unique()
+            .context()
+            .await
+            .map_err(background_error)?;
 
         let (inserts_dir, deletes_dir) = {
             let mut txn_dir = txn_dir.write().await;
@@ -927,9 +1014,9 @@ impl<Txn> PersistentTable<Txn> {
         };
 
         let delta = Delta {
-            inserts: TableStore::from_dir(inserts_dir, schema.clone(), storage)
+            inserts: LocalTable::from_dir(inserts_dir, schema.clone(), storage)
                 .map_err(background_error)?,
-            deletes: TableStore::from_dir(deletes_dir, schema, storage)
+            deletes: LocalTable::from_dir(deletes_dir, schema, storage)
                 .map_err(background_error)?,
         };
 
@@ -941,7 +1028,6 @@ impl<Txn> PersistentTable<Txn> {
         }
 
         state.pending.insert(txn_id, delta.clone());
-
         Ok(delta)
     }
 }

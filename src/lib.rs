@@ -2,12 +2,9 @@
 #![deny(clippy::needless_question_mark)]
 
 mod persistent_file;
-pub use persistent_file::PersistentFile;
+pub use persistent_file::{CollectionFile, CollectionNode, PersistentFile};
 
 mod stream;
-
-mod context;
-pub use context::CollectionDir;
 
 mod txn;
 pub use txn::StorageContext;
@@ -152,9 +149,6 @@ mod architecture_tests {
 
     #[test]
     fn routes_delegate_without_handler_carrier_enums() {
-        let ir = include_str!("../../tc-ir/src/handler.rs");
-        assert!(!ir.contains("type Handler"));
-
         for source in [
             include_str!("route.rs"),
             include_str!("btree/route.rs"),
@@ -171,6 +165,22 @@ mod architecture_tests {
                 assert!(
                     !source.contains(&forbidden),
                     "native routes must not use {forbidden} carrier dispatch"
+                );
+            }
+        }
+
+        for source in [
+            include_str!("btree/route.rs"),
+            include_str!("tensor/route.rs"),
+        ] {
+            for forbidden in [
+                "path: Vec<PathSegment>",
+                "BTreeHandler::",
+                "TensorHandler::",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "Route must select an operation before constructing its terminal handler"
                 );
             }
         }
@@ -193,6 +203,23 @@ mod architecture_tests {
 
         assert!(include_str!("btree/stream.rs").contains("GuardedStream"));
         assert!(include_str!("table/stream.rs").contains("ReadPermit"));
+    }
+
+    #[test]
+    fn collection_storage_has_no_mode_shim() {
+        for source in [include_str!("btree/file.rs"), include_str!("table/file.rs")] {
+            for forbidden in ["CollectionDir", "dyn Any", "downcast_ref"] {
+                assert!(
+                    !source.contains(forbidden),
+                    "collections must consume delegated storage without {forbidden}"
+                );
+            }
+
+            assert!(
+                source.contains("subcontext_unique()"),
+                "each transaction-local delta must receive a unique delegated context"
+            );
+        }
     }
 
     #[test]

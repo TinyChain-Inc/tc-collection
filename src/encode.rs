@@ -2,8 +2,8 @@ use destream::en::{self, EncodeMap};
 use futures::StreamExt;
 use safecast::CastFrom;
 use tc_error::TCError;
-use tc_ir::NativeClass;
 use tc_value::Value;
+use tc_value::class::NativeClass;
 
 use crate::view::{BTreeView, CollectionView, TableView};
 use crate::{BTreeType, TableType, TensorType};
