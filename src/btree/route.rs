@@ -3,7 +3,7 @@ use std::ops::Bound;
 use pathlink::PathSegment;
 use safecast::CastInto;
 use tc_error::{TCError, TCResult};
-use tc_ir::{Id, Map, Scalar};
+use tc_ir::{Id, Map};
 use tc_value::Value;
 
 use crate::Collection;
@@ -11,139 +11,37 @@ use crate::collection::BTreeView;
 use crate::route::CollectionState;
 
 type BTreeBounds = (Bound<Value>, Bound<Value>);
-pub struct BTreeHandler<S: CollectionState> {
-    view: BTreeView<S::Txn>,
-    path: Vec<PathSegment>,
-    state: std::marker::PhantomData<fn() -> S>,
-}
+struct DeleteRow<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
+struct Contains<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
+struct Count<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
+struct IsEmpty<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
+struct Slice<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
+struct Insert<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
+struct Delete<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
 
 impl<S, Txn> tc_ir::Route<S> for BTreeView<Txn>
 where
     S: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
 {
-    fn route(&self, path: &[PathSegment]) -> Option<Box<dyn tc_ir::Handler<S> + '_>> {
-        let known = path.is_empty()
-            || matches!(path, [segment] if matches!(segment.as_str(), "contains" | "count" | "is_empty" | "slice" | "insert" | "delete"));
-        known.then(|| {
-            Box::new(BTreeHandler {
-                view: self.clone(),
-                path: path.to_vec(),
-                state: std::marker::PhantomData,
-            }) as Box<dyn tc_ir::Handler<S>>
-        })
-    }
-}
-impl<S: CollectionState> BTreeHandler<S> {
-    async fn get(&self, txn: &S::Txn, request: Scalar) -> TCResult<S> {
-        self.view
-            .get(&self.path, S::from(request), txn)
-            .await?
-            .ok_or_else(|| TCError::method_not_allowed(tc_ir::Method::Get, "BTree"))
-    }
-
-    async fn post(&self, txn: &S::Txn, request: Map<S>) -> TCResult<S> {
-        self.view
-            .post(&self.path, request, txn)
-            .await?
-            .ok_or_else(|| TCError::method_not_allowed(tc_ir::Method::Post, "BTree"))
-    }
-
-    async fn delete(&self, txn: &S::Txn, request: Scalar) -> TCResult<()> {
-        let _ = self
-            .view
-            .delete(&self.path, S::from(request), txn)
-            .await?
-            .ok_or_else(|| TCError::method_not_allowed(tc_ir::Method::Delete, "BTree"))?;
-        Ok(())
+    fn route<'a>(&'a self, path: &[PathSegment]) -> Option<Box<dyn tc_ir::Handler<'a, S> + 'a>> {
+        match path {
+            [] => Some(Box::new(DeleteRow(self))),
+            [segment] => match segment.as_str() {
+                "contains" => Some(Box::new(Contains(self))),
+                "count" => Some(Box::new(Count(self))),
+                "is_empty" => Some(Box::new(IsEmpty(self))),
+                "slice" => Some(Box::new(Slice(self))),
+                "insert" => Some(Box::new(Insert(self))),
+                "delete" => Some(Box::new(Delete(self))),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 }
 
 impl<Txn: crate::StorageContext> BTreeView<Txn> {
-    async fn get<S: CollectionState<Txn = Txn>>(
-        &self,
-        path: &[PathSegment],
-        key: S,
-        txn: &Txn,
-    ) -> TCResult<Option<S>> {
-        if path.len() != 1 {
-            return Ok(None);
-        }
-        let state = match path[0].as_str() {
-            "contains" => S::from(Value::from(
-                self.btree
-                    .contains_row(txn.id(), &row_from_state(key, "BTree row")?)
-                    .await,
-            )),
-            "count" => {
-                let view = self.slice_from_key(key)?;
-                S::from(Value::from(
-                    view.btree
-                        .slice(view.bounds.clone(), view.reverse)
-                        .count(txn.id())
-                        .await,
-                ))
-            }
-            "is_empty" => {
-                let view = self.slice_from_key(key)?;
-                S::from(Value::from(
-                    view.btree
-                        .slice(view.bounds.clone(), view.reverse)
-                        .is_empty(txn.id())
-                        .await,
-                ))
-            }
-            "slice" => {
-                let (bounds, reverse) = slice_bounds_from_state(key)?;
-                S::from(Collection::BTree(Box::new(self.slice(bounds, reverse))))
-            }
-            _ => return Ok(None),
-        };
-        Ok(Some(state))
-    }
-
-    async fn post<S: CollectionState<Txn = Txn>>(
-        &self,
-        path: &[PathSegment],
-        params: Map<S>,
-        txn: &Txn,
-    ) -> TCResult<Option<S>> {
-        if path.len() != 1 {
-            return Ok(None);
-        }
-        let row_id: Id = "row".parse().expect("valid row parameter");
-        let row = row_from_state(
-            params
-                .get(&row_id)
-                .cloned()
-                .ok_or_else(|| TCError::bad_request("missing BTree row parameter"))?,
-            "BTree row",
-        )?;
-        match path[0].as_str() {
-            "insert" => self.btree.insert_row(txn, row).await,
-            "delete" => self.btree.delete_row(txn, row).await,
-            _ => return Ok(None),
-        }
-        .map_err(|err| TCError::bad_request(err.to_string()))?;
-        Ok(Some(S::from(Value::None)))
-    }
-
-    async fn delete<S: CollectionState<Txn = Txn>>(
-        &self,
-        path: &[PathSegment],
-        key: S,
-        txn: &Txn,
-    ) -> TCResult<Option<S>> {
-        if !path.is_empty() {
-            return Ok(None);
-        }
-        self.btree
-            .delete_row(txn, row_from_state(key, "BTree row")?)
-            .await
-            .map_err(|err| TCError::bad_request(err.to_string()))?;
-        Ok(Some(S::from(Value::None)))
-    }
-
     fn slice_from_key<S: CollectionState>(&self, key: S) -> TCResult<Self> {
         if key.is_none() {
             Ok(self.clone())
@@ -196,17 +94,166 @@ fn bound_from_map<S: CollectionState>(
     }
 }
 
-#[tc_ir::async_trait]
-impl<S: CollectionState> tc_ir::Handler<S> for BTreeHandler<S> {
-    async fn get(&self, txn: &S::Txn, key: Scalar) -> TCResult<S> {
-        BTreeHandler::get(self, txn, key).await
-    }
+fn row_param<S: CollectionState>(params: &Map<S>) -> TCResult<Vec<Value>> {
+    let row_id: Id = "row".parse().expect("valid row parameter");
+    row_from_state(
+        params
+            .get(&row_id)
+            .cloned()
+            .ok_or_else(|| TCError::bad_request("missing BTree row parameter"))?,
+        "BTree row",
+    )
+}
 
-    async fn post(&self, txn: &S::Txn, params: Map<S>) -> TCResult<S> {
-        BTreeHandler::post(self, txn, params).await
+impl<'a, S, Txn> tc_ir::Handler<'a, S> for DeleteRow<'a, Txn>
+where
+    S: CollectionState<Txn = Txn>,
+    Txn: crate::StorageContext,
+{
+    fn delete<'txn>(self: Box<Self>) -> Option<tc_ir::DeleteHandler<'a, 'txn, S>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, key| {
+            Box::pin(async move {
+                self.0
+                    .btree
+                    .delete_row(txn, row_from_state(S::from(key), "BTree row")?)
+                    .await
+                    .map_err(|err| TCError::bad_request(err.to_string()))
+            })
+        }))
     }
+}
 
-    async fn delete(&self, txn: &S::Txn, key: Scalar) -> TCResult<()> {
-        BTreeHandler::delete(self, txn, key).await
+impl<'a, S, Txn> tc_ir::Handler<'a, S> for Contains<'a, Txn>
+where
+    S: CollectionState<Txn = Txn>,
+    Txn: crate::StorageContext,
+{
+    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, S>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, key| {
+            Box::pin(async move {
+                Ok(S::from(Value::from(
+                    self.0
+                        .btree
+                        .contains_row(txn.id(), &row_from_state(S::from(key), "BTree row")?)
+                        .await,
+                )))
+            })
+        }))
+    }
+}
+
+impl<'a, S, Txn> tc_ir::Handler<'a, S> for Count<'a, Txn>
+where
+    S: CollectionState<Txn = Txn>,
+    Txn: crate::StorageContext,
+{
+    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, S>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, key| {
+            Box::pin(async move {
+                let view = self.0.slice_from_key(S::from(key))?;
+                Ok(S::from(Value::from(
+                    view.btree
+                        .slice(view.bounds.clone(), view.reverse)
+                        .count(txn.id())
+                        .await,
+                )))
+            })
+        }))
+    }
+}
+
+impl<'a, S, Txn> tc_ir::Handler<'a, S> for IsEmpty<'a, Txn>
+where
+    S: CollectionState<Txn = Txn>,
+    Txn: crate::StorageContext,
+{
+    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, S>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, key| {
+            Box::pin(async move {
+                let view = self.0.slice_from_key(S::from(key))?;
+                Ok(S::from(Value::from(
+                    view.btree
+                        .slice(view.bounds.clone(), view.reverse)
+                        .is_empty(txn.id())
+                        .await,
+                )))
+            })
+        }))
+    }
+}
+
+impl<'a, S, Txn> tc_ir::Handler<'a, S> for Slice<'a, Txn>
+where
+    S: CollectionState<Txn = Txn>,
+    Txn: crate::StorageContext,
+{
+    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, S>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |_txn, key| {
+            Box::pin(async move {
+                let (bounds, reverse) = slice_bounds_from_state(S::from(key))?;
+                Ok(S::from(Collection::BTree(Box::new(
+                    self.0.slice(bounds, reverse),
+                ))))
+            })
+        }))
+    }
+}
+
+impl<'a, S, Txn> tc_ir::Handler<'a, S> for Insert<'a, Txn>
+where
+    S: CollectionState<Txn = Txn>,
+    Txn: crate::StorageContext,
+{
+    fn post<'txn>(self: Box<Self>) -> Option<tc_ir::PostHandler<'a, 'txn, S>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, params| {
+            Box::pin(async move {
+                self.0
+                    .btree
+                    .insert_row(txn, row_param(&params)?)
+                    .await
+                    .map_err(|err| TCError::bad_request(err.to_string()))?;
+                Ok(S::from(Value::None))
+            })
+        }))
+    }
+}
+
+impl<'a, S, Txn> tc_ir::Handler<'a, S> for Delete<'a, Txn>
+where
+    S: CollectionState<Txn = Txn>,
+    Txn: crate::StorageContext,
+{
+    fn post<'txn>(self: Box<Self>) -> Option<tc_ir::PostHandler<'a, 'txn, S>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, params| {
+            Box::pin(async move {
+                self.0
+                    .btree
+                    .delete_row(txn, row_param(&params)?)
+                    .await
+                    .map_err(|err| TCError::bad_request(err.to_string()))?;
+                Ok(S::from(Value::None))
+            })
+        }))
     }
 }

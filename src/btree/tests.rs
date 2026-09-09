@@ -1,5 +1,6 @@
 //! Transactional visibility and ordering regression tests for `BTree`.
-use super::{BTree, BTreeSlice, PersistentFile};
+use super::{BTree, BTreeSlice};
+use crate::PersistentFile;
 use crate::test::run_async_test;
 use freqfs::Cache;
 use futures::future::join_all;
@@ -50,6 +51,7 @@ impl Transaction for TestTxn {
 }
 
 impl crate::StorageContext for TestTxn {
+    type File = PersistentFile;
     fn context(
         &self,
     ) -> impl std::future::Future<Output = tc_error::TCResult<freqfs::DirLock<PersistentFile>>> + Send

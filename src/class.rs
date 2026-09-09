@@ -1,5 +1,5 @@
 use pathlink::{Label, PathBuf, PathSegment, label, path_label};
-use tc_ir::{Class, NativeClass};
+use tc_value::class::{Class, NativeClass};
 
 const BTREE_PATH: pathlink::PathLabel = path_label(&["state", "collection", "btree"]);
 const TABLE_PATH: pathlink::PathLabel = path_label(&["state", "collection", "table"]);

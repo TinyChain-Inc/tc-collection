@@ -54,6 +54,7 @@ impl Transaction for TestTxn {
 }
 
 impl crate::StorageContext for TestTxn {
+    type File = PersistentFile;
     fn context(
         &self,
     ) -> impl std::future::Future<Output = tc_error::TCResult<freqfs::DirLock<PersistentFile>>> + Send
@@ -2435,19 +2436,19 @@ fn restart_drops_uncommitted_pending_table() {
     run_async_test("restart_drops_uncommitted_pending_table", || {
         Box::pin(async {
             let root = init_root("restart-pending-dropped-table").await;
-            let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
+            {
+                let (persistent, txn) = load_roots(&root);
+                let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
-            table
-                .upsert_row(
-                    &TestTxn::new(tx(10), txn.clone()),
-                    vec![Value::from(1_u64)],
-                    vec![Value::from("pending")],
-                )
-                .await
-                .expect("insert pending (not committed)");
-
-            drop(table);
+                table
+                    .upsert_row(
+                        &TestTxn::new(tx(10), txn.clone()),
+                        vec![Value::from(1_u64)],
+                        vec![Value::from("pending")],
+                    )
+                    .await
+                    .expect("insert pending (not committed)");
+            }
 
             // Reload — pending delta should be gone (no WAL owned by Table).
             let (persistent, _) = load_roots(&root);
@@ -2470,27 +2471,27 @@ fn restart_reconstructs_committed_state_table() {
     run_async_test("restart_reconstructs_committed_state_table", || {
         Box::pin(async {
             let root = init_root("restart-committed-table").await;
-            let (persistent, txn) = load_roots(&root);
-            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
+            {
+                let (persistent, txn) = load_roots(&root);
+                let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
 
-            for i in 1..=5u64 {
+                for i in 1..=5u64 {
+                    table
+                        .upsert_row(
+                            &TestTxn::new(tx(10), txn.clone()),
+                            vec![Value::from(i)],
+                            vec![Value::from(format!("v{i}"))],
+                        )
+                        .await
+                        .expect("insert row");
+                }
+                table.commit(tx(10)).expect("commit 10");
                 table
-                    .upsert_row(
-                        &TestTxn::new(tx(10), txn.clone()),
-                        vec![Value::from(i)],
-                        vec![Value::from(format!("v{i}"))],
-                    )
+                    .finalize(tx(10))
                     .await
-                    .expect("insert row");
+                    .expect("finalize 10 — merges into canon");
+                table.sync().await.expect("sync canon to disk");
             }
-            table.commit(tx(10)).expect("commit 10");
-            table
-                .finalize(tx(10))
-                .await
-                .expect("finalize 10 — merges into canon");
-            table.sync().await.expect("sync canon to disk");
-
-            drop(table);
 
             // Reload from the same dirs — canon should have the finalized rows.
             let (persistent, _) = load_roots(&root);
@@ -2515,19 +2516,20 @@ fn schema_mismatch_merge_fails_closed_table() {
             let root = init_root("schema-mismatch-table").await;
             let (persistent, txn) = load_roots(&root);
             let schema_a = simple_schema();
-            let table_a = PersistentTable::<TestTxn>::new(persistent.clone(), schema_a);
+            {
+                let table_a = PersistentTable::<TestTxn>::new(persistent.clone(), schema_a);
 
-            table_a
-                .upsert_row(
-                    &TestTxn::new(tx(10), txn.clone()),
-                    vec![Value::from(1_u64)],
-                    vec![Value::from("alpha")],
-                )
-                .await
-                .expect("insert row with schema A");
-            table_a.commit(tx(10)).expect("commit 10");
-            table_a.finalize(tx(10)).await.expect("finalize 10");
-            drop(table_a);
+                table_a
+                    .upsert_row(
+                        &TestTxn::new(tx(10), txn.clone()),
+                        vec![Value::from(1_u64)],
+                        vec![Value::from("alpha")],
+                    )
+                    .await
+                    .expect("insert row with schema A");
+                table_a.commit(tx(10)).expect("commit 10");
+                table_a.finalize(tx(10)).await.expect("finalize 10");
+            }
 
             // Attempt to load with a mismatched schema (different value column type).
             let mismatched_key = vec![Column {

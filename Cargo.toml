@@ -11,6 +11,7 @@ destream = { path = "../deps/destream", version = "0.10.1" }
 freqfs = { path = "../deps/freqfs", version = "0.13", features = ["stream"] }
 ha-ndarray = { path = "../deps/ha-ndarray" }
 futures = "0.3"
+get-size = "0.1"
 number-general = { path = "../deps/number-general" }
 safecast = "0.2"
 tc-ir = { path = "../tc-ir" }

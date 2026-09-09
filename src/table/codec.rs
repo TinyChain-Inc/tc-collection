@@ -2,28 +2,29 @@ use destream::de;
 use safecast::TryCastFrom;
 use tc_value::{Value, ValueCollator};
 
-use super::{LocalTable, Table, TableSchema};
+use super::file::{TableFile, upsert};
+use super::{Table, TableSchema};
 
 #[derive(Clone, Debug)]
-pub struct DecodedTablePayload<Txn> {
+pub struct DecodedTablePayload<Txn: crate::StorageContext> {
     pub table: Table<Txn>,
 }
 
-struct Rows;
+struct Rows<Txn: crate::StorageContext>(std::marker::PhantomData<fn() -> Txn>);
 
-impl de::FromStream for Rows {
-    type Context = LocalTable;
+impl<Txn: crate::StorageContext> de::FromStream for Rows<Txn> {
+    type Context = TableFile<Txn::File>;
 
     async fn from_stream<D: de::Decoder>(
         table: Self::Context,
         decoder: &mut D,
     ) -> Result<Self, D::Error> {
-        struct Visitor {
-            table: LocalTable,
+        struct Visitor<Txn: crate::StorageContext> {
+            table: TableFile<Txn::File>,
         }
 
-        impl de::Visitor for Visitor {
-            type Value = Rows;
+        impl<Txn: crate::StorageContext> de::Visitor for Visitor<Txn> {
+            type Value = Rows<Txn>;
 
             fn expecting() -> &'static str {
                 "a sequence of Table rows"
@@ -35,7 +36,6 @@ impl de::FromStream for Rows {
             ) -> Result<Self::Value, A::Error> {
                 let schema = self.table.schema().clone();
                 let key_len = schema.key().len();
-                let mut table = self.table.write().await;
                 while let Some(row) = seq.next_element::<Value>(()).await? {
                     let Value::Tuple(row) = row else {
                         return Err(de::Error::custom("table row must be a tuple"));
@@ -47,16 +47,19 @@ impl de::FromStream for Rows {
                             schema.column_count()
                         )));
                     }
-                    table
-                        .upsert(row[..key_len].to_vec(), row[key_len..].to_vec())
-                        .await
-                        .map_err(de::Error::custom)?;
+                    upsert(
+                        &self.table,
+                        row[..key_len].to_vec(),
+                        row[key_len..].to_vec(),
+                    )
+                    .await
+                    .map_err(de::Error::custom)?;
                 }
-                Ok(Rows)
+                Ok(Rows(std::marker::PhantomData))
             }
         }
 
-        decoder.decode_seq(Visitor { table }).await
+        decoder.decode_seq(Visitor::<Txn> { table }).await
     }
 }
 
@@ -70,12 +73,12 @@ impl<Txn: crate::StorageContext> de::FromStream for DecodedTablePayload<Txn> {
         let txn = txn.subcontext_unique();
         let dir = txn.context().await.map_err(de::Error::custom)?;
 
-        struct Visitor<Txn> {
-            dir: freqfs::DirLock<crate::PersistentFile>,
+        struct Visitor<Txn: crate::StorageContext> {
+            dir: freqfs::DirLock<Txn::File>,
             txn: std::marker::PhantomData<fn() -> Txn>,
         }
 
-        impl<Txn> de::Visitor for Visitor<Txn> {
+        impl<Txn: crate::StorageContext> de::Visitor for Visitor<Txn> {
             type Value = DecodedTablePayload<Txn>;
 
             fn expecting() -> &'static str {
@@ -93,10 +96,10 @@ impl<Txn: crate::StorageContext> de::FromStream for DecodedTablePayload<Txn> {
                 let schema = TableSchema::try_cast_from(schema, |schema| {
                     de::Error::custom(format!("invalid Table schema: {schema:?}"))
                 })?;
-                let table = LocalTable::create(schema, ValueCollator::default(), self.dir)
+                let table = b_table::TableLock::create(schema, ValueCollator::default(), self.dir)
                     .map_err(de::Error::custom)?;
 
-                seq.next_element::<Rows>(table.clone())
+                seq.next_element::<Rows<Txn>>(table.clone())
                     .await?
                     .ok_or_else(|| de::Error::custom("missing Table rows"))?;
                 if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {

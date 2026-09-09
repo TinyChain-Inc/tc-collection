@@ -5,7 +5,7 @@ use super::selector::KeyOrRange;
 use crate::PersistentFile;
 use crate::StorageContext;
 use crate::btree::StorageConfig;
-use crate::table::{Column, LocalTable, PersistentTable, Table, TableSchema};
+use crate::table::{Column, PersistentTable, Table, TableSchema};
 use crate::test::run_async_test;
 use freqfs::Cache;
 use safecast::TryCastInto;
@@ -189,6 +189,7 @@ impl MockTxn {
 }
 
 impl crate::StorageContext for MockTxn {
+    type File = PersistentFile;
     fn context(
         &self,
     ) -> impl std::future::Future<Output = tc_error::TCResult<freqfs::DirLock<PersistentFile>>> + Send
@@ -326,7 +327,7 @@ async fn make_local_table_with_data(txn: &MockTxn) -> Table<MockTxn> {
         .context()
         .await
         .expect("local table directory");
-    let table = LocalTable::create(simple_schema(), ValueCollator::default(), dir)
+    let table = b_table::TableLock::create(simple_schema(), ValueCollator::default(), dir)
         .expect("create local table");
     {
         let mut table = table.write().await;
@@ -388,10 +389,10 @@ fn get_table_all() {
             let table = make_table_with_data().await;
             let handler = route::<State>(&table, &[]).expect("root");
             let txn = MockTxn::new(20);
-            let resp = handler
-                .get(&txn, Scalar::Value(tc_value::Value::None))
-                .await
-                .expect("response");
+            let resp =
+                handler.get().expect("GET handler")(&txn, Scalar::Value(tc_value::Value::None))
+                    .await
+                    .expect("response");
             assert!(matches!(resp, State::Collection(_)));
         })
     });
@@ -423,15 +424,14 @@ fn local_table_uses_native_routes_without_transaction_deltas() {
 
                 let count = route::<State>(&table, &[segment("count")]).expect("count route");
                 assert_eq!(
-                    count
-                        .get(&txn, Scalar::Value(Value::None))
+                    count.get().expect("GET handler")(&txn, Scalar::Value(Value::None))
                         .await
                         .expect("count local rows"),
                     State::Count(2)
                 );
 
                 let root = route::<State>(&table, &[]).expect("root route");
-                root.put(
+                root.put().expect("PUT handler")(
                     &txn,
                     Scalar::Value(Value::Tuple(vec![Value::from(3_u64)])),
                     State::from(Scalar::Value(Value::from("gamma"))),
@@ -439,10 +439,13 @@ fn local_table_uses_native_routes_without_transaction_deltas() {
                 .await
                 .expect("upsert local row");
 
-                let row = root
-                    .get(&txn, Scalar::Value(Value::Tuple(vec![Value::from(3_u64)])))
-                    .await
-                    .expect("read local row");
+                let root = route::<State>(&table, &[]).expect("root route");
+                let row = root.get().expect("GET handler")(
+                    &txn,
+                    Scalar::Value(Value::Tuple(vec![Value::from(3_u64)])),
+                )
+                .await
+                .expect("read local row");
                 assert_eq!(
                     row,
                     State::Value(Value::Tuple(vec![Value::from(3_u64), Value::from("gamma")]))
@@ -488,7 +491,9 @@ fn get_table_key() {
             let handler = route::<State>(&table, &[]).expect("root");
             let txn = MockTxn::new(20);
             let req = Scalar::Value(Value::Tuple(vec![Value::from(2_u64)]));
-            let resp = handler.get(&txn, req).await.expect("response");
+            let resp = handler.get().expect("GET handler")(&txn, req)
+                .await
+                .expect("response");
             match resp {
                 State::Value(Value::Tuple(row)) => {
                     assert_eq!(row, vec![Value::from(2_u64), Value::from("beta")]);
@@ -508,8 +513,7 @@ fn get_columns() {
             let table = make_table_with_data().await;
             let handler = route::<State>(&table, &[segment("columns")]).expect("columns");
             let txn = MockTxn::new(20);
-            let resp = handler
-                .get(&txn, Scalar::Value(Value::None))
+            let resp = handler.get().expect("GET handler")(&txn, Scalar::Value(Value::None))
                 .await
                 .expect("response");
             match resp {
@@ -533,10 +537,10 @@ fn get_count_all() {
             let table = make_table_with_data().await;
             let handler = route::<State>(&table, &[segment("count")]).expect("count");
             let txn = MockTxn::new(20);
-            let resp = handler
-                .get(&txn, Scalar::Value(tc_value::Value::None))
-                .await
-                .expect("response");
+            let resp =
+                handler.get().expect("GET handler")(&txn, Scalar::Value(tc_value::Value::None))
+                    .await
+                    .expect("response");
             assert_eq!(resp, State::Count(3));
         })
     });
@@ -551,7 +555,9 @@ fn get_count_key() {
             let handler = route::<State>(&table, &[segment("count")]).expect("count");
             let txn = MockTxn::new(20);
             let req = Scalar::Value(Value::Tuple(vec![Value::from(2_u64)]));
-            let resp = handler.get(&txn, req).await.expect("response");
+            let resp = handler.get().expect("GET handler")(&txn, req)
+                .await
+                .expect("response");
             assert_eq!(resp, State::Count(1));
         })
     });
@@ -566,7 +572,9 @@ fn get_count_missing_key() {
             let handler = route::<State>(&table, &[segment("count")]).expect("count");
             let txn = MockTxn::new(20);
             let req = Scalar::Value(Value::Tuple(vec![Value::from(999_u64)]));
-            let resp = handler.get(&txn, req).await.expect("response");
+            let resp = handler.get().expect("GET handler")(&txn, req)
+                .await
+                .expect("response");
             assert_eq!(resp, State::Count(0));
         })
     });
@@ -582,7 +590,9 @@ fn get_contains_key() {
             let handler = route::<State>(&table, &[segment("contains")]).expect("contains");
             let txn = MockTxn::new(20);
             let req = Scalar::Value(Value::Tuple(vec![Value::from(2_u64)]));
-            let resp = handler.get(&txn, req).await.expect("response");
+            let resp = handler.get().expect("GET handler")(&txn, req)
+                .await
+                .expect("response");
             match resp {
                 State::Value(Value::Number(n)) => assert!(bool::cast_from(n)),
                 other => panic!("expected bool, got {other:?}"),
@@ -601,7 +611,9 @@ fn get_contains_missing() {
             let handler = route::<State>(&table, &[segment("contains")]).expect("contains");
             let txn = MockTxn::new(20);
             let req = Scalar::Value(Value::Tuple(vec![Value::from(999_u64)]));
-            let resp = handler.get(&txn, req).await.expect("response");
+            let resp = handler.get().expect("GET handler")(&txn, req)
+                .await
+                .expect("response");
             match resp {
                 State::Value(Value::Number(n)) => assert!(!bool::cast_from(n)),
                 other => panic!("expected bool, got {other:?}"),
@@ -619,8 +631,7 @@ fn get_key_columns() {
             let table = make_table_with_data().await;
             let handler = route::<State>(&table, &[segment("key_columns")]).expect("key_columns");
             let txn = MockTxn::new(20);
-            let resp = handler
-                .get(&txn, Scalar::Value(Value::None))
+            let resp = handler.get().expect("GET handler")(&txn, Scalar::Value(Value::None))
                 .await
                 .expect("response");
             match resp {
@@ -645,8 +656,7 @@ fn get_key_names() {
             let table = make_table_with_data().await;
             let handler = route::<State>(&table, &[segment("key_names")]).expect("key_names");
             let txn = MockTxn::new(20);
-            let resp = handler
-                .get(&txn, Scalar::Value(Value::None))
+            let resp = handler.get().expect("GET handler")(&txn, Scalar::Value(Value::None))
                 .await
                 .expect("response");
             assert_eq!(resp, State::Value(Value::Tuple(vec![Value::from("id")])));
@@ -663,7 +673,9 @@ fn get_limit() {
             let handler = route::<State>(&table, &[segment("limit")]).expect("limit");
             let txn = MockTxn::new(20);
             let req = Scalar::Value(Value::from(2_u64));
-            let resp = handler.get(&txn, req).await.expect("response");
+            let resp = handler.get().expect("GET handler")(&txn, req)
+                .await
+                .expect("response");
             assert!(matches!(resp, State::Collection(_)));
         })
     });
@@ -678,7 +690,9 @@ fn get_order() {
             let handler = route::<State>(&table, &[segment("order")]).expect("order");
             let txn = MockTxn::new(20);
             let req = Scalar::Value(Value::Tuple(vec![Value::from("id")]));
-            let resp = handler.get(&txn, req).await.expect("response");
+            let resp = handler.get().expect("GET handler")(&txn, req)
+                .await
+                .expect("response");
             assert!(matches!(resp, State::Collection(_)));
         })
     });
@@ -693,7 +707,9 @@ fn get_select() {
             let handler = route::<State>(&table, &[segment("select")]).expect("select");
             let txn = MockTxn::new(20);
             let req = Scalar::Value(Value::Tuple(vec![Value::from("id"), Value::from("label")]));
-            let resp = handler.get(&txn, req).await.expect("response");
+            let resp = handler.get().expect("GET handler")(&txn, req)
+                .await
+                .expect("response");
             assert!(matches!(resp, State::Collection(_)));
         })
     });
@@ -713,7 +729,9 @@ fn put_upsert_via_key() {
             let key = Scalar::Value(Value::Tuple(vec![Value::from(2_u64)]));
             let value = State::from(Scalar::Value(Value::Tuple(vec![Value::from("updated")])));
 
-            handler.put(&txn, key, value).await.expect("upsert ok");
+            handler.put().expect("PUT handler")(&txn, key, value)
+                .await
+                .expect("upsert ok");
 
             let row = table.read_row(tx(30), &[Value::from(2_u64)]).await;
             assert!(row.is_some());
@@ -742,14 +760,13 @@ fn put_update_all() {
                 Scalar::Value(Value::from("updated")),
             );
 
-            handler
-                .put(
-                    &txn,
-                    Scalar::Value(Value::None),
-                    State::from(Scalar::Map(value_map)),
-                )
-                .await
-                .expect("update ok");
+            handler.put().expect("PUT handler")(
+                &txn,
+                Scalar::Value(Value::None),
+                State::from(Scalar::Map(value_map)),
+            )
+            .await
+            .expect("update ok");
 
             for id in [1_u64, 2_u64, 3_u64] {
                 let row = table.read_row(tx(30), &[Value::from(id)]).await;
@@ -786,14 +803,13 @@ fn put_update_range() {
                 Scalar::Value(Value::from("range_updated")),
             );
 
-            handler
-                .put(
-                    &txn,
-                    Scalar::Value(key_selector),
-                    State::from(Scalar::Map(value_map)),
-                )
-                .await
-                .expect("update ok");
+            handler.put().expect("PUT handler")(
+                &txn,
+                Scalar::Value(key_selector),
+                State::from(Scalar::Map(value_map)),
+            )
+            .await
+            .expect("update ok");
 
             let row1 = table.read_row(tx(30), &[Value::from(1_u64)]).await;
             assert_eq!(
@@ -862,7 +878,9 @@ fn post_slice() {
                 ]))),
             );
 
-            let resp = handler.post(&txn, req).await.expect("response");
+            let resp = handler.post().expect("POST handler")(&txn, req)
+                .await
+                .expect("response");
             assert!(matches!(resp, State::Collection(_)));
         })
     });
@@ -880,7 +898,9 @@ fn delete_key() {
             let txn = MockTxn::new(30);
 
             let req = Scalar::Value(Value::Tuple(vec![Value::from(2_u64)]));
-            handler.delete(&txn, req).await.expect("delete ok");
+            handler.delete().expect("DELETE handler")(&txn, req)
+                .await
+                .expect("delete ok");
 
             let row = table.read_row(tx(30), &[Value::from(2_u64)]).await;
             assert!(row.is_none(), "row should be deleted");
@@ -898,7 +918,9 @@ fn delete_all_truncates() {
             let txn = MockTxn::new(30);
 
             let req = Scalar::Value(Value::None);
-            handler.delete(&txn, req).await.expect("truncate ok");
+            handler.delete().expect("DELETE handler")(&txn, req)
+                .await
+                .expect("truncate ok");
 
             assert!(table.is_empty(tx(30)).await, "table should be empty");
         })
@@ -963,11 +985,7 @@ fn put_on_count_rejected() {
         Box::pin(async {
             let table = make_table_with_data().await;
             let handler = route::<State>(&table, &[segment("count")]).expect("count");
-            let txn = MockTxn::new(20);
-            let result = handler
-                .put(&txn, Scalar::default(), State::from(Scalar::default()))
-                .await;
-            assert!(result.is_err());
+            assert!(handler.put().is_none());
         })
     });
 }
@@ -978,9 +996,7 @@ fn delete_on_columns_rejected() {
         Box::pin(async {
             let table = make_table_with_data().await;
             let handler = route::<State>(&table, &[segment("columns")]).expect("columns");
-            let txn = MockTxn::new(20);
-            let result = handler.delete(&txn, Scalar::default()).await;
-            assert!(result.is_err());
+            assert!(handler.delete().is_none());
         })
     });
 }
@@ -1005,10 +1021,13 @@ fn insert_is_strict_and_is_empty_is_direct() {
             ]
             .into_iter()
             .collect();
-            insert.post(&txn, params.clone()).await.expect("insert row");
+            insert.post().expect("POST handler")(&txn, params.clone())
+                .await
+                .expect("insert row");
             assert!(table.contains_row(tx(30), &[Value::from(4_u64)]).await);
 
-            let duplicate = insert.post(&txn, params).await;
+            let insert = route::<State>(&table, &[segment("insert")]).expect("insert route");
+            let duplicate = insert.post().expect("POST handler")(&txn, params).await;
             assert!(
                 duplicate.is_err(),
                 "strict insert must reject a visible key"
@@ -1016,8 +1035,7 @@ fn insert_is_strict_and_is_empty_is_direct() {
 
             let is_empty = route::<State>(&table, &[segment("is_empty")]).expect("is_empty route");
             assert_eq!(
-                is_empty
-                    .get(&txn, Scalar::Value(Value::None))
+                is_empty.get().expect("GET handler")(&txn, Scalar::Value(Value::None))
                     .await
                     .expect("is_empty"),
                 State::from(Value::from(false))
@@ -1048,21 +1066,20 @@ fn local_slice_update_and_truncate_stream_through_delegated_storage() {
                 let slice = Table::from(table.slice(range, &[], false).expect("slice"));
                 let handler = route::<State>(&slice, &[]).expect("slice route");
 
-                handler
-                    .put(
-                        &txn,
-                        Scalar::Value(Value::None),
-                        State::from(Scalar::Map(
-                            [(
-                                "label".parse().expect("label"),
-                                Scalar::Value(Value::from("updated")),
-                            )]
-                            .into_iter()
-                            .collect(),
-                        )),
-                    )
-                    .await
-                    .expect("update slice");
+                handler.put().expect("PUT handler")(
+                    &txn,
+                    Scalar::Value(Value::None),
+                    State::from(Scalar::Map(
+                        [(
+                            "label".parse().expect("label"),
+                            Scalar::Value(Value::from("updated")),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    )),
+                )
+                .await
+                .expect("update slice");
 
                 assert_eq!(
                     table
@@ -1083,8 +1100,8 @@ fn local_slice_update_and_truncate_stream_through_delegated_storage() {
                     &[Value::from(2_u64), Value::from("beta")]
                 );
 
-                handler
-                    .delete(&txn, Scalar::Value(Value::None))
+                let handler = route::<State>(&slice, &[]).expect("slice route");
+                handler.delete().expect("DELETE handler")(&txn, Scalar::Value(Value::None))
                     .await
                     .expect("truncate slice");
                 assert!(

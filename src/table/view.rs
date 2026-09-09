@@ -10,17 +10,16 @@ use futures::TryStreamExt;
 use tc_ir::{Id, Map, TxnId};
 use tc_value::{Value, ValueCollator};
 
-use super::LocalTable;
-use super::file::PersistentTable;
+use super::file::{PersistentTable, TableFile, count, delete_row, is_empty, row_stream, upsert};
 use super::schema::TableSchema;
 use super::stream::Rows;
 
-enum TableSource<Txn> {
+enum TableSource<Txn: crate::StorageContext> {
     File(PersistentTable<Txn>),
-    Local(LocalTable),
+    Local(TableFile<Txn::File>),
 }
 
-impl<Txn> Clone for TableSource<Txn> {
+impl<Txn: crate::StorageContext> Clone for TableSource<Txn> {
     fn clone(&self) -> Self {
         match self {
             Self::File(table) => Self::File(table.clone()),
@@ -29,7 +28,7 @@ impl<Txn> Clone for TableSource<Txn> {
     }
 }
 
-impl<Txn> TableSource<Txn> {
+impl<Txn: crate::StorageContext> TableSource<Txn> {
     fn schema(&self) -> &TableSchema {
         match self {
             Self::File(table) => table.schema(),
@@ -50,12 +49,7 @@ impl<Txn> TableSource<Txn> {
                 .await
                 .map_err(tc_error::TCError::from),
             Self::Local(table) => {
-                let rows = table
-                    .clone()
-                    .into_read()
-                    .await
-                    .rows(range, &order, reverse, None)
-                    .await?;
+                let rows = row_stream(table, range, &order, reverse).await?;
                 Ok(Rows::local(rows))
             }
         }
@@ -64,22 +58,14 @@ impl<Txn> TableSource<Txn> {
     async fn count(&self, txn_id: TxnId, range: Range<Id, Value>) -> tc_error::TCResult<u64> {
         match self {
             Self::File(table) => Ok(table.count_in(txn_id, range).await),
-            Self::Local(table) => table
-                .read()
-                .await
-                .count(range)
-                .await
-                .map_err(tc_error::TCError::from),
+            Self::Local(table) => count(table, range).await.map_err(tc_error::TCError::from),
         }
     }
 
     async fn is_empty(&self, txn_id: TxnId, range: Range<Id, Value>) -> tc_error::TCResult<bool> {
         match self {
             Self::File(table) => Ok(table.is_empty_in(txn_id, range).await),
-            Self::Local(table) => table
-                .read()
-                .await
-                .is_empty(range)
+            Self::Local(table) => is_empty(table, range)
                 .await
                 .map_err(tc_error::TCError::from),
         }
@@ -91,14 +77,14 @@ impl<Txn> TableSource<Txn> {
 /// Constructed via [`PersistentTable::slice`] or [`PersistentTable::order_by`].
 /// All operations delegate to the source table with the stored range, order,
 /// and direction applied. The view is structural — it holds no row data.
-pub struct TableSlice<Txn> {
+pub struct TableSlice<Txn: crate::StorageContext> {
     table: TableSource<Txn>,
     range: Range<Id, Value>,
     order: Vec<Id>,
     reverse: bool,
 }
 
-impl<Txn> Clone for TableSlice<Txn> {
+impl<Txn: crate::StorageContext> Clone for TableSlice<Txn> {
     fn clone(&self) -> Self {
         Self {
             table: self.table.clone(),
@@ -109,7 +95,7 @@ impl<Txn> Clone for TableSlice<Txn> {
     }
 }
 
-impl<Txn> fmt::Debug for TableSlice<Txn> {
+impl<Txn: crate::StorageContext> fmt::Debug for TableSlice<Txn> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TableSlice")
             .field("range", &self.range)
@@ -119,7 +105,7 @@ impl<Txn> fmt::Debug for TableSlice<Txn> {
     }
 }
 
-impl<Txn> TableSlice<Txn> {
+impl<Txn: crate::StorageContext> TableSlice<Txn> {
     fn from_source(
         table: TableSource<Txn>,
         range: Range<Id, Value>,
@@ -144,7 +130,7 @@ impl<Txn> TableSlice<Txn> {
     }
 
     pub(crate) fn local(
-        table: LocalTable,
+        table: TableFile<Txn::File>,
         range: Range<Id, Value>,
         order: Vec<Id>,
         reverse: bool,
@@ -279,7 +265,7 @@ impl<Txn> TableSlice<Txn> {
 }
 
 pub(crate) async fn update_local<Txn: crate::StorageContext>(
-    table: &LocalTable,
+    table: &TableFile<Txn::File>,
     txn: &Txn,
     range: Range<Id, Value>,
     values: Map<Value>,
@@ -297,7 +283,7 @@ pub(crate) async fn update_local<Txn: crate::StorageContext>(
 }
 
 pub(crate) async fn truncate_local<Txn: crate::StorageContext>(
-    table: &LocalTable,
+    table: &TableFile<Txn::File>,
     txn: &Txn,
     range: Range<Id, Value>,
 ) -> tc_error::TCResult<()> {
@@ -305,14 +291,14 @@ pub(crate) async fn truncate_local<Txn: crate::StorageContext>(
 }
 
 async fn rewrite_local<Txn: crate::StorageContext>(
-    table: &LocalTable,
+    table: &TableFile<Txn::File>,
     txn: &Txn,
     range: Range<Id, Value>,
     updates: Option<Map<Value>>,
 ) -> tc_error::TCResult<()> {
     let schema = table.schema().clone();
     let temp_txn = txn.subcontext_unique();
-    let temp = LocalTable::create(
+    let temp = b_table::TableLock::create(
         schema.clone(),
         ValueCollator::default(),
         temp_txn.context().await?,
@@ -320,44 +306,36 @@ async fn rewrite_local<Txn: crate::StorageContext>(
     .map_err(tc_error::TCError::from)?;
     let key_len = schema.key().len();
 
-    let mut rows = table
-        .clone()
-        .into_read()
-        .await
-        .rows(range, &[], false, None)
-        .await
-        .map_err(tc_error::TCError::from)?;
-    while let Some(row) = rows.try_next().await.map_err(tc_error::TCError::from)? {
-        let mut row = row.into_vec();
-        if let Some(updates) = updates.as_ref() {
-            for (i, name) in schema.values().iter().enumerate() {
-                if let Some(value) = updates.get(name) {
-                    row[key_len + i] = value.clone();
+    {
+        let mut rows = row_stream(table, range, &[], false)
+            .await
+            .map_err(tc_error::TCError::from)?;
+        while let Some(row) = rows.try_next().await.map_err(tc_error::TCError::from)? {
+            let mut row = row.into_vec();
+            if let Some(updates) = updates.as_ref() {
+                for (i, name) in schema.values().iter().enumerate() {
+                    if let Some(value) = updates.get(name) {
+                        row[key_len + i] = value.clone();
+                    }
                 }
             }
+
+            let values = row.split_off(key_len);
+            upsert(&temp, row, values).await?;
         }
-
-        let values = row.split_off(key_len);
-        temp.write().await.upsert(row, values).await?;
     }
-    drop(rows);
 
-    let mut staged = temp
-        .into_read()
-        .await
-        .into_rows()
+    let mut staged = row_stream(&temp, Range::default(), &[], false)
         .await
         .map_err(tc_error::TCError::from)?;
     while let Some(row) = staged.try_next().await.map_err(tc_error::TCError::from)? {
         let mut row = row.into_vec();
         let values = row.split_off(key_len);
-        let mut table = table.write().await;
-        table
-            .delete_row(&row)
+        delete_row(table, &row)
             .await
             .map_err(tc_error::TCError::from)?;
         if updates.is_some() {
-            table.upsert(row, values).await?;
+            upsert(table, row, values).await?;
         }
     }
 
@@ -369,12 +347,12 @@ async fn rewrite_local<Txn: crate::StorageContext>(
 /// Constructed via [`TableSlice::limit`] or [`PersistentTable::limit`].
 /// `count` streams rows and stops at the cap — no full materialization.
 #[derive(Clone)]
-pub struct Limited<Txn> {
+pub struct Limited<Txn: crate::StorageContext> {
     source: TableSlice<Txn>,
     limit: u64,
 }
 
-impl<Txn> fmt::Debug for Limited<Txn> {
+impl<Txn: crate::StorageContext> fmt::Debug for Limited<Txn> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Limited")
             .field("limit", &self.limit)
@@ -382,7 +360,7 @@ impl<Txn> fmt::Debug for Limited<Txn> {
     }
 }
 
-impl<Txn> Limited<Txn> {
+impl<Txn: crate::StorageContext> Limited<Txn> {
     pub fn schema(&self) -> &TableSchema {
         self.source.schema()
     }
@@ -464,14 +442,14 @@ impl<Txn> Limited<Txn> {
 /// The projection is applied lazily during streaming — no rows are copied
 /// until the stream is polled.
 #[derive(Clone)]
-pub struct Selection<Txn> {
+pub struct Selection<Txn: crate::StorageContext> {
     source: TableSlice<Txn>,
     schema: TableSchema,
     columns: Vec<Id>,
     limit: Option<u64>,
 }
 
-impl<Txn> fmt::Debug for Selection<Txn> {
+impl<Txn: crate::StorageContext> fmt::Debug for Selection<Txn> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Selection")
             .field("columns", &self.columns)
@@ -479,7 +457,7 @@ impl<Txn> fmt::Debug for Selection<Txn> {
     }
 }
 
-impl<Txn> Selection<Txn> {
+impl<Txn: crate::StorageContext> Selection<Txn> {
     pub fn schema(&self) -> &TableSchema {
         &self.schema
     }
