@@ -302,8 +302,25 @@ impl<Txn: crate::StorageContext> fmt::Debug for PersistentTable<Txn> {
 
 impl<Txn: crate::StorageContext> PersistentTable<Txn> {
     pub fn new(persistent_dir: DirLock<Txn::File>, schema: TableSchema) -> Self {
-        let persistent = Self::load_store(persistent_dir.clone(), schema.clone());
+        Self::try_new(persistent_dir, schema).expect("create persistent Table store")
+    }
 
+    /// Create in empty caller-delegated storage.
+    pub fn try_new(
+        persistent_dir: DirLock<Txn::File>,
+        schema: TableSchema,
+    ) -> std::io::Result<Self> {
+        let persistent =
+            TableLock::create(schema.clone(), ValueCollator::default(), persistent_dir)?;
+        Ok(Self::from_store(schema, persistent))
+    }
+
+    pub fn load(persistent_dir: DirLock<Txn::File>, schema: TableSchema) -> std::io::Result<Self> {
+        let persistent = TableLock::load(schema.clone(), ValueCollator::default(), persistent_dir)?;
+        Ok(Self::from_store(schema, persistent))
+    }
+
+    fn from_store(schema: TableSchema, persistent: TableFile<Txn::File>) -> Self {
         let state = State {
             persistent,
             committed: BTreeMap::new(),
@@ -340,6 +357,15 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
             state.persistent.clone()
         };
         persistent.sync().await
+    }
+
+    /// Explicitly make canonical storage durable without publishing pending versions.
+    pub async fn sync_all(&self) -> std::io::Result<()> {
+        let persistent = {
+            let state = self.state.read().expect("state read lock");
+            state.persistent.clone()
+        };
+        persistent.sync_all().await
     }
 
     pub async fn upsert_row(
@@ -858,11 +884,6 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         Ok(())
     }
 
-    fn load_store(persistent_dir: DirLock<Txn::File>, schema: TableSchema) -> TableFile<Txn::File> {
-        TableLock::load(schema, ValueCollator::default(), persistent_dir)
-            .expect("load persistent Table store")
-    }
-
     async fn pending_delta_for_txn(&self, txn: &Txn) -> Result<Delta<Txn::File>, txn_lock::Error> {
         let txn_id = txn.id();
         let schema = {
@@ -894,9 +915,9 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         };
 
         let delta = Delta {
-            inserts: TableLock::load(schema.clone(), ValueCollator::default(), inserts_dir)
+            inserts: TableLock::create(schema.clone(), ValueCollator::default(), inserts_dir)
                 .map_err(background_error)?,
-            deletes: TableLock::load(schema, ValueCollator::default(), deletes_dir)
+            deletes: TableLock::create(schema, ValueCollator::default(), deletes_dir)
                 .map_err(background_error)?,
         };
 

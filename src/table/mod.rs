@@ -77,6 +77,26 @@ impl<Txn: crate::StorageContext> From<Selection<Txn>> for Table<Txn> {
 }
 
 impl<Txn: crate::StorageContext> Table<Txn> {
+    pub fn is_persistent(&self) -> bool {
+        matches!(self, Self::File(_))
+    }
+
+    /// Synchronize canonical storage of a persistent owner.
+    pub async fn sync(&self) -> TCResult<()> {
+        match self {
+            Self::File(table) => table.sync().await.map_err(Into::into),
+            _ => Err(TCError::bad_request("expected a persistent Table owner")),
+        }
+    }
+
+    /// Explicitly make canonical storage durable without publishing pending versions.
+    pub async fn sync_all(&self) -> TCResult<()> {
+        match self {
+            Self::File(table) => table.sync_all().await.map_err(Into::into),
+            _ => Err(TCError::bad_request("expected a persistent Table owner")),
+        }
+    }
+
     pub fn schema(&self) -> &TableSchema {
         match self {
             Self::File(t) => t.schema(),

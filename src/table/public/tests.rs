@@ -13,9 +13,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tc_ir::{Claim, Map, NetworkTime, Scalar, Transact, Transaction, TxnId};
+use tc_ir::{Map, NetworkTime, Scalar, Transact, Transaction, TxnId};
 use tc_value::{Value, ValueCollator, ValueType};
-use umask::Mode;
 
 fn segment(name: &str) -> pathlink::PathSegment {
     pathlink::PathSegment::from_str(name).expect("path segment")
@@ -154,7 +153,6 @@ impl crate::CollectionState for State {
 #[derive(Clone, Debug)]
 struct MockTxn {
     id: TxnId,
-    claim: Claim,
     root: freqfs::DirLock<PersistentFile>,
     path: Vec<String>,
     unique: Arc<AtomicU64>,
@@ -177,10 +175,6 @@ impl MockTxn {
         let root = cache.load(root).expect("load transaction root");
         Self {
             id: tx(nonce),
-            claim: Claim::new(
-                pathlink::Link::from_str("/test").expect("link"),
-                Mode::all(),
-            ),
             root,
             path: Vec::new(),
             unique: Arc::new(AtomicU64::new(0)),
@@ -230,12 +224,6 @@ impl crate::StorageContext for MockTxn {
 impl Transaction for MockTxn {
     fn id(&self) -> TxnId {
         self.id
-    }
-    fn timestamp(&self) -> NetworkTime {
-        self.id.timestamp()
-    }
-    fn claim(&self) -> &Claim {
-        &self.claim
     }
 }
 
@@ -1021,13 +1009,18 @@ fn insert_is_strict_and_is_empty_is_direct() {
             ]
             .into_iter()
             .collect();
-            insert.post().expect("POST handler")(&txn, params.clone())
+            let key = Scalar::Value(Value::Tuple(vec![Value::from(4_u64)]));
+            let values = params
+                .get(&"values".parse::<tc_ir::Id>().expect("values id"))
+                .unwrap()
+                .clone();
+            insert.put().expect("PUT handler")(&txn, key.clone(), values.clone())
                 .await
                 .expect("insert row");
             assert!(table.contains_row(tx(30), &[Value::from(4_u64)]).await);
 
             let insert = route::<State>(&table, &[segment("insert")]).expect("insert route");
-            let duplicate = insert.post().expect("POST handler")(&txn, params).await;
+            let duplicate = insert.put().expect("PUT handler")(&txn, key, values).await;
             assert!(
                 duplicate.is_err(),
                 "strict insert must reject a visible key"

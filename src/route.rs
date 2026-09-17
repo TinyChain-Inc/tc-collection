@@ -70,10 +70,10 @@ mod tests {
     use std::sync::Arc;
 
     use freqfs::Cache;
-    use pathlink::{Link, PathSegment};
+    use pathlink::PathSegment;
     use safecast::TryCastFrom;
     use tc_error::TCError;
-    use tc_ir::{Claim, NetworkTime, Transaction, TxnId};
+    use tc_ir::{NetworkTime, Transaction, TxnId};
     use tc_value::Value;
 
     use super::*;
@@ -171,7 +171,6 @@ mod tests {
     #[derive(Clone, Debug)]
     struct TestTxn {
         id: TxnId,
-        claim: Claim,
         root: freqfs::DirLock<crate::PersistentFile>,
         path: Vec<String>,
     }
@@ -195,7 +194,6 @@ mod tests {
             let root = cache.load(root).expect("load transaction root");
             Self {
                 id: TxnId::from_parts(NetworkTime::from_nanos(1), 1),
-                claim: Claim::new(Link::from_str("/test").expect("claim"), umask::Mode::all()),
                 root,
                 path: Vec::new(),
             }
@@ -204,12 +202,6 @@ mod tests {
     impl Transaction for TestTxn {
         fn id(&self) -> TxnId {
             self.id
-        }
-        fn timestamp(&self) -> NetworkTime {
-            self.id().timestamp()
-        }
-        fn claim(&self) -> &Claim {
-            &self.claim
         }
     }
 

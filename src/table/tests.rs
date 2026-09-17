@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tc_ir::{Claim, NetworkTime, Transaction, TxnId};
+use tc_ir::{NetworkTime, Transaction, TxnId};
 use tc_value::{Value, ValueType};
 use tokio::sync::Barrier;
 use tokio::time::{Duration, sleep, timeout};
@@ -23,7 +23,6 @@ fn tx(nonce: u16) -> TxnId {
 #[derive(Clone)]
 struct TestTxn {
     id: TxnId,
-    claim: Claim,
     root: freqfs::DirLock<PersistentFile>,
     path: Vec<String>,
 }
@@ -32,7 +31,6 @@ impl TestTxn {
     fn new(id: TxnId, root: freqfs::DirLock<PersistentFile>) -> Self {
         Self {
             id,
-            claim: Claim::new("/test".parse().expect("test claim"), umask::Mode::all()),
             root,
             path: Vec::new(),
         }
@@ -42,14 +40,6 @@ impl TestTxn {
 impl Transaction for TestTxn {
     fn id(&self) -> TxnId {
         self.id
-    }
-
-    fn timestamp(&self) -> NetworkTime {
-        self.id.timestamp()
-    }
-
-    fn claim(&self) -> &Claim {
-        &self.claim
     }
 }
 
@@ -2439,6 +2429,7 @@ fn restart_drops_uncommitted_pending_table() {
             {
                 let (persistent, txn) = load_roots(&root);
                 let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
+                table.sync().await.expect("publish initial canonical table");
 
                 table
                     .upsert_row(
@@ -2452,7 +2443,7 @@ fn restart_drops_uncommitted_pending_table() {
 
             // Reload — pending delta should be gone (no WAL owned by Table).
             let (persistent, _) = load_roots(&root);
-            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
+            let table = PersistentTable::<TestTxn>::load(persistent, simple_schema()).unwrap();
 
             assert!(table.is_empty(tx(20)).await);
             assert!(
@@ -2495,7 +2486,7 @@ fn restart_reconstructs_committed_state_table() {
 
             // Reload from the same dirs — canon should have the finalized rows.
             let (persistent, _) = load_roots(&root);
-            let table = PersistentTable::<TestTxn>::new(persistent, simple_schema());
+            let table = PersistentTable::<TestTxn>::load(persistent, simple_schema()).unwrap();
 
             assert_eq!(table.count(tx(20)).await, 5);
             assert!(table.contains_row(tx(20), &[Value::from(3_u64)]).await);
@@ -2551,7 +2542,7 @@ fn schema_mismatch_merge_fails_closed_table() {
             // Loading with a mismatched schema should either fail at load or
             // fail closed on first operation. We test that data written with one
             // schema is not silently accepted under a different schema.
-            let table_b = PersistentTable::<TestTxn>::new(persistent, mismatched_schema);
+            let table_b = PersistentTable::<TestTxn>::load(persistent, mismatched_schema).unwrap();
 
             // The mismatched table should fail closed — reading a row written
             // under the original schema must not silently return wrong data.

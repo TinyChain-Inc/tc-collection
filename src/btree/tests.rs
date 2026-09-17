@@ -8,7 +8,7 @@ use std::ops::Bound;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tc_ir::{Claim, NetworkTime, Transaction, TxnId};
+use tc_ir::{NetworkTime, Transaction, TxnId};
 use tc_value::Value;
 use tokio::sync::Barrier;
 use tokio::time::{Duration, sleep, timeout};
@@ -20,7 +20,6 @@ fn tx(nonce: u16) -> TxnId {
 #[derive(Clone)]
 struct TestTxn {
     id: TxnId,
-    claim: Claim,
     root: freqfs::DirLock<PersistentFile>,
     path: Vec<String>,
 }
@@ -29,7 +28,6 @@ impl TestTxn {
     fn new(id: TxnId, root: freqfs::DirLock<PersistentFile>) -> Self {
         Self {
             id,
-            claim: Claim::new("/test".parse().expect("test claim"), umask::Mode::all()),
             root,
             path: Vec::new(),
         }
@@ -39,14 +37,6 @@ impl TestTxn {
 impl Transaction for TestTxn {
     fn id(&self) -> TxnId {
         self.id
-    }
-
-    fn timestamp(&self) -> NetworkTime {
-        self.id.timestamp()
-    }
-
-    fn claim(&self) -> &Claim {
-        &self.claim
     }
 }
 
