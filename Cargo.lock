@@ -1236,7 +1236,6 @@ dependencies = [
  "safecast",
  "tc-error",
  "tc-value",
- "umask",
 ]
 
 [[package]]

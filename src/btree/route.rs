@@ -1,7 +1,7 @@
 use std::ops::Bound;
 
 use pathlink::PathSegment;
-use safecast::CastInto;
+use safecast::{CastInto, TryCastFrom};
 use tc_error::{TCError, TCResult};
 use tc_ir::{Id, Map};
 use tc_value::Value;
@@ -53,12 +53,13 @@ impl<Txn: crate::StorageContext> BTreeView<Txn> {
 }
 
 fn row_from_state<S: CollectionState>(state: S, context: &str) -> TCResult<Vec<Value>> {
-    state
-        .into_tuple()?
-        .into_iter()
-        .map(|value| value.into_value())
-        .collect::<TCResult<Vec<_>>>()
-        .map_err(|_| TCError::bad_request(format!("expected {context} values")))
+    let value = Value::try_cast_from(state.into_scalar()?, |_| {
+        TCError::bad_request(format!("expected {context} values"))
+    })?;
+    match value {
+        Value::Tuple(row) => Ok(row),
+        _ => Err(TCError::bad_request(format!("expected {context} tuple"))),
+    }
 }
 
 fn slice_bounds_from_state<S: CollectionState>(key: S) -> TCResult<(BTreeBounds, bool)> {
@@ -92,17 +93,6 @@ fn bound_from_map<S: CollectionState>(
         Some(value) if !value.is_none() => Ok(bound(value.into_value()?)),
         _ => Ok(Bound::Unbounded),
     }
-}
-
-fn row_param<S: CollectionState>(params: &Map<S>) -> TCResult<Vec<Value>> {
-    let row_id: Id = "row".parse().expect("valid row parameter");
-    row_from_state(
-        params
-            .get(&row_id)
-            .cloned()
-            .ok_or_else(|| TCError::bad_request("missing BTree row parameter"))?,
-        "BTree row",
-    )
 }
 
 impl<'a, S, Txn> tc_ir::Handler<'a, S> for DeleteRow<'a, Txn>
@@ -219,18 +209,20 @@ where
     S: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
 {
-    fn post<'txn>(self: Box<Self>) -> Option<tc_ir::PostHandler<'a, 'txn, S>>
+    fn put<'txn>(self: Box<Self>) -> Option<tc_ir::PutHandler<'a, 'txn, S>>
     where
         'txn: 'a,
     {
-        Some(Box::new(move |txn, params| {
+        Some(Box::new(move |txn, key, row| {
             Box::pin(async move {
+                if !S::from(key).is_none() {
+                    return Err(TCError::bad_request("BTree insert expects a null key"));
+                }
                 self.0
                     .btree
-                    .insert_row(txn, row_param(&params)?)
+                    .insert_row(txn, row_from_state(row, "BTree row")?)
                     .await
-                    .map_err(|err| TCError::bad_request(err.to_string()))?;
-                Ok(S::from(Value::None))
+                    .map_err(|err| TCError::bad_request(err.to_string()))
             })
         }))
     }
@@ -241,18 +233,17 @@ where
     S: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
 {
-    fn post<'txn>(self: Box<Self>) -> Option<tc_ir::PostHandler<'a, 'txn, S>>
+    fn delete<'txn>(self: Box<Self>) -> Option<tc_ir::DeleteHandler<'a, 'txn, S>>
     where
         'txn: 'a,
     {
-        Some(Box::new(move |txn, params| {
+        Some(Box::new(move |txn, key| {
             Box::pin(async move {
                 self.0
                     .btree
-                    .delete_row(txn, row_param(&params)?)
+                    .delete_row(txn, row_from_state(S::from(key), "BTree row")?)
                     .await
-                    .map_err(|err| TCError::bad_request(err.to_string()))?;
-                Ok(S::from(Value::None))
+                    .map_err(|err| TCError::bad_request(err.to_string()))
             })
         }))
     }

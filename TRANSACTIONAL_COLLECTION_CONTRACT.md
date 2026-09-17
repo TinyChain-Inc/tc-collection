@@ -65,6 +65,13 @@ limits compose beneath any broader admission policy supplied by the caller.
 
 ## Persistence and recovery
 
+Creation requires empty delegated storage. Loading requires existing roots and
+all schema-required indexes; it never initializes missing state. The caller owns
+publication and explicitly synchronizes initial canonical state before relying
+on restart loading.
+
+Snapshot copying and replacement are not provided by this crate.
+
 Local materializations may accelerate access but are not an independent source
 of canonical history. Collection code must deterministically apply the ordered
 mutations supplied by its caller. It must not add a WAL, replay registry,

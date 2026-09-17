@@ -165,6 +165,38 @@ impl<Txn: crate::StorageContext> From<Table<Txn>> for Collection<Txn> {
 }
 
 impl<Txn: crate::StorageContext> Collection<Txn> {
+    /// Whether this value is a full persistent owner rather than a view or Tensor.
+    pub fn is_persistent(&self) -> bool {
+        match self {
+            Self::BTree(view) => {
+                view.bounds == (Bound::Unbounded, Bound::Unbounded) && !view.reverse
+            }
+            Self::Table(table) => table.is_persistent(),
+            Self::Tensor(_) => false,
+        }
+    }
+
+    /// Synchronize canonical storage without publishing pending transaction versions.
+    pub async fn sync(&self) -> tc_error::TCResult<()> {
+        match self {
+            Self::BTree(view) => view.btree.sync().await.map_err(Into::into),
+            Self::Table(table) => table.sync().await,
+            Self::Tensor(_) => Err(tc_error::TCError::bad_request(
+                "persistent Tensor subjects are not supported",
+            )),
+        }
+    }
+
+    /// Explicitly make canonical storage durable without publishing pending versions.
+    pub async fn sync_all(&self) -> tc_error::TCResult<()> {
+        match self {
+            Self::BTree(view) => view.btree.sync_all().await.map_err(Into::into),
+            Self::Table(table) => table.sync_all().await,
+            Self::Tensor(_) => Err(tc_error::TCError::bad_request(
+                "persistent Tensor subjects are not supported",
+            )),
+        }
+    }
     pub fn as_btree(&self) -> Option<&BTree<Txn>> {
         match self {
             Self::BTree(btree) => Some(&btree.btree),

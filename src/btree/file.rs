@@ -312,8 +312,24 @@ impl<Txn: crate::StorageContext> BTree<Txn> {
     }
 
     pub fn with_schema(persistent_dir: DirLock<Txn::File>, schema: BTreeSchema) -> Self {
-        let persistent = Self::load_store(persistent_dir.clone(), schema);
+        Self::try_with_schema(persistent_dir, schema).expect("create persistent BTree store")
+    }
 
+    /// Create in empty caller-delegated storage.
+    pub fn try_with_schema(
+        persistent_dir: DirLock<Txn::File>,
+        schema: BTreeSchema,
+    ) -> std::io::Result<Self> {
+        let persistent = BTreeLock::create(schema, ValueCollator::default(), persistent_dir)?;
+        Ok(Self::from_store(persistent))
+    }
+
+    pub fn load(persistent_dir: DirLock<Txn::File>, schema: BTreeSchema) -> std::io::Result<Self> {
+        let persistent = BTreeLock::load(schema, ValueCollator::default(), persistent_dir)?;
+        Ok(Self::from_store(persistent))
+    }
+
+    fn from_store(persistent: BTreeLock<BTreeSchema, ValueCollator, Txn::File>) -> Self {
         let state = State {
             persistent,
             committed: BTreeMap::new(),
@@ -328,6 +344,29 @@ impl<Txn: crate::StorageContext> BTree<Txn> {
             )),
             txn: PhantomData,
         }
+    }
+
+    pub async fn sync(&self) -> std::io::Result<()> {
+        let persistent = {
+            self.state
+                .read()
+                .expect("state read lock")
+                .persistent
+                .clone()
+        };
+        persistent.sync().await
+    }
+
+    /// Explicitly make canonical storage durable without publishing pending versions.
+    pub async fn sync_all(&self) -> std::io::Result<()> {
+        let persistent = {
+            self.state
+                .read()
+                .expect("state read lock")
+                .persistent
+                .clone()
+        };
+        persistent.sync_all().await
     }
 
     pub fn finalized(&self) -> Option<TxnId> {
@@ -771,14 +810,6 @@ impl<Txn: crate::StorageContext> BTree<Txn> {
         Ok(())
     }
 
-    fn load_store(
-        persistent_dir: DirLock<Txn::File>,
-        schema: BTreeSchema,
-    ) -> BTreeLock<BTreeSchema, ValueCollator, Txn::File> {
-        BTreeLock::load(schema, ValueCollator::default(), persistent_dir)
-            .expect("load persistent BTree store")
-    }
-
     async fn pending_delta_for_txn(&self, txn: &Txn) -> Result<Delta<Txn::File>, txn_lock::Error> {
         let txn_id = txn.id();
         let key_schema = {
@@ -810,9 +841,9 @@ impl<Txn: crate::StorageContext> BTree<Txn> {
         };
 
         let delta = Delta {
-            inserts: BTreeLock::load(key_schema.clone(), ValueCollator::default(), inserts)
+            inserts: BTreeLock::create(key_schema.clone(), ValueCollator::default(), inserts)
                 .map_err(background_error)?,
-            deletes: BTreeLock::load(key_schema, ValueCollator::default(), deletes)
+            deletes: BTreeLock::create(key_schema, ValueCollator::default(), deletes)
                 .map_err(background_error)?,
         };
 

@@ -380,21 +380,20 @@ where
     State: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
 {
-    fn post<'txn>(self: Box<Self>) -> Option<tc_ir::PostHandler<'a, 'txn, State>>
+    fn put<'txn>(self: Box<Self>) -> Option<tc_ir::PutHandler<'a, 'txn, State>>
     where
         'txn: 'a,
     {
-        Some(Box::new(move |txn, mut request| {
+        Some(Box::new(move |txn, key, values| {
             Box::pin(async move {
                 let table = self.table.clone();
-                let key = value_from_state(request.require("key")?, "a Table key")?;
+                let key = value_from_state(State::from(key), "a Table key")?;
                 let key: Vec<Value> =
                     key.try_cast_into(|value| bad_request!("expected a Table key, not {value:?}"))?;
-                let values = value_from_state(request.require("values")?, "Table values")?;
+                let values = value_from_state(values, "Table values")?;
                 let values: Vec<Value> = values
                     .try_cast_into(|value| bad_request!("expected Table values, not {value:?}"))?;
-                table.insert_row(txn, key, values).await?;
-                Ok(State::from(Value::None))
+                table.insert_row(txn, key, values).await
             })
         }))
     }
