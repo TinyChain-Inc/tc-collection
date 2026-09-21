@@ -1,7 +1,4 @@
-use destream::{
-    de,
-    en::{self, EncodeSeq},
-};
+use destream::{de, en};
 use number_general::Number;
 use safecast::TryCastFrom;
 use tc_value::class::NativeClass;
@@ -16,75 +13,68 @@ pub struct BTreeColumnSchema {
     pub max_size: Option<Number>,
 }
 
+impl From<BTreeColumnSchema> for Value {
+    fn from(column: BTreeColumnSchema) -> Self {
+        let mut fields = vec![
+            Value::from(column.name),
+            Value::from(column.dtype.path().to_string()),
+        ];
+        if let Some(size) = column.max_size {
+            fields.push(Value::Number(size));
+        }
+
+        Value::Tuple(fields)
+    }
+}
+
+impl TryCastFrom<Value> for BTreeColumnSchema {
+    fn can_cast_from(value: &Value) -> bool {
+        Self::opt_cast_from(value.clone()).is_some()
+    }
+
+    fn opt_cast_from(value: Value) -> Option<Self> {
+        let Value::Tuple(fields) = value else {
+            return None;
+        };
+        if !(2..=3).contains(&fields.len()) {
+            return None;
+        }
+
+        let mut fields = fields.into_iter();
+        let Value::String(name) = fields.next()? else {
+            return None;
+        };
+        let Value::String(dtype) = fields.next()? else {
+            return None;
+        };
+        let path = dtype.as_str().parse::<pathlink::PathBuf>().ok()?;
+        let max_size = match fields.next() {
+            Some(Value::Number(size)) => Some(size),
+            None => None,
+            _ => return None,
+        };
+
+        Some(Self {
+            name: name.to_string(),
+            dtype: ValueType::from_path(&path)?,
+            max_size,
+        })
+    }
+}
+
 impl<'en> en::IntoStream<'en> for BTreeColumnSchema {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        let mut seq = encoder.encode_seq(Some(if self.max_size.is_some() { 3 } else { 2 }))?;
-        seq.encode_element(self.name)?;
-        seq.encode_element(self.dtype.path().to_string())?;
-        if let Some(max_size) = self.max_size {
-            seq.encode_element(max_size)?;
-        }
-        seq.end()
+        Value::from(self).into_stream(encoder)
     }
 }
 
 impl de::FromStream for BTreeColumnSchema {
     type Context = ();
 
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct ColumnVisitor;
-
-        impl de::Visitor for ColumnVisitor {
-            type Value = BTreeColumnSchema;
-
-            fn expecting() -> &'static str {
-                "a BTree schema column [name, dtype, optional max_size]"
-            }
-
-            async fn visit_seq<A: de::SeqAccess>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                let name = seq
-                    .next_element::<String>(())
-                    .await?
-                    .ok_or_else(|| de::Error::custom("missing BTree schema column name"))?;
-
-                let dtype = seq
-                    .next_element::<String>(())
-                    .await?
-                    .ok_or_else(|| de::Error::custom("missing BTree schema column dtype"))?;
-
-                let path = dtype.parse::<pathlink::PathBuf>().map_err(|err| {
-                    de::Error::custom(format!("invalid BTree schema dtype {dtype:?}: {err}"))
-                })?;
-
-                let dtype = ValueType::from_path(path.as_ref()).ok_or_else(|| {
-                    de::Error::custom(format!(
-                        "unsupported BTree schema dtype path {dtype}; expected a /state/scalar/value/... URI"
-                    ))
-                })?;
-
-                let max_size = seq.next_element::<Number>(()).await?;
-
-                if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
-                    return Err(de::Error::custom(
-                        "BTree schema column entries must have length 2 or 3",
-                    ));
-                }
-
-                Ok(BTreeColumnSchema {
-                    name,
-                    dtype,
-                    max_size,
-                })
-            }
-        }
-
-        decoder.decode_seq(ColumnVisitor).await
+    async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
+        Self::try_cast_from(Value::from_stream((), decoder).await?, |_| {
+            de::Error::custom("invalid BTree schema column [name, dtype, optional max_size]")
+        })
     }
 }
 

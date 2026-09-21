@@ -19,6 +19,7 @@ pub use stream::Rows;
 pub use view::{Limited, Selection, TableSlice};
 
 pub use b_table::{ColumnRange, Range, Row};
+use futures::TryStreamExt;
 use futures::{StreamExt, stream::BoxStream};
 use tc_error::{TCError, TCResult};
 use tc_ir::TxnId;
@@ -77,6 +78,22 @@ impl<Txn: crate::StorageContext> From<Selection<Txn>> for Table<Txn> {
 }
 
 impl<Txn: crate::StorageContext> Table<Txn> {
+    /// Copy the visible rows into unpublished caller-delegated storage.
+    pub async fn copy_into(
+        &self,
+        txn: &Txn,
+        dir: freqfs::DirLock<Txn::File>,
+    ) -> TCResult<PersistentTable<Txn>> {
+        let target = PersistentTable::try_new(dir, self.schema().clone())?;
+
+        let mut rows = self.row_stream(txn.id()).await?;
+        while let Some(row) = rows.try_next().await? {
+            target.load_literal_row(row.into_vec()).await?;
+        }
+
+        Ok(target)
+    }
+
     pub fn is_persistent(&self) -> bool {
         matches!(self, Self::File(_))
     }

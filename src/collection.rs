@@ -2,13 +2,59 @@ use std::cmp::Ordering;
 use std::ops::Bound;
 
 use collate::Collate;
-use safecast::TryCastFrom;
-use tc_ir::{Transact, TxnId};
+use futures::TryStreamExt;
+use safecast::{CastFrom, TryCastFrom};
+use tc_ir::{Sha256Hash, Transact, TxnId};
+use tc_value::class::NativeClass;
 use tc_value::{Value, ValueCollator};
 
 use crate::btree::{BTree, BTreeColumnSchema};
 use crate::table::{PersistentTable, Table};
 use crate::tensor::Tensor;
+
+/// Schema required to strictly reopen a native persistent collection.
+#[derive(Clone, Debug)]
+pub enum CollectionSchema {
+    BTree(Vec<BTreeColumnSchema>),
+    Table(crate::table::TableSchema),
+}
+
+impl From<CollectionSchema> for (pathlink::PathBuf, Value) {
+    fn from(schema: CollectionSchema) -> Self {
+        match schema {
+            CollectionSchema::BTree(columns) => (
+                crate::BTreeType.path(),
+                Value::Tuple(columns.into_iter().map(Value::from).collect()),
+            ),
+            CollectionSchema::Table(schema) => (crate::TableType.path(), Value::cast_from(schema)),
+        }
+    }
+}
+
+impl TryCastFrom<(pathlink::PathBuf, Value)> for CollectionSchema {
+    fn can_cast_from(value: &(pathlink::PathBuf, Value)) -> bool {
+        Self::opt_cast_from(value.clone()).is_some()
+    }
+
+    fn opt_cast_from((path, schema): (pathlink::PathBuf, Value)) -> Option<Self> {
+        match crate::CollectionType::from_path(&path)? {
+            crate::CollectionType::BTree(_) => {
+                let Value::Tuple(columns) = schema else {
+                    return None;
+                };
+                let columns: Vec<_> = columns
+                    .into_iter()
+                    .map(BTreeColumnSchema::opt_cast_from)
+                    .collect::<Option<_>>()?;
+                crate::btree::BTreeSchema::can_cast_from(&columns).then_some(Self::BTree(columns))
+            }
+            crate::CollectionType::Table(_) => {
+                crate::table::TableSchema::opt_cast_from(schema).map(Self::Table)
+            }
+            crate::CollectionType::Tensor(_) => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct BTreeView<Txn: crate::StorageContext> {
@@ -30,6 +76,34 @@ impl<Txn: crate::StorageContext> Clone for BTreeView<Txn> {
 }
 
 impl<Txn: crate::StorageContext> BTreeView<Txn> {
+    /// Copy the visible keys into unpublished caller-delegated storage.
+    pub async fn copy_into(
+        &self,
+        txn: &Txn,
+        dir: freqfs::DirLock<Txn::File>,
+    ) -> tc_error::TCResult<Self> {
+        let schema = crate::btree::BTreeSchema::try_cast_from(self.schema.clone(), |_| {
+            tc_error::TCError::bad_request("invalid BTree schema")
+        })?;
+        let target = BTree::try_with_schema(dir, schema)?;
+
+        let mut keys = self
+            .btree
+            .keys(txn.id(), self.bounds.clone(), self.reverse)
+            .await?;
+        while let Some(mut key) = keys.try_next().await? {
+            target
+                .load_literal_row(if self.schema.len() == 1 {
+                    key.remove(0)
+                } else {
+                    Value::Tuple(key)
+                })
+                .await?;
+        }
+
+        Ok(Self::new(self.schema.clone(), target))
+    }
+
     pub fn new(schema: Vec<BTreeColumnSchema>, btree: BTree<Txn>) -> Self {
         Self {
             schema,
@@ -165,6 +239,91 @@ impl<Txn: crate::StorageContext> From<Table<Txn>> for Collection<Txn> {
 }
 
 impl<Txn: crate::StorageContext> Collection<Txn> {
+    pub fn schema(&self) -> tc_error::TCResult<CollectionSchema> {
+        match self {
+            Self::BTree(view) => Ok(CollectionSchema::BTree(view.schema.clone())),
+            Self::Table(table) => Ok(CollectionSchema::Table(table.schema().clone())),
+            Self::Tensor(_) => Err(tc_error::TCError::bad_request(
+                "persistent Tensor values are not supported",
+            )),
+        }
+    }
+
+    /// Copy a consistent value into unpublished caller-owned storage.
+    pub async fn copy_into(
+        &self,
+        txn: &Txn,
+        dir: freqfs::DirLock<Txn::File>,
+    ) -> tc_error::TCResult<Self> {
+        match self {
+            Self::BTree(view) => view
+                .copy_into(txn, dir)
+                .await
+                .map(|v| Self::BTree(Box::new(v))),
+            Self::Table(table) => table.copy_into(txn, dir).await.map(Self::from),
+            Self::Tensor(_) => Err(tc_error::TCError::bad_request(
+                "persistent Tensor values are not supported",
+            )),
+        }
+    }
+
+    /// Strictly load native storage using its recorded semantic schema.
+    pub fn load(
+        dir: freqfs::DirLock<Txn::File>,
+        schema: CollectionSchema,
+    ) -> tc_error::TCResult<Self> {
+        match schema {
+            CollectionSchema::BTree(columns) => {
+                let schema = crate::btree::BTreeSchema::try_cast_from(columns.clone(), |_| {
+                    tc_error::TCError::bad_request("invalid BTree schema")
+                })?;
+
+                Ok(Self::BTree(Box::new(BTreeView::new(
+                    columns,
+                    BTree::load(dir, schema)?,
+                ))))
+            }
+            CollectionSchema::Table(schema) => PersistentTable::load(dir, schema)
+                .map(Self::from)
+                .map_err(Into::into),
+        }
+    }
+
+    /// Hash the class and semantic schema, then ordered native contents, without encoding.
+    pub async fn hash(&self, txn_id: TxnId) -> tc_error::TCResult<Sha256Hash> {
+        use async_hash::{Digest, Hash, Sha256, hash_try_stream};
+
+        let (class, schema): (pathlink::PathBuf, Value) = self.schema()?.into();
+        let schema_hash = Hash::<Sha256>::hash((class, schema));
+
+        let hash = match self {
+            Self::BTree(view) => {
+                hash_try_stream::<Sha256, _, _, _>(
+                    view.btree
+                        .keys(txn_id, view.bounds.clone(), view.reverse)
+                        .await?,
+                )
+                .await?
+            }
+            Self::Table(table) => {
+                hash_try_stream::<Sha256, _, _, _>(
+                    table.row_stream(txn_id).await?.map_ok(|row| row.into_vec()),
+                )
+                .await?
+            }
+            Self::Tensor(_) => {
+                return Err(tc_error::TCError::bad_request(
+                    "persistent Tensor values are not supported",
+                ));
+            }
+        };
+
+        let mut digest = Sha256::new();
+        digest.update(schema_hash);
+        digest.update(hash);
+        Ok(digest.finalize())
+    }
+
     /// Whether this value is a full persistent owner rather than a view or Tensor.
     pub fn is_persistent(&self) -> bool {
         match self {

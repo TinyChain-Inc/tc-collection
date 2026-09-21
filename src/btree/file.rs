@@ -491,14 +491,10 @@ impl<Txn: crate::StorageContext> BTree<Txn> {
 
     /// Commit the pending delta at `txn_id`.
     ///
-    /// This may return `Conflict` or `Outdated` when lifecycle ordering rules are violated.
+    /// The caller must finish this transaction's operations and release its streams first.
+    /// Returns `Outdated` at or before the finalized frontier.
     pub fn commit(&self, txn_id: TxnId) -> Result<(), txn_lock::Error> {
-        // Commit mutates txn lifecycle state globally, so reserve the full range.
-        let _permit = self
-            .semaphore
-            .try_write(txn_id, txn_lock::set::Range::All)?;
-
-        let result = {
+        {
             let mut state = self.state.write().expect("state write lock");
             if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
                 Err(txn_lock::Error::Outdated)
@@ -510,49 +506,39 @@ impl<Txn: crate::StorageContext> BTree<Txn> {
                 }
                 Ok(())
             }
-        };
-        // Release waiters blocked on this txn's reservations.
-        self.release_txn_reservation(txn_id);
-        result
+        }?;
+
+        self.semaphore.finalize(&txn_id, false);
+        Ok(())
     }
 
     /// Roll back the pending delta at `txn_id`.
     ///
-    /// This may return `Conflict` or `Outdated` when lifecycle ordering rules are violated.
+    /// The caller must finish this transaction's operations and release its streams first.
+    /// Returns `Conflict` for a committed transaction or `Outdated` at the frontier.
     pub fn rollback(&self, txn_id: TxnId) -> Result<(), txn_lock::Error> {
-        // Rollback also mutates txn lifecycle state globally.
-        let _permit = self
-            .semaphore
-            .try_write(txn_id, txn_lock::set::Range::All)?;
-
-        let result = {
+        {
             let mut state = self.state.write().expect("state write lock");
             if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
-                Err(txn_lock::Error::Outdated)
+                return Err(txn_lock::Error::Outdated);
             } else if state.committed.contains_key(&txn_id) {
-                Err(txn_lock::Error::Conflict)
+                return Err(txn_lock::Error::Conflict);
             } else {
                 state.pending.remove(&txn_id);
-                Ok(())
             }
-        };
-        // Rollback completion unblocks later readers/writers on overlapping ranges.
-        self.release_txn_reservation(txn_id);
-        result
+        }
+
+        self.semaphore.finalize(&txn_id, false);
+        Ok(())
     }
 
     /// Finalize all committed deltas up to `txn_id` into persistent state.
     ///
     /// Finalize is monotonic. A stale finalize is a no-op.
     ///
-    /// Unlike commit/rollback, finalize does **not** acquire a semaphore write
-    /// permit. Finalize is a lifecycle operation that merges already-committed
-    /// data into canon — it does not introduce new pending writes. Acquiring a
-    /// write permit via `try_write` would conflict with future read reservations
-    /// (e.g. readers at txn N+1), which is incorrect: finalize at txn N should
-    /// proceed even when later transactions hold read permits. Synchronization
-    /// is provided by the state write lock, and `semaphore.finalize(drop_past=true)`
-    /// cleans up semaphore versions ≤ `txn_id`.
+    /// The caller serializes lifecycle decisions and finishes operations through the
+    /// cutoff first. Later transactions may retain read permits; merging uses native
+    /// storage locks without acquiring a new semaphore write reservation.
     pub async fn finalize(&self, txn_id: TxnId) -> Result<(), txn_lock::Error> {
         let (persistent, committed_to_apply) = {
             let state = self.state.write().expect("state write lock");
@@ -759,11 +745,6 @@ impl<Txn: crate::StorageContext> BTree<Txn> {
             .read(txn_id, range)
             .await
             .expect("acquire read permit")
-    }
-
-    #[inline]
-    fn release_txn_reservation(&self, txn_id: TxnId) {
-        self.semaphore.finalize(&txn_id, false);
     }
 
     #[inline]

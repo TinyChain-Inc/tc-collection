@@ -686,7 +686,6 @@ fn snapshot_scan_is_coherent_under_concurrent_commits() {
                         .await
                         .expect("insert future key");
                     btree.commit(tx(32)).expect("commit 32");
-                    btree.finalize(tx(32)).await.expect("finalize 32");
                 })
             };
 
@@ -694,6 +693,7 @@ fn snapshot_scan_is_coherent_under_concurrent_commits() {
 
             let saw_future_key = scan_task.await.expect("scan task join");
             writer_task.await.expect("writer task join");
+            btree.finalize(tx(32)).await.expect("finalize after scan");
 
             assert!(
                 !saw_future_key,
@@ -975,15 +975,15 @@ fn multi_column_partial_overlap_blocking_behavior() {
             .expect("disjoint composite-key read should not block");
             assert!(!disjoint);
 
-            let err = btree
+            btree
                 .commit(tx(80))
-                .expect_err("commit should conflict while future overlapping read is active");
-            assert_eq!(err, txn_lock::Error::Conflict);
-
-            let err = btree
-                .rollback(tx(80))
-                .expect_err("rollback should also conflict with active future read version");
-            assert_eq!(err, txn_lock::Error::Conflict);
+                .expect("commit preserves the disjoint future read");
+            assert!(
+                btree
+                    .contains_row(tx(81), &[Value::from("a"), Value::from(1_u64)])
+                    .await
+            );
+            assert_eq!(btree.rollback(tx(80)), Err(txn_lock::Error::Conflict));
         })
     });
 }

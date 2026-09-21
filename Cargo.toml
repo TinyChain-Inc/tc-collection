@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-hash = { path = "../deps/async-hash" }
 b-table = { path = "../deps/b-table", features = ["stream"] }
 b-tree = { path = "../deps/b-tree", features = ["stream"] }
 collate = { path = "../deps/collate", features = ["stream"] }
 destream = { path = "../deps/destream", version = "0.10.1" }
-freqfs = { path = "../deps/freqfs", version = "0.13", features = ["stream"] }
+freqfs = { path = "../deps/freqfs", version = "0.13" }
 ha-ndarray = { path = "../deps/ha-ndarray" }
 futures = "0.3"
 get-size = "0.1"
@@ -18,6 +19,7 @@ tc-ir = { path = "../tc-ir" }
 tc-error = { path = "../tc-error", features = ["txn_lock"] }
 tc-value = { path = "../tc-value" }
 pathlink = { path = "../deps/pathlink" }
+tbon = { path = "../deps/tbon", version = "0.9", features = ["tokio-io"] }
 tokio = { version = "1.51", features = ["fs", "rt", "sync", "time", "macros", "rt-multi-thread"] }
 txn_lock = { path = "../deps/txn_lock" }
 

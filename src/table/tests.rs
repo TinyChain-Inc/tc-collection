@@ -1846,14 +1846,17 @@ fn concurrent_read_write_finalize_table() {
                             )
                             .await;
                     }
-                    t_write.commit(tx(50)).expect("commit");
                 });
 
                 let finalize_task = tokio::spawn(async move {
                     t_finalize.finalize(tx(1)).await.expect("finalize");
                 });
 
-                let _ = tokio::join!(read_task, write_task, finalize_task);
+                let (read, write, finalize) = tokio::join!(read_task, write_task, finalize_task);
+                read.expect("read task");
+                write.expect("write task");
+                finalize.expect("finalize task");
+                table.commit(tx(50)).expect("commit");
             })
             .await;
 
@@ -1886,8 +1889,7 @@ fn lock_order_no_deadlock_table() {
             table.commit(tx(1)).expect("commit");
             table.finalize(tx(1)).await.expect("finalize");
 
-            // Interleave commit, finalize, read, and write at different txns
-            // to exercise lock ordering. If lock order is canonical, no deadlock.
+            // Concurrent mutations precede caller-sequenced lifecycle decisions.
             let result = timeout(Duration::from_secs(3), async {
                 let t1 = table.clone();
                 let t2 = table.clone();
@@ -1902,8 +1904,6 @@ fn lock_order_no_deadlock_table() {
                     )
                     .await
                     .expect("w1");
-                    t1.commit(tx(10)).expect("commit");
-                    t1.finalize(tx(10)).await.expect("finalize");
                 });
 
                 let w2 = tokio::spawn(async move {
@@ -1914,11 +1914,15 @@ fn lock_order_no_deadlock_table() {
                     )
                     .await
                     .expect("w2");
-                    t2.commit(tx(20)).expect("commit");
-                    t2.finalize(tx(20)).await.expect("finalize");
                 });
 
-                let _ = tokio::join!(w1, w2);
+                let (w1, w2) = tokio::join!(w1, w2);
+                w1.expect("w1 task");
+                w2.expect("w2 task");
+                table.commit(tx(10)).expect("commit 10");
+                table.finalize(tx(10)).await.expect("finalize 10");
+                table.commit(tx(20)).expect("commit 20");
+                table.finalize(tx(20)).await.expect("finalize 20");
             })
             .await;
 
@@ -2407,15 +2411,15 @@ fn multi_column_partial_overlap_blocking_behavior_table() {
                 .expect("disjoint composite-key read should not block");
                 assert!(!disjoint);
 
-                let err = table
+                table
                     .commit(tx(80))
-                    .expect_err("commit should conflict while future overlapping read is active");
-                assert_eq!(err, txn_lock::Error::Conflict);
-
-                let err = table
-                    .rollback(tx(80))
-                    .expect_err("rollback should also conflict with active future read version");
-                assert_eq!(err, txn_lock::Error::Conflict);
+                    .expect("commit preserves the disjoint future read");
+                assert!(
+                    table
+                        .contains_row(tx(81), &[Value::from(1_u64), Value::from(1_u64)])
+                        .await
+                );
+                assert_eq!(table.rollback(tx(80)), Err(txn_lock::Error::Conflict));
             })
         },
     );
@@ -2624,7 +2628,6 @@ fn snapshot_scan_is_coherent_under_concurrent_commits_table() {
                             .await
                             .expect("insert future key");
                         table.commit(tx(32)).expect("commit 32");
-                        table.finalize(tx(32)).await.expect("finalize 32");
                     })
                 };
 
@@ -2632,6 +2635,7 @@ fn snapshot_scan_is_coherent_under_concurrent_commits_table() {
 
                 let saw_future_key = scan_task.await.expect("scan task join");
                 writer_task.await.expect("writer task join");
+                table.finalize(tx(32)).await.expect("finalize after scan");
 
                 assert!(
                     !saw_future_key,

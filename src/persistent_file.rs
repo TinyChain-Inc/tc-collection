@@ -37,6 +37,8 @@ impl<T> CollectionFile for T where
 
 /// Collection-only file type used by standalone callers and tests.
 ///
+/// This adapter explicitly uses TBON, preserving its existing stored representation.
+///
 /// `CollectionNode` and `AsType` are both defined by dependency crates, so
 /// Rust's orphan rules prohibit implementing `AsType<CollectionNode>` directly
 /// for `CollectionNode`. This local newtype exists only to provide that required
@@ -64,19 +66,29 @@ impl AsType<CollectionNode> for PersistentFile {
     }
 }
 
-impl FileLoad for PersistentFile {
+impl freqfs::FileLoad for PersistentFile {
     async fn load(
-        path: &std::path::Path,
+        _: &std::path::Path,
         file: tokio::fs::File,
-        metadata: std::fs::Metadata,
+        _: std::fs::Metadata,
     ) -> std::io::Result<Self> {
-        CollectionNode::load(path, file, metadata).await.map(Self)
+        tbon::de::read_from((), file)
+            .await
+            .map(Self)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 }
-
-impl FileSave for PersistentFile {
+impl freqfs::FileSave for PersistentFile {
     async fn save(&self, file: &mut tokio::fs::File) -> std::io::Result<u64> {
-        self.0.save(file).await
+        use futures::TryStreamExt;
+        use tokio::io::AsyncWriteExt;
+        let mut stream = tbon::en::encode(&self.0).map_err(std::io::Error::other)?;
+        let mut size = 0;
+        while let Some(chunk) = stream.try_next().await.map_err(std::io::Error::other)? {
+            file.write_all(&chunk).await?;
+            size += chunk.len() as u64;
+        }
+        Ok(size)
     }
 }
 

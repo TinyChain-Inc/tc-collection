@@ -342,6 +342,26 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         &self.schema
     }
 
+    pub(crate) async fn load_literal_row(&self, mut row: Vec<Value>) -> std::io::Result<()> {
+        if row.len() != self.schema.column_count() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid Table row",
+            ));
+        }
+
+        let values = row.split_off(self.schema.key().len());
+        let persistent = {
+            self.state
+                .read()
+                .expect("state read lock")
+                .persistent
+                .clone()
+        };
+
+        upsert(&persistent, row, values).await
+    }
+
     pub fn finalized(&self) -> Option<TxnId> {
         self.state.read().expect("state read lock").finalized
     }
@@ -827,11 +847,6 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
     }
 
     #[inline]
-    fn release_txn_reservation(&self, txn_id: TxnId) {
-        self.semaphore.finalize(&txn_id, false);
-    }
-
-    #[inline]
     fn release_txn_frontier(&self, txn_id: TxnId) {
         self.semaphore.finalize(&txn_id, true);
     }
@@ -936,15 +951,10 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
 impl<Txn: crate::StorageContext> PersistentTable<Txn> {
     /// Commit the pending delta at `txn_id`.
     ///
-    /// Returns `Err(Outdated)` if the txn is at or before the finalize frontier,
-    /// `Ok(())` for a duplicate commit (idempotent no-op), or `Err(Conflict)` if
-    /// the semaphore cannot be acquired due to a future overlapping read.
+    /// The caller must finish this transaction's operations and release its streams first.
+    /// Returns `Outdated` at or before the finalized frontier.
     pub fn commit(&self, txn_id: TxnId) -> Result<(), txn_lock::Error> {
-        let _permit = self
-            .semaphore
-            .try_write(txn_id, txn_lock::set::Range::All)?;
-
-        let result = {
+        {
             let mut state = self.state.write().expect("state write lock");
             if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
                 Err(txn_lock::Error::Outdated)
@@ -956,48 +966,39 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
                 }
                 Ok(())
             }
-        };
-        self.release_txn_reservation(txn_id);
-        result
+        }?;
+
+        self.semaphore.finalize(&txn_id, false);
+        Ok(())
     }
 
     /// Roll back the pending delta at `txn_id`.
     ///
-    /// Returns `Err(Outdated)` if the txn is at or before the finalize frontier,
-    /// `Err(Conflict)` if the txn is already committed, or `Err(Conflict)` if the
-    /// semaphore cannot be acquired due to a future overlapping read.
+    /// The caller must finish this transaction's operations and release its streams first.
+    /// Returns `Conflict` for a committed transaction or `Outdated` at the frontier.
     pub fn rollback(&self, txn_id: TxnId) -> Result<(), txn_lock::Error> {
-        let _permit = self
-            .semaphore
-            .try_write(txn_id, txn_lock::set::Range::All)?;
-
-        let result = {
+        {
             let mut state = self.state.write().expect("state write lock");
             if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
-                Err(txn_lock::Error::Outdated)
+                return Err(txn_lock::Error::Outdated);
             } else if state.committed.contains_key(&txn_id) {
-                Err(txn_lock::Error::Conflict)
+                return Err(txn_lock::Error::Conflict);
             } else {
                 state.pending.remove(&txn_id);
-                Ok(())
             }
-        };
-        self.release_txn_reservation(txn_id);
-        result
+        }
+
+        self.semaphore.finalize(&txn_id, false);
+        Ok(())
     }
 
     /// Finalize all committed deltas up to `txn_id` into persistent state.
     ///
     /// Finalize is monotonic. A stale finalize (≤ frontier) is a no-op.
     ///
-    /// Unlike commit/rollback, finalize does **not** acquire a semaphore write
-    /// permit. Finalize is a lifecycle operation that merges already-committed
-    /// data into canon — it does not introduce new pending writes. Acquiring a
-    /// write permit via `try_write` would conflict with future read reservations
-    /// (e.g. readers at txn N+1), which is incorrect: finalize at txn N should
-    /// proceed even when later transactions hold read permits. Synchronization
-    /// is provided by the state write lock, and `semaphore.finalize(drop_past=true)`
-    /// cleans up semaphore versions ≤ `txn_id`.
+    /// The caller serializes lifecycle decisions and finishes operations through the
+    /// cutoff first. Later transactions may retain read permits; merging uses native
+    /// storage locks without acquiring a new semaphore write reservation.
     pub async fn finalize(&self, txn_id: TxnId) -> Result<(), txn_lock::Error> {
         let (persistent, committed_to_apply) = {
             let state = self.state.write().expect("state write lock");

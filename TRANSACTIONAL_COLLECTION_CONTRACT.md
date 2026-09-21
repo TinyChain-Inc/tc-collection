@@ -6,8 +6,11 @@ code; future integration work belongs in the roadmap.
 
 ## Ownership
 
-A collection owns local transactional state and deterministic visibility. Its
-storage backend is a non-policy primitive. The caller owns public naming,
+A collection owns local transactional state, concurrent mutation isolation,
+conflict ordering, and deterministic visibility. Its transactional data structures
+and locking primitives enforce these guarantees without relying on a caller to
+serialize mutation handlers. Its storage backend is a non-policy primitive.
+The caller owns public naming,
 routing, durable ordered history, replay, canonical-state selection,
 reconciliation, and resynchronization.
 
@@ -30,6 +33,18 @@ lifecycle:
 Commit, rollback, and finalize are deterministic and idempotent. A stale or
 duplicate lifecycle call is a no-op only when the collection can prove the
 result. Ambiguous state and malformed storage fail closed.
+
+Callers serialize lifecycle decisions for a collection. Before commit or rollback,
+they prevent new work in that transaction, finish or cancel its operations, and
+release its streams and guards. Before finalization, they do so for transactions
+through the cutoff. Collections do not check this precondition by acquiring new
+semaphore reservations; unrelated later transactions may continue.
+
+BTree and Table commit publish pending deltas as committed in memory. Commit and
+rollback release the state lock before releasing transaction reservations, and
+failed decisions retain reservations. Neither operation persists canonical state.
+Finalization merges committed deltas into canonical storage; the durable owner
+must synchronize that storage before retiring its recovery evidence.
 
 ## Visibility and ordering
 
@@ -54,8 +69,8 @@ being collected into unbounded intermediate vectors.
   path which may acquire another lock domain.
 - Mutate under the narrowest guard, release it, then publish or await unrelated
   work.
-- Every lifecycle exit releases any semaphore reservation it acquired,
-  including errors, duplicates, and stale no-ops.
+- Successful commit and rollback release their transaction's reservations,
+  including duplicate decisions. Failed decisions preserve them.
 - Streams retain their read guards and capacity permits until completion or
   drop. Waiting remains cancellable and bounded by the request deadline.
 
@@ -70,7 +85,13 @@ all schema-required indexes; it never initializes missing state. The caller owns
 publication and explicitly synchronizes initial canonical state before relying
 on restart loading.
 
-Snapshot copying and replacement are not provided by this crate.
+Native copying streams a transaction-consistent value into unpublished delegated
+storage. Native schemas convert to and from a collection class path and a Value
+for strict reopening. Collection identity hashes the class and semantic schema,
+hashes ordered native contents, then combines those hashes with SHA-256. It
+includes column and index definitions but excludes cache configuration and physical
+layout; no serialization is used for hashing. The caller owns publication, durability,
+and retention. Collection routes expose no snapshot restoration endpoint.
 
 Local materializations may accelerate access but are not an independent source
 of canonical history. Collection code must deterministically apply the ordered
