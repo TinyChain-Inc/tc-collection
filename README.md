@@ -7,8 +7,14 @@ streaming codec, and local transactional lifecycle.
 Collections do not own public names, cross-process routing, transaction-ID
 allocation, durable history, or reconciliation. Literal and transaction-local
 values receive a delegated transaction and allocation context. Long-lived
-public hosting is outside this crate; collection snapshots and indexes remain
-derived materializations.
+public hosting is outside this crate.
+
+Persistent BTree/Table owners provide in-memory transactional visibility and
+in-place canonical materialization. `PersistentFile` contains native nodes only.
+Commit is not independently crash-durable. Native restoration, strict loading,
+and caller-owned recovery are described by the
+[transactional collection contract](TRANSACTIONAL_COLLECTION_CONTRACT.md).
+Recreate development fixtures from earlier layouts.
 
 ## Tensor
 

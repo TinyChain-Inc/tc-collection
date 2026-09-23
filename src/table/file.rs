@@ -1,7 +1,6 @@
-use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use b_table::{Range, Row, TableLock};
 use collate::{Collate, try_diff, try_merge};
@@ -11,13 +10,11 @@ use futures::{StreamExt, TryStreamExt};
 use tc_ir::{Id, Transact, TxnId};
 use tc_value::{Value, ValueCollator};
 
+use crate::persistence::{CollectionOwner, PersistentDelta, VisibleSnapshot, background_error};
+
 use super::schema::{TableIndexSchema, TableSchema};
 use super::stream::Rows;
 use super::view::{Limited, Selection, TableSlice};
-
-fn background_error(err: impl fmt::Display) -> txn_lock::Error {
-    txn_lock::Error::Background(err.to_string())
-}
 
 /// Collator for merging row streams that are ordered by specific column indices.
 ///
@@ -157,6 +154,26 @@ struct Delta<F: crate::CollectionFile> {
 }
 
 impl<F: crate::CollectionFile> Delta<F> {
+    async fn create(schema: TableSchema, dir: DirLock<F>) -> std::io::Result<Self> {
+        let (inserts, deletes) = crate::persistence::create_delta_dirs(&dir).await?;
+        Ok(Self {
+            inserts: TableLock::create(schema.clone(), ValueCollator::default(), inserts)?,
+            deletes: TableLock::create(schema, ValueCollator::default(), deletes)?,
+        })
+    }
+
+    async fn replacement(canonical: &TableFile<F>, dir: DirLock<F>) -> std::io::Result<Self> {
+        let (inserts, deletes) = crate::persistence::create_delta_dirs(&dir).await?;
+        Ok(Self {
+            inserts: TableLock::create(
+                canonical.schema().clone(),
+                ValueCollator::default(),
+                inserts,
+            )?,
+            deletes: canonical.copy_into(deletes).await?,
+        })
+    }
+
     async fn upsert(&self, key: Vec<Value>, values: Vec<Value>) -> std::io::Result<()> {
         delete_row(&self.deletes, &key).await?;
         delete_row(&self.inserts, &key).await?;
@@ -180,7 +197,7 @@ impl<F: crate::CollectionFile> Delta<F> {
     }
 
     async fn merge_into<'a>(
-        &'a self,
+        &self,
         rows: BoxStream<'a, Result<Vec<Value>, std::io::Error>>,
         range: Range<tc_ir::Id, Value>,
         order: &[tc_ir::Id],
@@ -203,77 +220,29 @@ impl<F: crate::CollectionFile> Delta<F> {
 
         try_diff(collator, merged, deleted).boxed()
     }
-
-    /// Owned variant of [`merge_into`](Self::merge_into) that produces a
-    /// `'static` stream suitable for returning from `rows()`.
-    ///
-    /// `self` is consumed (Delta is `Clone`) so the returned stream does not
-    /// borrow from the caller's stack.
-    async fn merge_into_owned(
-        self,
-        rows: BoxStream<'static, Result<Vec<Value>, std::io::Error>>,
-        range: Range<tc_ir::Id, Value>,
-        order: Vec<tc_ir::Id>,
-        reverse: bool,
-        collator: RowCollator,
-    ) -> BoxStream<'static, Result<Vec<Value>, std::io::Error>> {
-        let inserted = row_stream(&self.inserts, range.clone(), &order, reverse)
-            .await
-            .expect("stream insert delta rows")
-            .map_ok(|row| row.to_vec())
-            .boxed();
-
-        let merged = try_merge(collator.clone(), inserted, rows).boxed();
-
-        let deleted = row_stream(&self.deletes, range, &order, reverse)
-            .await
-            .expect("stream delete delta rows")
-            .map_ok(|row| row.to_vec())
-            .boxed();
-
-        try_diff(collator, merged, deleted).boxed()
-    }
 }
 
-async fn apply_delta<F: crate::CollectionFile>(
-    persistent: &TableFile<F>,
-    delta: &Delta<F>,
-) -> std::io::Result<()> {
-    let key_len = persistent.schema().key().len();
-    let mut inserts = row_stream(&delta.inserts, Range::default(), &[], false).await?;
-    while let Some(row) = inserts.try_next().await? {
-        upsert(persistent, row[..key_len].to_vec(), row[key_len..].to_vec()).await?;
+impl<F: crate::CollectionFile> PersistentDelta for Delta<F> {
+    type Native = TableFile<F>;
+
+    async fn apply_to(&self, persistent: &TableFile<F>) -> std::io::Result<()> {
+        let key_len = persistent.schema().key().len();
+        let mut inserts = row_stream(&self.inserts, Range::default(), &[], false).await?;
+        while let Some(row) = inserts.try_next().await? {
+            upsert(persistent, row[..key_len].to_vec(), row[key_len..].to_vec()).await?;
+        }
+
+        let mut deletes = row_stream(&self.deletes, Range::default(), &[], false).await?;
+        while let Some(row) = deletes.try_next().await? {
+            delete_row(persistent, &row[..key_len]).await?;
+        }
+
+        Ok(())
     }
-
-    let mut deletes = row_stream(&delta.deletes, Range::default(), &[], false).await?;
-    while let Some(row) = deletes.try_next().await? {
-        delete_row(persistent, &row[..key_len]).await?;
-    }
-
-    Ok(())
-}
-
-#[derive(Clone)]
-struct State<F: crate::CollectionFile> {
-    persistent: TableFile<F>,
-    committed: BTreeMap<TxnId, Delta<F>>,
-    pending: BTreeMap<TxnId, Delta<F>>,
-    finalized: Option<TxnId>,
-}
-
-#[derive(Clone)]
-struct VisibleSnapshot<F: crate::CollectionFile> {
-    persistent: TableFile<F>,
-    deltas: Vec<Delta<F>>,
 }
 
 pub struct PersistentTable<Txn: crate::StorageContext> {
-    state: Arc<RwLock<State<Txn::File>>>,
-    semaphore: txn_lock::semaphore::Semaphore<
-        TxnId,
-        b_tree::Collator<ValueCollator>,
-        txn_lock::set::Range<Vec<Value>>,
-    >,
+    owner: Arc<CollectionOwner<Delta<Txn::File>>>,
     schema: TableSchema,
     txn: PhantomData<fn() -> Txn>,
 }
@@ -281,8 +250,7 @@ pub struct PersistentTable<Txn: crate::StorageContext> {
 impl<Txn: crate::StorageContext> Clone for PersistentTable<Txn> {
     fn clone(&self) -> Self {
         Self {
-            state: self.state.clone(),
-            semaphore: self.semaphore.clone(),
+            owner: self.owner.clone(),
             schema: self.schema.clone(),
             txn: PhantomData,
         }
@@ -291,7 +259,7 @@ impl<Txn: crate::StorageContext> Clone for PersistentTable<Txn> {
 
 impl<Txn: crate::StorageContext> fmt::Debug for PersistentTable<Txn> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state = self.state.read().expect("state read lock");
+        let state = self.owner.state.read().expect("state read lock");
         f.debug_struct("PersistentTable")
             .field("committed_len", &state.committed.len())
             .field("pending_len", &state.pending.len())
@@ -315,24 +283,18 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         Ok(Self::from_store(schema, persistent))
     }
 
-    pub fn load(persistent_dir: DirLock<Txn::File>, schema: TableSchema) -> std::io::Result<Self> {
+    pub async fn load(
+        persistent_dir: DirLock<Txn::File>,
+        schema: TableSchema,
+    ) -> std::io::Result<Self> {
         let persistent = TableLock::load(schema.clone(), ValueCollator::default(), persistent_dir)?;
+        persistent.validate().await?;
         Ok(Self::from_store(schema, persistent))
     }
 
     fn from_store(schema: TableSchema, persistent: TableFile<Txn::File>) -> Self {
-        let state = State {
-            persistent,
-            committed: BTreeMap::new(),
-            pending: BTreeMap::new(),
-            finalized: None,
-        };
-
         Self {
-            state: Arc::new(RwLock::new(state)),
-            semaphore: txn_lock::semaphore::Semaphore::new(b_tree::Collator::new(
-                ValueCollator::default(),
-            )),
+            owner: Arc::new(CollectionOwner::new(persistent)),
             schema,
             txn: PhantomData,
         }
@@ -352,7 +314,8 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
 
         let values = row.split_off(self.schema.key().len());
         let persistent = {
-            self.state
+            self.owner
+                .state
                 .read()
                 .expect("state read lock")
                 .persistent
@@ -363,29 +326,79 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
     }
 
     pub fn finalized(&self) -> Option<TxnId> {
-        self.state.read().expect("state read lock").finalized
+        self.owner.finalized()
     }
 
     /// Sync the canonical (persistent) state to disk.
     ///
-    /// This flushes any in-memory modifications to the filesystem so they
-    /// survive a restart. Pending and committed deltas are not synced; their
-    /// durable ordering and replay belong to the caller.
+    /// Buffered writeback does not acknowledge durability. Pending workspace
+    /// and committed workspace deltas are not included.
     pub async fn sync(&self) -> std::io::Result<()> {
-        let persistent = {
-            let state = self.state.read().expect("state read lock");
-            state.persistent.clone()
-        };
+        let persistent = self
+            .owner
+            .state
+            .read()
+            .expect("state read lock")
+            .persistent
+            .clone();
         persistent.sync().await
     }
 
-    /// Explicitly make canonical storage durable without publishing pending versions.
+    /// Durably synchronize materialized canonical storage; pending deltas are excluded.
     pub async fn sync_all(&self) -> std::io::Result<()> {
-        let persistent = {
-            let state = self.state.read().expect("state read lock");
-            state.persistent.clone()
-        };
+        let persistent = self
+            .owner
+            .state
+            .read()
+            .expect("state read lock")
+            .persistent
+            .clone();
         persistent.sync_all().await
+    }
+
+    /// Stage a native replacement without changing the existing pending delta on failure.
+    pub async fn restore_from(&self, txn: &Txn, source: &Self) -> tc_error::TCResult<()> {
+        let id = txn.id();
+        let _permit = self
+            .owner
+            .semaphore
+            .try_write(id, txn_lock::set::Range::All)?;
+        let (canonical, committed) = {
+            let state = self.owner.state.read().expect("state read lock");
+            state.assert_writable(id)?;
+            (
+                state.persistent.clone(),
+                state
+                    .committed
+                    .range(..=id)
+                    .filter_map(|(_, delta)| delta.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let schema = self.schema.clone();
+        if <Value as safecast::CastFrom<TableSchema>>::cast_from(schema.clone())
+            != <Value as safecast::CastFrom<TableSchema>>::cast_from(source.schema.clone())
+        {
+            return Err(tc_error::TCError::bad_request(
+                "Table restoration schema mismatch",
+            ));
+        }
+        let workspace = txn.subcontext_unique().context().await?;
+        let delta = Delta::replacement(&canonical, workspace).await?;
+        for committed in committed {
+            committed.apply_to(&delta.deletes).await?;
+        }
+        let key_len = self.schema.key().len();
+        let mut rows = source.rows(id, Range::default(), vec![], false).await?;
+        while let Some(row) = rows.try_next().await? {
+            delta
+                .upsert(row[..key_len].to_vec(), row[key_len..].to_vec())
+                .await?;
+        }
+        let mut state = self.owner.state.write().expect("state write lock");
+        state.assert_writable(id)?;
+        state.pending.insert(id, delta);
+        Ok(())
     }
 
     pub async fn upsert_row(
@@ -403,6 +416,7 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
             b_table::Schema::validate_values(&self.schema, values).map_err(background_error)?;
 
         let _permit = self
+            .owner
             .semaphore
             .try_write(txn_id, txn_lock::set::Range::One(Arc::new(key.clone())))?;
 
@@ -429,12 +443,13 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         let values = b_table::Schema::validate_values(&self.schema, values)?;
 
         let _permit = self
+            .owner
             .semaphore
             .try_write(txn_id, txn_lock::set::Range::One(Arc::new(key.clone())))
             .map_err(tc_error::TCError::from)?;
 
         if self
-            .resolve_row(&self.visible_snapshot(txn_id), &key)
+            .resolve_row(&self.owner.visible_snapshot(txn_id), &key)
             .await
             .is_some()
         {
@@ -461,6 +476,7 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         let key = b_table::Schema::validate_key(&self.schema, key).map_err(background_error)?;
 
         let _permit = self
+            .owner
             .semaphore
             .try_write(txn_id, txn_lock::set::Range::One(Arc::new(key.clone())))?;
 
@@ -480,7 +496,7 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
             .map_err(background_error)?;
 
         if row.is_none() {
-            let snapshot = self.visible_snapshot(txn_id);
+            let snapshot = self.owner.visible_snapshot(txn_id);
             row = self.resolve_row(&snapshot, &key).await;
         }
 
@@ -503,19 +519,21 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
 
     pub async fn read_row(&self, txn_id: TxnId, key: &[Value]) -> Option<Row<Value>> {
         let _permit = self
+            .owner
             .acquire_read_permit(txn_id, txn_lock::set::Range::One(Arc::new(key.to_vec())))
             .await;
 
-        let snapshot = self.visible_snapshot(txn_id);
+        let snapshot = self.owner.visible_snapshot(txn_id);
         self.resolve_row(&snapshot, key).await
     }
 
     pub async fn contains_row(&self, txn_id: TxnId, key: &[Value]) -> bool {
         let _permit = self
+            .owner
             .acquire_read_permit(txn_id, txn_lock::set::Range::One(Arc::new(key.to_vec())))
             .await;
 
-        let snapshot = self.visible_snapshot(txn_id);
+        let snapshot = self.owner.visible_snapshot(txn_id);
         self.is_row_visible(&snapshot, key).await
     }
 
@@ -543,6 +561,7 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         F: FnMut(Row<Value>),
     {
         let _permit = self
+            .owner
             .acquire_read_permit(txn_id, txn_lock::set::Range::All)
             .await;
 
@@ -585,10 +604,11 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         reverse: bool,
     ) -> Result<Rows, txn_lock::Error> {
         let permit = self
+            .owner
             .acquire_read_permit(txn_id, txn_lock::set::Range::All)
             .await;
 
-        let snapshot = self.visible_snapshot(txn_id);
+        let snapshot = self.owner.visible_snapshot(txn_id);
         let collator = RowCollator::for_order(&self.schema, &order, reverse);
 
         let mut visible: BoxStream<'static, Result<Vec<Value>, std::io::Error>> =
@@ -600,13 +620,7 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
 
         for delta in snapshot.deltas.into_iter() {
             visible = delta
-                .merge_into_owned(
-                    visible,
-                    range.clone(),
-                    order.clone(),
-                    reverse,
-                    collator.clone(),
-                )
+                .merge_into(visible, range.clone(), &order, reverse, collator.clone())
                 .await;
         }
 
@@ -672,12 +686,13 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         let collator = RowCollator::for_order(&self.schema, &[], false);
 
         let _permit = self
+            .owner
             .semaphore
             .try_write(txn_id, txn_lock::set::Range::All)?;
 
         let pending = self.pending_delta_for_txn(txn).await?;
 
-        let snapshot = self.visible_snapshot(txn_id);
+        let snapshot = self.owner.visible_snapshot(txn_id);
 
         let mut visible: BoxStream<'_, Result<Vec<Value>, std::io::Error>> =
             row_stream(&snapshot.persistent, range.clone(), &[], false)
@@ -727,12 +742,13 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         let collator = RowCollator::for_order(&self.schema, &[], false);
 
         let _permit = self
+            .owner
             .semaphore
             .try_write(txn_id, txn_lock::set::Range::All)?;
 
         let pending = self.pending_delta_for_txn(txn).await?;
 
-        let snapshot = self.visible_snapshot(txn_id);
+        let snapshot = self.owner.visible_snapshot(txn_id);
 
         let mut visible: BoxStream<'_, Result<Vec<Value>, std::io::Error>> =
             row_stream(&snapshot.persistent, range.clone(), &[], false)
@@ -794,7 +810,7 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
     ) where
         F: FnMut(Row<Value>) -> bool,
     {
-        let snapshot = self.visible_snapshot(txn_id);
+        let snapshot = self.owner.visible_snapshot(txn_id);
 
         let mut visible: BoxStream<'_, Result<Vec<Value>, std::io::Error>> =
             row_stream(&snapshot.persistent, range.clone(), order, reverse)
@@ -817,43 +833,9 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         }
     }
 
-    fn visible_snapshot(&self, txn_id: TxnId) -> VisibleSnapshot<Txn::File> {
-        let state = self.state.read().expect("state read lock");
-        let mut deltas = state
-            .committed
-            .iter()
-            .filter_map(|(id, delta)| (*id <= txn_id).then_some(delta.clone()))
-            .collect::<Vec<_>>();
-
-        if let Some(delta) = state.pending.get(&txn_id).cloned() {
-            deltas.push(delta);
-        }
-
-        VisibleSnapshot {
-            persistent: state.persistent.clone(),
-            deltas,
-        }
-    }
-
-    async fn acquire_read_permit(
-        &self,
-        txn_id: TxnId,
-        range: txn_lock::set::Range<Vec<Value>>,
-    ) -> txn_lock::semaphore::PermitRead<txn_lock::set::Range<Vec<Value>>> {
-        self.semaphore
-            .read(txn_id, range)
-            .await
-            .expect("acquire read permit")
-    }
-
-    #[inline]
-    fn release_txn_frontier(&self, txn_id: TxnId) {
-        self.semaphore.finalize(&txn_id, true);
-    }
-
     async fn resolve_row(
         &self,
-        snapshot: &VisibleSnapshot<Txn::File>,
+        snapshot: &VisibleSnapshot<Delta<Txn::File>>,
         key: &[Value],
     ) -> Option<Row<Value>> {
         let mut row = get_row(&snapshot.persistent, key)
@@ -880,30 +862,19 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         row
     }
 
-    async fn is_row_visible(&self, snapshot: &VisibleSnapshot<Txn::File>, key: &[Value]) -> bool {
+    async fn is_row_visible(
+        &self,
+        snapshot: &VisibleSnapshot<Delta<Txn::File>>,
+        key: &[Value],
+    ) -> bool {
         self.resolve_row(snapshot, key).await.is_some()
-    }
-
-    fn assert_writable_state(
-        state: &State<Txn::File>,
-        txn_id: TxnId,
-    ) -> Result<(), txn_lock::Error> {
-        if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
-            return Err(txn_lock::Error::Outdated);
-        }
-
-        if state.committed.contains_key(&txn_id) {
-            return Err(txn_lock::Error::Committed);
-        }
-
-        Ok(())
     }
 
     async fn pending_delta_for_txn(&self, txn: &Txn) -> Result<Delta<Txn::File>, txn_lock::Error> {
         let txn_id = txn.id();
         let schema = {
-            let state = self.state.write().expect("state write lock");
-            Self::assert_writable_state(&state, txn_id)?;
+            let state = self.owner.state.write().expect("state write lock");
+            state.assert_writable(txn_id)?;
 
             if let Some(pending) = state.pending.get(&txn_id).cloned() {
                 return Ok(pending);
@@ -918,26 +889,12 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
             .await
             .map_err(background_error)?;
 
-        let (inserts_dir, deletes_dir) = {
-            let mut txn_dir = txn_dir.write().await;
-            let inserts = txn_dir
-                .get_or_create_dir("inserts".to_string())
-                .map_err(background_error)?;
-            let deletes = txn_dir
-                .get_or_create_dir("deletes".to_string())
-                .map_err(background_error)?;
-            (inserts, deletes)
-        };
+        let delta = Delta::create(schema, txn_dir)
+            .await
+            .map_err(background_error)?;
 
-        let delta = Delta {
-            inserts: TableLock::create(schema.clone(), ValueCollator::default(), inserts_dir)
-                .map_err(background_error)?,
-            deletes: TableLock::create(schema, ValueCollator::default(), deletes_dir)
-                .map_err(background_error)?,
-        };
-
-        let mut state = self.state.write().expect("state write lock");
-        Self::assert_writable_state(&state, txn_id)?;
+        let mut state = self.owner.state.write().expect("state write lock");
+        state.assert_writable(txn_id)?;
 
         if let Some(existing) = state.pending.get(&txn_id).cloned() {
             return Ok(existing);
@@ -953,43 +910,12 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
     ///
     /// The caller must finish this transaction's operations and release its streams first.
     /// Returns `Outdated` at or before the finalized frontier.
-    pub fn commit(&self, txn_id: TxnId) -> Result<(), txn_lock::Error> {
-        {
-            let mut state = self.state.write().expect("state write lock");
-            if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
-                Err(txn_lock::Error::Outdated)
-            } else if state.committed.contains_key(&txn_id) {
-                Ok(())
-            } else {
-                if let Some(delta) = state.pending.remove(&txn_id) {
-                    state.committed.insert(txn_id, delta);
-                }
-                Ok(())
-            }
-        }?;
-
-        self.semaphore.finalize(&txn_id, false);
-        Ok(())
+    pub async fn commit(&self, txn_id: TxnId) -> Result<(), txn_lock::Error> {
+        self.owner.commit(txn_id)
     }
 
-    /// Roll back the pending delta at `txn_id`.
-    ///
-    /// The caller must finish this transaction's operations and release its streams first.
-    /// Returns `Conflict` for a committed transaction or `Outdated` at the frontier.
     pub fn rollback(&self, txn_id: TxnId) -> Result<(), txn_lock::Error> {
-        {
-            let mut state = self.state.write().expect("state write lock");
-            if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
-                return Err(txn_lock::Error::Outdated);
-            } else if state.committed.contains_key(&txn_id) {
-                return Err(txn_lock::Error::Conflict);
-            } else {
-                state.pending.remove(&txn_id);
-            }
-        }
-
-        self.semaphore.finalize(&txn_id, false);
-        Ok(())
+        self.owner.rollback(txn_id)
     }
 
     /// Finalize all committed deltas up to `txn_id` into persistent state.
@@ -1000,44 +926,15 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
     /// cutoff first. Later transactions may retain read permits; merging uses native
     /// storage locks without acquiring a new semaphore write reservation.
     pub async fn finalize(&self, txn_id: TxnId) -> Result<(), txn_lock::Error> {
-        let (persistent, committed_to_apply) = {
-            let state = self.state.write().expect("state write lock");
-
-            if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
-                return Ok(());
-            }
-
-            let committed_to_apply = state
-                .committed
-                .iter()
-                .filter_map(|(id, delta)| (*id <= txn_id).then_some(delta.clone()))
-                .collect::<Vec<_>>();
-
-            (state.persistent.clone(), committed_to_apply)
-        };
-
-        for delta in &committed_to_apply {
-            apply_delta(&persistent, delta)
-                .await
-                .map_err(background_error)?;
-        }
-
-        {
-            let mut state = self.state.write().expect("state write lock");
-            state.committed.retain(|id, _| *id > txn_id);
-            state.pending.retain(|id, _| *id > txn_id);
-            state.finalized = Some(state.finalized.map_or(txn_id, |prior| prior.max(txn_id)));
-        }
-
-        self.release_txn_frontier(txn_id);
-
-        Ok(())
+        self.owner.finalize(txn_id).await
     }
 }
 
 impl<Txn: crate::StorageContext> Transact for PersistentTable<Txn> {
     async fn commit(&self, txn_id: TxnId) -> tc_error::TCResult<()> {
-        PersistentTable::commit(self, txn_id).map_err(Into::into)
+        PersistentTable::commit(self, txn_id)
+            .await
+            .map_err(Into::into)
     }
 
     fn rollback(
