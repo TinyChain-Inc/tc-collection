@@ -154,6 +154,7 @@ struct Delta<F: crate::CollectionFile> {
 }
 
 impl<F: crate::CollectionFile> Delta<F> {
+    /// Start an ordinary delta with empty insert and delete storage.
     async fn create(schema: TableSchema, dir: DirLock<F>) -> std::io::Result<Self> {
         let (inserts, deletes) = crate::persistence::create_delta_dirs(&dir).await?;
         Ok(Self {
@@ -162,7 +163,12 @@ impl<F: crate::CollectionFile> Delta<F> {
         })
     }
 
-    async fn replacement(canonical: &TableFile<F>, dir: DirLock<F>) -> std::io::Result<Self> {
+    /// Seed a restoration delta in a separate workspace: empty inserts and
+    /// canonical contents in deletes, so keys absent from the snapshot are removed.
+    /// The caller applies visible committed deltas to deletes, inserts the snapshot,
+    /// and installs the pending replacement only after construction succeeds.
+    /// Failure or cancellation leaves the existing pending delta untouched.
+    async fn for_restore(canonical: &TableFile<F>, dir: DirLock<F>) -> std::io::Result<Self> {
         let (inserts, deletes) = crate::persistence::create_delta_dirs(&dir).await?;
         Ok(Self {
             inserts: TableLock::create(
@@ -384,7 +390,7 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
             ));
         }
         let workspace = txn.subcontext_unique().context().await?;
-        let delta = Delta::replacement(&canonical, workspace).await?;
+        let delta = Delta::for_restore(&canonical, workspace).await?;
         for committed in committed {
             committed.apply_to(&delta.deletes).await?;
         }
