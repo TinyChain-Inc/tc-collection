@@ -40,11 +40,16 @@ release its streams and guards. Before finalization, they do so for transactions
 through the cutoff. Collections do not check this precondition by acquiring new
 semaphore reservations; unrelated later transactions may continue.
 
-BTree and Table commit publish pending deltas as committed in memory. Commit and
-rollback release the state lock before releasing transaction reservations, and
-failed decisions retain reservations. Neither operation persists canonical state.
-Finalization merges committed deltas into canonical storage; the durable owner
-must synchronize that storage before retiring its recovery evidence.
+BTree and Table commit move the pending delta into committed visibility under the
+shared state lock, then release reservations. Commit performs no persistence and
+is not independently crash-durable. Empty decisions need no files. Failed decisions
+retain reservations. Rollback discards pending work.
+
+Finalization applies covered deltas in place to native canonical storage, prunes
+covered transaction state, then releases reservations. The caller supplies durable
+recovery evidence and coordinates canonical synchronization. Interrupted or failed
+materialization must not be retried against uncertain live storage; the caller owns the
+recovery-required boundary.
 
 ## Visibility and ordering
 
@@ -80,18 +85,38 @@ limits compose beneath any broader admission policy supplied by the caller.
 
 ## Persistence and recovery
 
-Creation requires empty delegated storage. Loading requires existing roots and
-all schema-required indexes; it never initializes missing state. The caller owns
-publication and explicitly synchronizes initial canonical state before relying
-on restart loading.
+Creation requires empty delegated storage. Loading strictly requires the existing
+root and all schema-required indexes, and validates native tree structure and index
+consistency. Loading reconstructs only materialized canonical contents. It does not
+recover committed visibility, acceptance receipts, or a cutoff. The caller reconstructs
+those from its retained WAL with original-ID capabilities and fresh workspaces.
+
+Committed deltas retain their delegated transaction workspaces until finalization.
+Host workspace removal follows successful recursive finalization. Explicit
+`sync_all()` makes materialized canonical storage durable; `sync()` is buffered
+writeback. Neither persists pending or committed workspace deltas as accepted work.
+
+BTree and Table share one private lifecycle owner containing their transaction
+state and existing semaphore. It implements visibility selection and decisions once,
+delegating delta application to concrete key/row operations. Concrete collections
+retain creation, loading, workspace construction, hashing, copying and restoration.
+There is no independent publication owner or acceptance metadata.
 
 Native copying streams a transaction-consistent value into unpublished delegated
 storage. Native schemas convert to and from a collection class path and a Value
 for strict reopening. Collection identity hashes the class and semantic schema,
 hashes ordered native contents, then combines those hashes with SHA-256. It
 includes column and index definitions but excludes cache configuration and physical
-layout; no serialization is used for hashing. The caller owns publication, durability,
-and retention. Collection routes expose no snapshot restoration endpoint.
+layout; no serialization is used for hashing. The caller coordinates publication
+and retention. Native `restore_from` validates kind and semantic schema, builds
+insert/delete deltas in a separate delegated workspace, and installs the pending
+replacement only after construction succeeds. Rollback preserves the previous
+committed value. Collection routes expose no snapshot restoration endpoint.
+
+Native trees mutate individual blocks and delete obsolete nodes in place. They
+provide no immutable root generations or unreachable-version reclamation. Native
+copying and loading retain corruption checks. Development fixtures from earlier
+layouts must be recreated; no migration reader or fallback is provided.
 
 Local materializations may accelerate access but are not an independent source
 of canonical history. Collection code must deterministically apply the ordered

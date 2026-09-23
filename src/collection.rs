@@ -101,6 +101,7 @@ impl<Txn: crate::StorageContext> BTreeView<Txn> {
                 .await?;
         }
 
+        target.sync().await?;
         Ok(Self::new(self.schema.clone(), target))
     }
 
@@ -268,7 +269,7 @@ impl<Txn: crate::StorageContext> Collection<Txn> {
     }
 
     /// Strictly load native storage using its recorded semantic schema.
-    pub fn load(
+    pub async fn load(
         dir: freqfs::DirLock<Txn::File>,
         schema: CollectionSchema,
     ) -> tc_error::TCResult<Self> {
@@ -280,10 +281,11 @@ impl<Txn: crate::StorageContext> Collection<Txn> {
 
                 Ok(Self::BTree(Box::new(BTreeView::new(
                     columns,
-                    BTree::load(dir, schema)?,
+                    BTree::load(dir, schema).await?,
                 ))))
             }
             CollectionSchema::Table(schema) => PersistentTable::load(dir, schema)
+                .await
                 .map(Self::from)
                 .map_err(Into::into),
         }
@@ -332,6 +334,31 @@ impl<Txn: crate::StorageContext> Collection<Txn> {
             }
             Self::Table(table) => table.is_persistent(),
             Self::Tensor(_) => false,
+        }
+    }
+
+    /// Stage a same-kind, same-schema native replacement in the caller's transaction.
+    pub async fn restore_from(&self, txn: &Txn, source: &Self) -> tc_error::TCResult<()> {
+        let schema: (pathlink::PathBuf, Value) = self.schema()?.into();
+        let source_schema: (pathlink::PathBuf, Value) = source.schema()?.into();
+        if !self.is_persistent() || !source.is_persistent() || schema != source_schema {
+            return Err(tc_error::TCError::bad_request(
+                "restoration requires matching persistent collections",
+            ));
+        }
+        match (self, source) {
+            (Self::BTree(target), Self::BTree(source)) => {
+                target.btree.restore_from(txn, &source.btree).await
+            }
+            (Self::Table(target), Self::Table(source)) => {
+                target
+                    .persistent()?
+                    .restore_from(txn, source.persistent()?)
+                    .await
+            }
+            _ => Err(tc_error::TCError::bad_request(
+                "unsupported collection restoration",
+            )),
         }
     }
 

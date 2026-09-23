@@ -32,7 +32,8 @@ are non-normative integration context when this repository is used as a submodul
   directory handles, or runtime downcasts.
 - Standalone named persistent collections are unsupported. Literal and
   transaction-local collections are owned by their enclosing request. Public
-  hosting and durable ownership are outside this crate.
+  hosting is outside this crate. Persistent owners provide transactional visibility
+  and native materialization; the caller owns durable requests and recovery.
 - Callers own durable history, replay, canonical-state selection, and
   reconciliation. Collections own local state transitions and fail closed on
   ambiguity; they do not maintain a WAL, select canonical history, or repair

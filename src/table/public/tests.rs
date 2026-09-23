@@ -303,7 +303,7 @@ async fn make_table_with_data() -> PersistentTable<MockTxn> {
         )
         .await
         .expect("upsert 3");
-    table.commit(tx(10)).expect("commit");
+    table.commit(tx(10)).await.expect("commit");
     table.finalize(tx(10)).await.expect("finalize");
     table
 }

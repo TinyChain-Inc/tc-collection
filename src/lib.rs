@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::needless_question_mark)]
 
+mod persistence;
 mod persistent_file;
 pub use persistent_file::{CollectionFile, CollectionNode, PersistentFile};
 

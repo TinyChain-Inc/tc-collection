@@ -5,10 +5,10 @@ use get_size::GetSize;
 use safecast::AsType;
 use tc_value::Value;
 
-/// The only file value owned by `tc-collection`.
+/// A native BTree node shared by BTree and Table storage.
 pub type CollectionNode = b_tree::Node<Vec<Vec<Value>>>;
 
-/// A caller-owned file composition capable of containing collection nodes.
+/// A caller-owned file composition containing native nodes.
 pub trait CollectionFile:
     Clone
     + FileLoad
@@ -37,32 +37,20 @@ impl<T> CollectionFile for T where
 
 /// Collection-only file type used by standalone callers and tests.
 ///
-/// This adapter explicitly uses TBON, preserving its existing stored representation.
-///
-/// `CollectionNode` and `AsType` are both defined by dependency crates, so
-/// Rust's orphan rules prohibit implementing `AsType<CollectionNode>` directly
-/// for `CollectionNode`. This local newtype exists only to provide that required
-/// `freqfs` projection; it is not an extensible file-variant registry.
+/// This adapter selects TBON for native nodes.
+/// Domain codecs remain format-neutral.
 #[derive(Clone)]
-pub struct PersistentFile(CollectionNode);
-
-impl From<CollectionNode> for PersistentFile {
-    fn from(node: CollectionNode) -> Self {
-        Self(node)
-    }
+pub enum PersistentFile {
+    Node(CollectionNode),
 }
 
-impl AsType<CollectionNode> for PersistentFile {
-    fn as_type(&self) -> Option<&CollectionNode> {
-        Some(&self.0)
-    }
+safecast::as_type!(PersistentFile, Node, CollectionNode);
 
-    fn as_type_mut(&mut self) -> Option<&mut CollectionNode> {
-        Some(&mut self.0)
-    }
-
-    fn into_type(self) -> Option<CollectionNode> {
-        Some(self.0)
+impl<'en> destream::en::ToStream<'en> for PersistentFile {
+    fn to_stream<E: destream::en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
+        match self {
+            Self::Node(node) => node.to_stream(encoder),
+        }
     }
 }
 
@@ -74,15 +62,16 @@ impl freqfs::FileLoad for PersistentFile {
     ) -> std::io::Result<Self> {
         tbon::de::read_from((), file)
             .await
-            .map(Self)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+            .map(Self::Node)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))
     }
 }
+
 impl freqfs::FileSave for PersistentFile {
     async fn save(&self, file: &mut tokio::fs::File) -> std::io::Result<u64> {
         use futures::TryStreamExt;
         use tokio::io::AsyncWriteExt;
-        let mut stream = tbon::en::encode(&self.0).map_err(std::io::Error::other)?;
+        let mut stream = tbon::en::encode(self).map_err(std::io::Error::other)?;
         let mut size = 0;
         while let Some(chunk) = stream.try_next().await.map_err(std::io::Error::other)? {
             file.write_all(&chunk).await?;
@@ -94,6 +83,8 @@ impl freqfs::FileSave for PersistentFile {
 
 impl GetSize for PersistentFile {
     fn get_size(&self) -> usize {
-        self.0.get_size()
+        match self {
+            Self::Node(node) => node.get_size(),
+        }
     }
 }

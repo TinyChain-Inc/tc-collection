@@ -91,11 +91,19 @@ impl<Txn: crate::StorageContext> Table<Txn> {
             target.load_literal_row(row.into_vec()).await?;
         }
 
+        target.sync().await?;
         Ok(target)
     }
 
     pub fn is_persistent(&self) -> bool {
         matches!(self, Self::File(_))
+    }
+
+    pub(crate) fn persistent(&self) -> TCResult<&PersistentTable<Txn>> {
+        match self {
+            Self::File(table) => Ok(table),
+            _ => Err(TCError::bad_request("expected a persistent Table owner")),
+        }
     }
 
     /// Synchronize canonical storage of a persistent owner.
