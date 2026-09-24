@@ -268,6 +268,23 @@ impl<Txn: crate::StorageContext> Collection<Txn> {
         }
     }
 
+    /// Create an unpublished persistent collection in caller-delegated empty storage.
+    pub fn create(
+        dir: freqfs::DirLock<Txn::File>,
+        schema: CollectionSchema,
+    ) -> tc_error::TCResult<Self> {
+        match schema {
+            CollectionSchema::BTree(columns) => {
+                let schema = crate::btree::BTreeSchema::try_cast_from(columns.clone(), |_| {
+                    tc_error::TCError::bad_request("invalid BTree schema")
+                })?;
+                let btree = BTree::try_with_schema(dir, schema)?;
+                Ok(Self::BTree(Box::new(BTreeView::new(columns, btree))))
+            }
+            CollectionSchema::Table(schema) => Ok(PersistentTable::try_new(dir, schema)?.into()),
+        }
+    }
+
     /// Strictly load native storage using its recorded semantic schema.
     pub async fn load(
         dir: freqfs::DirLock<Txn::File>,
