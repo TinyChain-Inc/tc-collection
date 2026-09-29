@@ -11,7 +11,7 @@ use crate::collection::BTreeView;
 use crate::route::CollectionState;
 
 type BTreeBounds = (Bound<Value>, Bound<Value>);
-struct DeleteRow<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
+struct BTreeHandler<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
 struct Contains<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
 struct Count<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
 struct IsEmpty<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
@@ -26,7 +26,7 @@ where
 {
     fn route<'a>(&'a self, path: &[PathSegment]) -> Option<Box<dyn tc_ir::Handler<'a, S> + 'a>> {
         match path {
-            [] => Some(Box::new(DeleteRow(self))),
+            [] => Some(Box::new(BTreeHandler(self))),
             [segment] => match segment.as_str() {
                 "contains" => Some(Box::new(Contains(self))),
                 "count" => Some(Box::new(Count(self))),
@@ -95,11 +95,24 @@ fn bound_from_map<S: CollectionState>(
     }
 }
 
-impl<'a, S, Txn> tc_ir::Handler<'a, S> for DeleteRow<'a, Txn>
+impl<'a, S, Txn> tc_ir::Handler<'a, S> for BTreeHandler<'a, Txn>
 where
     S: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
 {
+    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, S>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |_txn, key| {
+            Box::pin(async move {
+                self.0
+                    .slice_from_key(S::from(key))
+                    .map(|view| S::from(Collection::BTree(Box::new(view))))
+            })
+        }))
+    }
+
     fn delete<'txn>(self: Box<Self>) -> Option<tc_ir::DeleteHandler<'a, 'txn, S>>
     where
         'txn: 'a,

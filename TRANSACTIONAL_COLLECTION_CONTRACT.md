@@ -53,6 +53,12 @@ recovery-required boundary.
 
 ## Visibility and ordering
 
+Native BTree and Table root GET handlers return a native view for a null key.
+`IntoView` acquires transaction consistency; encoding remains separate. BTree delegates
+non-null slice arguments to its existing native slice behavior; no host-specific
+snapshot endpoint is required. Native creation and strict loading both delegate
+through `CollectionSchema` to the concrete owner.
+
 For transaction `T`, a read observes canonical state, committed versions no
 later than `T`, and its own pending version. It never observes another
 transaction's pending data.
