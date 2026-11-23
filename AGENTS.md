@@ -2,17 +2,14 @@
 
 The repository-local
 [`TRANSACTIONAL_COLLECTION_CONTRACT.md`](TRANSACTIONAL_COLLECTION_CONTRACT.md)
-is the canonical behavioral contract. The parent
-[workspace invariants](https://github.com/TinyChain-Inc/tcv2/blob/main/AGENTS.md)
-are non-normative integration context when this repository is used as a submodule.
+is the canonical behavioral contract.
 
 - Own BTree, Table, Tensor, and Collection values, local operations, routes,
   views, codecs, and deterministic transaction behavior.
 - Implement `Route` directly on each concrete collection and delegate the
   `Collection` enum to it. Select each operation once, retain no unresolved
-  path, and do not repeat traversal in a terminal handler. The parent workspace's
-  [native-routing contract](https://github.com/TinyChain-Inc/tcv2/blob/main/tc-ir/IR_INTERFACE_GUIDELINES.md#native-routing)
-  is non-normative integration context for these shared interfaces.
+  path, and do not repeat traversal in a terminal handler. See the shared
+  [native-routing contract](https://github.com/TinyChain-Inc/tc-ir/blob/main/IR_INTERFACE_GUIDELINES.md#native-routing).
 - Represent each selected operation with a small terminal handler borrowing its
   collection receiver. Do not clone the receiver into every handler or replace
   the terminal types with an operation tag, aggregate method switch, adapter

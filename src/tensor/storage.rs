@@ -230,7 +230,7 @@ impl<F: CollectionFile + TensorFileEntry<T>, T: TensorElement> Delta<F, T> {
         }
 
         self.generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
             .map_err(|_| invalid("Tensor mutation generation exhausted"))?;
 
         Ok(())

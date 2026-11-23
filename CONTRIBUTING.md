@@ -1,10 +1,7 @@
 # Contributing to tc-collection
 
 Read this repository's [invariants](AGENTS.md) and
-[transactional contract](TRANSACTIONAL_COLLECTION_CONTRACT.md). The parent
-workspace
-[contributor guide](https://github.com/TinyChain-Inc/tcv2/blob/main/CONTRIBUTING.md)
-is non-normative integration context for a superproject checkout.
+[transactional contract](TRANSACTIONAL_COLLECTION_CONTRACT.md).
 
 ## Collection types
 
@@ -60,6 +57,10 @@ limit: concurrent consumers and expression frames may retain multiple buffers.
   spawn ingestion tasks to hide ownership.
 
 ## Validation
+
+The [standalone CI guide](ci/README.md) describes pinned dependency setup and the
+repository's formatting, feature, library-test, and doctest checks. These checks
+run on pull requests and pushes to `main`.
 
 The persistence benchmark's `evaluation` suite measures primary reads with varying
 auxiliary-index counts, streamed restoration with canonical and retained baselines,
@@ -226,8 +227,8 @@ workers only.
 
 For comparisons, compile the same harness against both source snapshots and
 retain both executables. The shared
-[`fensor` comparison runner](https://github.com/TinyChain-Inc/tcv2/blob/main/deps/fensor/benchmarks/compare.py)
-is a non-normative workspace integration tool. Invoke it with
+[`fensor` comparison runner](https://github.com/TinyChain-Inc/fensor/blob/main/benchmarks/compare.py)
+is a timing tool. Invoke it with
 `--record-prefix COLLECTION --suite-env COLLECTION_BENCH_SUITE --suite all`.
 It alternates isolated processes and validates matching records. Keep its output
 under the ignored benchmark results directory; do not use timing assertions in

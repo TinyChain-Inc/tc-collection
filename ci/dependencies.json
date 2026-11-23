@@ -1,0 +1,92 @@
+[
+  {
+    "path": "deps/async-hash",
+    "repository": "https://github.com/TinyChain-Inc/async-hash.git",
+    "revision": "de73933523db6c6b3d2c3d90769166a149a8880c"
+  },
+  {
+    "path": "deps/b-table",
+    "repository": "https://github.com/TinyChain-Inc/b-table.git",
+    "revision": "1f242fb9e9f5c8ed750b2dca885e4e2a5d9c0b2e"
+  },
+  {
+    "path": "deps/b-tree",
+    "repository": "https://github.com/TinyChain-Inc/b-tree.git",
+    "revision": "2980650d86838d3e27d25f6c1e91363b4e78da76"
+  },
+  {
+    "path": "deps/collate",
+    "repository": "https://github.com/TinyChain-Inc/collate.git",
+    "revision": "e3fc4c0e0698fed8d189425f5985d59f4717f496"
+  },
+  {
+    "path": "deps/destream",
+    "repository": "https://github.com/TinyChain-Inc/destream",
+    "revision": "c220b4bd6e2bc7ed6ef4fd32ae0651b8b72b26ab"
+  },
+  {
+    "path": "deps/destream_json",
+    "repository": "https://github.com/TinyChain-Inc/destream_json",
+    "revision": "7d524014efb4373c5b000ab7f4520cce76d57c5a"
+  },
+  {
+    "path": "deps/fensor",
+    "repository": "https://github.com/TinyChain-Inc/fensor.git",
+    "revision": "5f35ce4dfba25a7efa64bc3603aed11a7c2d688c"
+  },
+  {
+    "path": "deps/freqfs",
+    "repository": "https://github.com/TinyChain-Inc/freqfs.git",
+    "revision": "384a37f15e166306a2e6cd7bd29a11a542f92f5d"
+  },
+  {
+    "path": "deps/ha-ndarray",
+    "repository": "https://github.com/TinyChain-Inc/ha-ndarray.git",
+    "revision": "df16f7722b628df0b9cdc39b65943177e2c25886"
+  },
+  {
+    "path": "deps/hr-id",
+    "repository": "https://github.com/TinyChain-Inc/hr-id.git",
+    "revision": "a79919f17aa5dc2574702c8dc8e4437daa7b7fe6"
+  },
+  {
+    "path": "deps/number-general",
+    "repository": "https://github.com/TinyChain-Inc/number-general.git",
+    "revision": "dc9e558f01e3f07a0cc0df564acf31dfa21f7211"
+  },
+  {
+    "path": "deps/pathlink",
+    "repository": "https://github.com/TinyChain-Inc/pathlink.git",
+    "revision": "a04aa2f52f8d0875cdd90cedcbfd8ccaa1b2a46d"
+  },
+  {
+    "path": "deps/tbon",
+    "repository": "https://github.com/TinyChain-Inc/tbon",
+    "revision": "b10ba0b31f7caf5ff49710e28c5987bbc456e00e"
+  },
+  {
+    "path": "deps/txfs",
+    "repository": "https://github.com/TinyChain-Inc/txfs.git",
+    "revision": "ac6c2faddfb9c6c54bd65caec6d01e3971c12196"
+  },
+  {
+    "path": "deps/txn_lock",
+    "repository": "https://github.com/TinyChain-Inc/txn_lock.git",
+    "revision": "56b3d43be8085e1d6f1c9df7ac54d84a7012a088"
+  },
+  {
+    "path": "tc-error",
+    "repository": "https://github.com/TinyChain-Inc/tc-error.git",
+    "revision": "03b6c36a5504de943ad3ebd23baf907a7f59644a"
+  },
+  {
+    "path": "tc-ir",
+    "repository": "https://github.com/TinyChain-Inc/tc-ir.git",
+    "revision": "4c9bce45a6a1e5cbed1f0d69046b8d004171c1b3"
+  },
+  {
+    "path": "tc-value",
+    "repository": "https://github.com/TinyChain-Inc/tc-value.git",
+    "revision": "a459d5638edc49f9ee99e456f33010ea8bd6e9ec"
+  }
+]
