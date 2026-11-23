@@ -2,16 +2,20 @@ use std::path::Path;
 use std::sync::Arc;
 
 use freqfs::Cache;
+use tc_ir::{NetworkTime, TxnId};
 
 use crate::tensor::{Tensor, TensorSchema};
 use crate::{PersistentFile, StorageContext};
-use tc_ir::{NetworkTime, TxnId};
 
 pub(crate) mod depth;
 pub(crate) mod storage;
 pub(crate) mod tensor;
 
 pub use storage::{TempRoot, TestTxn};
+
+// General storage tests use a generous resident target so cache pressure is not
+// an incidental part of their scenario. Pressure tests pass smaller capacities.
+const DEFAULT_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn tx(nonce: u16) -> TxnId {
     TxnId::from_parts(NetworkTime::from_nanos(1), nonce)
@@ -25,8 +29,12 @@ pub fn init_root(name: &str) -> Arc<TempRoot> {
 }
 
 pub fn load_roots(root: &Path) -> (freqfs::DirLock<PersistentFile>, TestTxn) {
-    let cache =
-        Cache::<PersistentFile>::new(16 * 1024 * 1024, None, 0, std::time::Duration::from_secs(3));
+    let cache = Cache::<PersistentFile>::new(
+        DEFAULT_CACHE_BYTES,
+        None,
+        0,
+        std::time::Duration::from_secs(3),
+    );
 
     let persistent = Arc::clone(&cache)
         .load(root.join("persistent"))
@@ -41,12 +49,17 @@ pub fn load_roots(root: &Path) -> (freqfs::DirLock<PersistentFile>, TestTxn) {
 
 #[tokio::test]
 async fn transaction_fixture_isolates_equal_ids_and_shared_subcontexts() {
-    use crate::StorageContext;
     use tc_ir::Transaction;
 
+    use crate::StorageContext;
+
     let id = tensor::id(10);
-    let (left_root, left) = TestTxn::owned(id, 16 * 1024 * 1024, 256 * 1024 * 1024);
-    let (right_root, right) = TestTxn::owned(id, 16 * 1024 * 1024, 256 * 1024 * 1024);
+    let (left_root, left) =
+        TestTxn::owned(id, DEFAULT_CACHE_BYTES, storage::DEFAULT_MATERIALIZED_BYTES);
+
+    let (right_root, right) =
+        TestTxn::owned(id, DEFAULT_CACHE_BYTES, storage::DEFAULT_MATERIALIZED_BYTES);
+
     assert_ne!(left_root.as_ref().as_ref(), right_root.as_ref().as_ref());
     assert_eq!(left.id(), right.id());
     let first = left.subcontext_unique().context().await.unwrap();
@@ -86,8 +99,8 @@ impl TestTxn {
     pub fn fresh(nonce: u16) -> Self {
         Self::owned(
             tc_ir::TxnId::from_parts(tc_ir::NetworkTime::from_nanos(1), nonce),
-            16 * 1024 * 1024,
-            256 * 1024 * 1024,
+            DEFAULT_CACHE_BYTES,
+            storage::DEFAULT_MATERIALIZED_BYTES,
         )
         .1
     }

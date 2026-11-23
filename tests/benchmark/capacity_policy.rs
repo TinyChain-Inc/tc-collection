@@ -7,10 +7,10 @@ use std::time::Instant;
 use fensor::{TensorElement, TensorFileEntry, TensorSource};
 use futures::{FutureExt, TryStreamExt, stream};
 use number_general::Number;
-
-use super::{PersistentFile, StorageContext, Tensor, TensorSchema, Txn, id, record, setup};
 use tc_collection::tensor::AxisRange;
 use tc_ir::{Transact, Transaction};
+
+use super::{PersistentFile, StorageContext, Tensor, TensorSchema, Txn, id, record, setup};
 
 async fn scan<T: Copy + Into<Number>>(tensor: &Tensor<Txn>, expected: &[T], version: u16) {
     let mut values = tensor.elements(id(version)).await.unwrap();

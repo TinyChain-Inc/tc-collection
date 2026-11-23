@@ -5,15 +5,15 @@ use std::sync::Arc;
 
 use freqfs::Cache;
 use safecast::{CastFrom, TryCastFrom, TryCastInto};
+use tc_ir::{Map, NetworkTime, Scalar, Transact, Transaction, TxnId};
+use tc_value::{Value, ValueType};
 
 use super::selector::KeyOrRange;
 use crate::btree::StorageConfig;
 use crate::collection::CollectionSchema;
 use crate::table::{Column, PersistentTable, Table, TableSchema};
 use crate::test::{TempRoot, TestTxn as MockTxn};
-use crate::{PersistentFile, StorageContext};
-use tc_ir::{Map, NetworkTime, Scalar, Transact, Transaction, TxnId};
-use tc_value::{Value, ValueType};
+use crate::{PersistentFile, Restore, StorageContext};
 
 fn segment(name: &str) -> pathlink::PathSegment {
     pathlink::PathSegment::from_str(name).expect("path segment")
@@ -587,8 +587,8 @@ async fn get_table_all() {
         let owner = crate::Collection::from(table);
         assert!(collection.sync().await.is_err());
         assert!(collection.sync_all().await.is_err());
-        assert!(collection.restore_from(&txn, &owner).await.is_err());
-        assert!(owner.restore_from(&txn, &collection).await.is_err());
+        assert!(collection.restore(&txn, &owner).await.is_err());
+        assert!(owner.restore(&txn, &collection).await.is_err());
         assert!(collection.commit(txn.id()).await.is_err());
         assert!(collection.rollback(&txn.id()).await.is_err());
         assert!(collection.finalize(&txn.id()).await.is_err());
@@ -656,7 +656,6 @@ async fn local_table_uses_native_routes_without_transaction_deltas() {
 async fn decoded_table_is_local_not_persistent() {
     Box::pin(async {
         use safecast::CastFrom;
-
         use tc_value::Value;
 
         let schema = simple_schema();
@@ -712,7 +711,6 @@ async fn get_table_key() {
 async fn get_columns() {
     Box::pin(async {
         use safecast::CastFrom;
-
         use tc_value::Value;
 
         let txn = MockTxn::fresh(20);
@@ -796,7 +794,6 @@ async fn get_count_missing_key() {
 async fn get_contains_key() {
     Box::pin(async {
         use safecast::CastFrom;
-
         use tc_value::Value;
 
         let txn = MockTxn::fresh(20);
@@ -827,7 +824,6 @@ async fn get_contains_key() {
 async fn get_contains_missing() {
     Box::pin(async {
         use safecast::CastFrom;
-
         use tc_value::Value;
 
         let txn = MockTxn::fresh(20);
@@ -858,7 +854,6 @@ async fn get_contains_missing() {
 async fn get_key_columns() {
     Box::pin(async {
         use safecast::CastFrom;
-
         use tc_value::Value;
 
         let txn = MockTxn::fresh(20);

@@ -4,10 +4,10 @@ use destream::{de, en};
 use futures::{StreamExt, TryStreamExt};
 use number_general::Number;
 use safecast::CastInto;
+use tc_value::Value;
 
 use super::{Data, NumberType, Tensor, TensorSchema, TensorView, Typed};
 use crate::StorageContext;
-use tc_value::Value;
 
 impl<'en> en::IntoStream<'en> for TensorView {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {

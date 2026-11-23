@@ -4,12 +4,12 @@ use std::fmt;
 use b_table::{ColumnRange, IndexSchema, Range, Schema};
 use b_tree::Schema as BTreeSchema;
 use safecast::{CastFrom, TryCastFrom};
-
-use super::stream::Projection;
-use crate::btree::StorageConfig;
 use tc_error::TCError;
 use tc_ir::Id;
 use tc_value::{Value, ValueType};
+
+use super::stream::Projection;
+use crate::btree::StorageConfig;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Column {

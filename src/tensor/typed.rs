@@ -4,11 +4,11 @@ use fensor::{
 };
 use freqfs::DirLock;
 use futures::{StreamExt, TryStreamExt};
+use tc_error::{Pressure, PressureReason, TCError, TCResult};
+use tc_ir::TxnId;
 
 use super::storage::{Owner, Snapshot};
 use crate::StorageContext;
-use tc_error::{Pressure, PressureReason, TCError, TCResult};
-use tc_ir::TxnId;
 
 /// Only owners mutate storage; geometric views and computed expressions are read-only.
 #[derive(Clone)]
@@ -382,7 +382,7 @@ where
         Self::write_elements(&view, txn, values).await
     }
 
-    pub(super) async fn write_elements(
+    async fn write_elements(
         view: &fensor::TensorView<Owner<Txn, T>>,
         txn: &Txn,
         values: impl futures::Stream<Item = TCResult<T>> + Send,
@@ -426,7 +426,51 @@ where
         owner.publish(txn, staged).await
     }
 
-    pub async fn restore_from(&self, txn: &Txn, source: &Self) -> TCResult<()> {
+    pub fn commit(&self, id: TxnId) -> TCResult<()> {
+        // owner() rejects views and expressions. Only the mutable owner can
+        // publish its pending blocks; commit does not flush canonical storage.
+        self.owner()?.core.commit(id)
+    }
+
+    pub fn rollback(&self, id: TxnId) -> TCResult<()> {
+        // Discard pending blocks through the same lifecycle owner as BTree/Table.
+        self.owner()?.core.rollback(id)
+    }
+
+    pub async fn finalize(&self, id: TxnId) -> TCResult<()> {
+        // The shared owner applies covered block replacements before advancing
+        // the frontier; fensor owns each native logical-block replacement.
+        self.owner()?.core.finalize(id).await
+    }
+
+    pub async fn sync(&self) -> TCResult<()> {
+        let owner = self.owner()?;
+        owner.canonical()?.sync().await?;
+        Ok(())
+    }
+
+    pub async fn sync_all(&self) -> TCResult<()> {
+        let owner = self.owner()?;
+        owner.canonical()?.sync_all().await?;
+        Ok(())
+    }
+
+    transform!(reshape, shape, Shape);
+    transform!(broadcast, shape, Shape);
+    transform!(slice, range, fensor::Range);
+    transform!(transpose, permutation, Option<fensor::Axes>);
+    transform!(flip, axis, usize);
+    transform!(squeeze, axes, fensor::Axes);
+    transform!(unsqueeze, axes, fensor::Axes);
+}
+
+impl<Txn: StorageContext, T: TensorElement> crate::Restore for Typed<Txn, T>
+where
+    Txn::File: TensorFileEntry<T>,
+{
+    type Txn = Txn;
+
+    async fn restore(&self, txn: &Txn, source: &Self) -> tc_error::TCResult<()> {
         let target = self.owner()?;
         let source = source.owner()?;
         if target.schema() != source.schema()
@@ -490,36 +534,8 @@ where
 
         target.install(txn.id(), staged)
     }
-
-    pub fn commit(&self, id: TxnId) -> TCResult<()> {
-        self.owner()?.core.commit(id)
-    }
-
-    pub fn rollback(&self, id: TxnId) -> TCResult<()> {
-        self.owner()?.core.rollback(id)
-    }
-
-    pub async fn finalize(&self, id: TxnId) -> TCResult<()> {
-        self.owner()?.core.finalize(id).await
-    }
-
-    pub async fn sync(&self) -> TCResult<()> {
-        let owner = self.owner()?;
-        owner.canonical()?.sync().await?;
-        Ok(())
-    }
-
-    pub async fn sync_all(&self) -> TCResult<()> {
-        let owner = self.owner()?;
-        owner.canonical()?.sync_all().await?;
-        Ok(())
-    }
-
-    transform!(reshape, shape, Shape);
-    transform!(broadcast, shape, Shape);
-    transform!(slice, range, fensor::Range);
-    transform!(transpose, permutation, Option<fensor::Axes>);
-    transform!(flip, axis, usize);
-    transform!(squeeze, axes, fensor::Axes);
-    transform!(unsqueeze, axes, fensor::Axes);
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/tensor/typed.rs"]
+mod tests;

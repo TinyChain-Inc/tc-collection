@@ -9,14 +9,14 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use number_general::Number;
 use safecast::CastInto;
+use tc_error::{TCError, TCResult};
+use tc_ir::{Transact, TxnId};
+use tc_value::NumberType;
 
 use crate::StorageContext;
 use crate::tensor::typed::Typed;
 pub(crate) use schema::MAX_TENSOR_METADATA_RANK;
 pub use schema::TensorSchema;
-use tc_error::{TCError, TCResult};
-use tc_ir::{Transact, TxnId};
-use tc_value::NumberType;
 pub use view::TensorView;
 
 pub type SparseElements = BoxStream<'static, TCResult<(Vec<u64>, Number)>>;
@@ -107,14 +107,6 @@ impl<Txn: StorageContext> Tensor<Txn> {
         }
     }
 
-    /// Evaluate once into independent unpublished native storage.
-    pub async fn materialize(&self, txn: &Txn, dir: DirLock<Txn::File>) -> TCResult<Self> {
-        let capacity = fensor::MAX_BLOCK_CAPACITY;
-        Ok(Self {
-            data: dispatch!(@wrap &self.data, value => value.copy_into(txn.id(), dir, capacity).await?),
-        })
-    }
-
     /// Interpret implicit zeros as dense values without copying or persisting data.
     /// Explicit copying materializes the result in independent storage.
     pub async fn as_dense(&self, id: TxnId) -> TCResult<Self> {
@@ -196,7 +188,7 @@ impl<Txn: StorageContext> Tensor<Txn> {
     /// Explicitly copy all logical values, including implicit sparse zeros.
     /// Use this when indexed sparse copying cannot preserve the source's order.
     /// The destination is independent; transaction visibility and source leases
-    /// are acquired in the same way as [`Self::materialize`].
+    /// are acquired in the same way as [`crate::CopyFrom::copy_from`].
     pub async fn copy_values(&self, txn: &Txn, dir: DirLock<Txn::File>) -> TCResult<Self> {
         let capacity = fensor::MAX_BLOCK_CAPACITY;
         Ok(Self {
@@ -217,10 +209,6 @@ impl<Txn: StorageContext> Tensor<Txn> {
 
     async fn assign(&self, txn: &Txn, range: Option<Range>, source: Self) -> TCResult<()> {
         dispatch_pair!(&self.data, source.data, target, source => target.assign(txn, range, source).await, Err(TCError::bad_request("Tensor dtype mismatch")))
-    }
-
-    pub async fn restore_from(&self, txn: &Txn, source: &Self) -> TCResult<()> {
-        dispatch_pair!(&self.data, &source.data, target, source => target.restore_from(txn, source).await, Err(TCError::bad_request("Tensor dtype mismatch")))
     }
 
     pub async fn sync(&self) -> TCResult<()> {
@@ -262,8 +250,32 @@ mod ops;
 pub(crate) mod route;
 mod schema;
 mod storage;
+mod typed;
+mod view;
+
+impl<Txn: crate::StorageContext> crate::CopyFrom<&Tensor<Txn>> for Tensor<Txn> {
+    type Txn = Txn;
+
+    async fn copy_from(
+        txn: &Txn,
+        dir: freqfs::DirLock<Txn::File>,
+        source: &Tensor<Txn>,
+    ) -> tc_error::TCResult<Self> {
+        let capacity = fensor::MAX_BLOCK_CAPACITY;
+        Ok(Self {
+            data: dispatch!(@wrap &source.data, value => value.copy_into(txn.id(), dir, capacity).await?),
+        })
+    }
+}
+
+impl<Txn: crate::StorageContext> crate::Restore for Tensor<Txn> {
+    type Txn = Txn;
+
+    async fn restore(&self, txn: &Txn, source: &Self) -> tc_error::TCResult<()> {
+        dispatch_pair!(&self.data, &source.data, target, source => target.restore(txn, source).await, Err(TCError::bad_request("Tensor dtype mismatch")))
+    }
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/tensor/tests.rs"]
 mod tests;
-mod typed;
-mod view;

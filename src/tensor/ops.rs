@@ -8,12 +8,12 @@ use fensor::{
 use fensor::{TensorComplex, TensorFourier, TensorMatrixUnaryComplex};
 use number_general::Number;
 use safecast::CastInto;
-
-use super::{Data, Shape, Tensor, TensorReduceResult, Typed};
-use crate::StorageContext;
 use tc_error::{TCError, TCResult};
 use tc_ir::TxnId;
 use tc_value::NumberType;
+
+use super::{Data, Shape, Tensor, TensorReduceResult, Typed};
+use crate::StorageContext;
 
 fn reduction_axes(shape: &[u64], axes: Option<Vec<usize>>) -> TCResult<fensor::Axes> {
     let axes = axes

@@ -1,7 +1,6 @@
 use fensor::{Layout, Shape};
 use number_general::Number;
 use safecast::{CastFrom, TryCastFrom};
-
 use tc_error::{TCError, TCResult};
 use tc_value::{NumberType, Value, ValueType};
 

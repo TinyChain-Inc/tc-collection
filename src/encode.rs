@@ -1,11 +1,11 @@
 use destream::en::{self, EncodeMap};
 use futures::StreamExt;
 use safecast::CastFrom;
+use tc_value::Value;
+use tc_value::class::NativeClass;
 
 use crate::view::{BTreeView, CollectionView, TableView};
 use crate::{BTreeType, TableType, TensorType};
-use tc_value::Value;
-use tc_value::class::NativeClass;
 
 impl<'en> en::IntoStream<'en> for BTreeView {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {

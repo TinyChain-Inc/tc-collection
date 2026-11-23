@@ -4,9 +4,8 @@ use std::time::{Duration, Instant};
 
 use futures::{FutureExt, TryStreamExt};
 use number_general::Number;
-
 use tc_collection::tensor::{AxisRange, Range, Tensor, TensorSchema};
-use tc_collection::{PersistentFile, StorageContext};
+use tc_collection::{PersistentFile, Restore, StorageContext};
 use tc_ir::{IntoView, Transact, Transaction};
 
 #[path = "common/storage.rs"]
@@ -25,7 +24,13 @@ mod tensor_layout;
 
 async fn setup() -> (std::sync::Arc<support::TempRoot>, Txn) {
     match std::env::var("COLLECTION_BENCH_CACHE_BYTES") {
-        Ok(capacity) => support::setup_with_capacity(capacity.parse().unwrap()).await,
+        Ok(capacity) => {
+            let capacity = capacity
+                .parse()
+                .expect("COLLECTION_BENCH_CACHE_BYTES must be a byte count");
+
+            support::setup_with_capacity(capacity).await
+        }
         Err(std::env::VarError::NotPresent) => support::setup().await,
         Err(error) => panic!("invalid benchmark cache capacity: {error}"),
     }
@@ -244,7 +249,7 @@ async fn restoration() {
         source.fill(&txn, 2.0.into()).boxed().await.unwrap();
         let (target, _) = create(&txn, vec![32, 65].into(), sparse, 64).await;
         let start = Instant::now();
-        target.restore_from(&txn, &source).boxed().await.unwrap();
+        target.restore(&txn, &source).boxed().await.unwrap();
         record(
             &format!("restoration/{}", layout(sparse)),
             "restore",
@@ -470,7 +475,8 @@ async fn benchmark() {
 
     println!(
         "cache capacity: {} bytes",
-        std::env::var("COLLECTION_BENCH_CACHE_BYTES").unwrap_or_else(|_| "262144".into())
+        std::env::var("COLLECTION_BENCH_CACHE_BYTES")
+            .unwrap_or_else(|_| support::DEFAULT_CACHE_BYTES.to_string())
     );
 
     let suite = std::env::var("COLLECTION_BENCH_SUITE").unwrap_or_else(|_| "all".into());

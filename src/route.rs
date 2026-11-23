@@ -1,13 +1,13 @@
 use number_general::Number;
 use pathlink::Link;
-
-use crate::Collection;
-use crate::class::CollectionType;
-use crate::tensor::Tensor;
 use tc_error::TCResult;
 use tc_ir::{Map, Scalar};
 use tc_value::Value;
 use tc_value::class::NativeClass;
+
+use crate::Collection;
+use crate::class::CollectionType;
+use crate::tensor::Tensor;
 
 /// The minimal conversion boundary required by collection route handlers.
 ///

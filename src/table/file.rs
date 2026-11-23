@@ -1,3 +1,10 @@
+//! Transactional row ownership over native indexed Tables.
+//!
+//! `KeyOwner` decides visibility and lifecycle; native b-table owners maintain
+//! indexes in canonical storage and each delta. Deletes retain the baseline row
+//! so scans through any index can suppress its old entry before adding the new
+//! row. See TRANSACTIONAL_COLLECTION_CONTRACT.md for caller obligations.
+
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -6,14 +13,14 @@ use b_table::{IndexSchema, Range, Row, TableLock};
 use freqfs::DirLock;
 use futures::TryStreamExt;
 use futures::stream::BoxStream;
+use tc_error::{TCError, TCResult};
+use tc_ir::{Id, Transact, TxnId};
+use tc_value::{Value, ValueCollator};
 
 use super::schema::{TableIndexSchema, TableSchema};
 use super::stream::Rows;
 use super::view::{Limited, Selection, TableSlice};
 use crate::persistence::{CollectionOwner, KeyOwner, PersistentDelta, PointRead, VisibleSnapshot};
-use tc_error::{TCError, TCResult};
-use tc_ir::{Id, Transact, TxnId};
-use tc_value::{Value, ValueCollator};
 
 type RowsResult = std::io::Result<BoxStream<'static, Result<Row<Value>, std::io::Error>>>;
 pub(crate) type TableFile<F> = TableLock<TableSchema, TableIndexSchema, ValueCollator, F>;
@@ -58,6 +65,8 @@ pub(crate) async fn delete_row<F: crate::CollectionFile>(
 }
 
 struct Delta<F: crate::CollectionFile> {
+    // A lookup distinguishes untouched (None), deleted (Some(None)), and replaced
+    // (Some(Some(row))). Inserts take precedence when both tables contain a key.
     inserts: TableFile<F>,
     deletes: TableFile<F>,
 }
@@ -266,69 +275,7 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         Ok(())
     }
 
-    /// Stage a native replacement without changing the pending delta on failure.
-    /// Self-restoration is a no-op; conflicting source admission returns without waiting.
-    pub async fn restore_from(&self, txn: &Txn, source: &Self) -> tc_error::TCResult<()> {
-        let id = txn.id();
-        self.owner.read_state().assert_writable(id)?;
-        if Arc::ptr_eq(&self.owner, &source.owner) {
-            return Ok(());
-        }
-
-        if !self.schema.same_semantics(&source.schema) {
-            return Err(tc_error::TCError::bad_request(
-                "Table restoration schema mismatch",
-            ));
-        }
-
-        let _permit = self
-            .owner
-            .try_acquire_write_permit(id, txn_lock::set::Range::All)?;
-
-        let base = self.owner.committed_snapshot(id)?;
-
-        let source_permit = source
-            .owner
-            .try_acquire_read_permit(id, txn_lock::set::Range::All)?;
-
-        let source_snapshot = source.owner.visible_snapshot(id)?;
-        let stream = source
-            .visible_rows(source_snapshot, Range::default(), &[], false)
-            .await?;
-
-        let mut rows = Rows::new(stream, source_permit);
-        let workspace = txn.subcontext_unique().context().await?;
-        let delta = Delta::create(self.schema.clone(), workspace).await?;
-        let key_len = self.schema.key().len();
-        let mut baseline = self
-            .visible_rows(base, Range::default(), &[], false)
-            .await?;
-
-        while let Some(row) = baseline.try_next().await? {
-            let mut key = row.into_vec();
-            let values = key.split_off(key_len);
-            delta.add_to_deletes(key, values).await?;
-        }
-
-        drop(baseline);
-
-        while let Some(row) = rows.try_next().await? {
-            let mut key = row.into_vec();
-            let values = key.split_off(key_len);
-            delta.upsert(key, values).await?;
-        }
-
-        drop(rows);
-        let mut state = self.owner.write_state();
-        state.assert_writable(id)?;
-        state.pending.insert(id, delta);
-        Ok(())
-    }
-
-    pub async fn upsert_row(&self, txn: &Txn, key: Vec<Value>, values: Vec<Value>) -> TCResult<()>
-    where
-        Txn: crate::StorageContext,
-    {
+    pub async fn upsert_row(&self, txn: &Txn, key: Vec<Value>, values: Vec<Value>) -> TCResult<()> {
         let txn_id = txn.id();
         let key = b_table::Schema::validate_key(&self.schema, key)?;
         let values = b_table::Schema::validate_values(&self.schema, values)?;
@@ -348,10 +295,7 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         txn: &Txn,
         key: Vec<Value>,
         values: Vec<Value>,
-    ) -> tc_error::TCResult<()>
-    where
-        Txn: crate::StorageContext,
-    {
+    ) -> tc_error::TCResult<()> {
         let txn_id = txn.id();
         let key = b_table::Schema::validate_key(&self.schema, key)?;
         let values = b_table::Schema::validate_values(&self.schema, values)?;
@@ -377,10 +321,7 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         Ok(())
     }
 
-    pub async fn delete_row(&self, txn: &Txn, key: Vec<Value>) -> TCResult<()>
-    where
-        Txn: crate::StorageContext,
-    {
+    pub async fn delete_row(&self, txn: &Txn, key: Vec<Value>) -> TCResult<()> {
         let txn_id = txn.id();
         let key = b_table::Schema::validate_key(&self.schema, key)?;
 
@@ -513,10 +454,7 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         txn: &Txn,
         range: Range<Id, Value>,
         values: tc_ir::Map<Value>,
-    ) -> TCResult<()>
-    where
-        Txn: crate::StorageContext,
-    {
+    ) -> TCResult<()> {
         let txn_id = txn.id();
         let value_columns = self.schema.values();
         for (name, value) in &values {
@@ -569,6 +507,8 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
 
         drop(visible);
         let pending = self.pending_delta_for_txn(txn).await?;
+        // Mutating pending while scanning its inserts would cross native lock
+        // domains and could invalidate traversal. Merge only after the scan drops.
         Box::pin(staged.apply_to_pending(&pending)).await?;
         Ok(())
     }
@@ -579,10 +519,7 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
     /// state, so the input guards are released before publication. A single
     /// whole-table write permit covers the operation without collecting rows
     /// in memory.
-    pub async fn truncate(&self, txn: &Txn, range: Range<Id, Value>) -> TCResult<()>
-    where
-        Txn: crate::StorageContext,
-    {
+    pub async fn truncate(&self, txn: &Txn, range: Range<Id, Value>) -> TCResult<()> {
         let txn_id = txn.id();
         let key_len = self.schema.key().len();
 
@@ -628,6 +565,10 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
             *current = incoming;
         });
 
+        // Oldest committed layer first, then this transaction's pending layer:
+        // delete its indexed baseline entries before merging replacement rows.
+        // Check retirement on both sides of I/O because finalization can move a
+        // layer into canonical storage while native streams are being opened.
         for (id, delta) in snapshot.deltas {
             if snapshot.visibility.retired(id) {
                 continue;
@@ -658,6 +599,8 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
             return Ok(pending);
         }
 
+        // Preserve the original indexed row only on the first change. Later
+        // upserts/deletes edit pending inserts while keeping this baseline marker.
         if let Some(mut row) =
             Self::resolve_row(self.owner.point_read(txn.id())?.committed(), key).await?
         {
@@ -740,6 +683,74 @@ impl<Txn: crate::StorageContext> Transact for PersistentTable<Txn> {
     ) -> impl std::future::Future<Output = tc_error::TCResult<()>> + Send {
         let txn_id = *txn_id;
         async move { PersistentTable::finalize(self, txn_id).await }
+    }
+}
+
+impl<Txn: crate::StorageContext> crate::Restore for PersistentTable<Txn> {
+    type Txn = Txn;
+
+    /// Restore through a staged indexed-row delta; see [`crate::Restore`].
+    async fn restore(&self, txn: &Txn, source: &Self) -> tc_error::TCResult<()> {
+        let id = txn.id();
+        self.owner.read_state().assert_writable(id)?;
+        if Arc::ptr_eq(&self.owner, &source.owner) {
+            return Ok(());
+        }
+
+        if !self.schema.same_semantics(&source.schema) {
+            return Err(tc_error::TCError::bad_request(
+                "Table restoration schema mismatch",
+            ));
+        }
+
+        let _permit = self
+            .owner
+            .try_acquire_write_permit(id, txn_lock::set::Range::All)?;
+
+        let base = self.owner.committed_snapshot(id)?;
+
+        // Build a complete replacement relative to committed state. Excluding
+        // the old pending delta lets publication replace it instead of composing
+        // the restored rows with earlier writes in this transaction.
+
+        let source_permit = source
+            .owner
+            .try_acquire_read_permit(id, txn_lock::set::Range::All)?;
+
+        let source_snapshot = source.owner.visible_snapshot(id)?;
+        let stream = source
+            .visible_rows(source_snapshot, Range::default(), &[], false)
+            .await?;
+
+        let mut rows = Rows::new(stream, source_permit);
+        let workspace = txn.subcontext_unique().context().await?;
+        let delta = Delta::create(self.schema.clone(), workspace).await?;
+        let key_len = self.schema.key().len();
+        let mut baseline = self
+            .visible_rows(base, Range::default(), &[], false)
+            .await?;
+
+        while let Some(row) = baseline.try_next().await? {
+            let mut key = row.into_vec();
+            let values = key.split_off(key_len);
+            delta.add_to_deletes(key, values).await?;
+        }
+
+        drop(baseline);
+
+        while let Some(row) = rows.try_next().await? {
+            let mut key = row.into_vec();
+            let values = key.split_off(key_len);
+            delta.upsert(key, values).await?;
+        }
+
+        drop(rows);
+        // Publish only after both input streams have released their native guards.
+        // A decision made during staging must still reject this replacement.
+        let mut state = self.owner.write_state();
+        state.assert_writable(id)?;
+        state.pending.insert(id, delta);
+        Ok(())
     }
 }
 

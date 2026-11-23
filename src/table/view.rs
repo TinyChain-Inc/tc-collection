@@ -7,12 +7,12 @@ use std::fmt;
 
 use b_table::{IndexSchema, Range, Row};
 use futures::TryStreamExt;
+use tc_ir::{Id, Map, TxnId};
+use tc_value::{Value, ValueCollator};
 
 use super::file::{PersistentTable, TableFile, delete_row, row_stream, upsert};
 use super::schema::TableSchema;
 use super::stream::{Projection, Rows};
-use tc_ir::{Id, Map, TxnId};
-use tc_value::{Value, ValueCollator};
 
 enum TableSource<Txn: crate::StorageContext> {
     File(PersistentTable<Txn>),
@@ -87,7 +87,7 @@ impl<Txn: crate::StorageContext> fmt::Debug for TableSlice<Txn> {
 }
 
 impl<Txn: crate::StorageContext> TableSlice<Txn> {
-    pub(super) fn validate_materialization(&self) -> tc_error::TCResult<()> {
+    pub(super) fn validate_copy(&self) -> tc_error::TCResult<()> {
         if self.reverse || (!self.order.is_empty() && self.order != self.schema().key()) {
             return Err(tc_error::TCError::bad_request(
                 "cannot materialize a reordered Table view in canonical key order",
@@ -335,8 +335,8 @@ impl<Txn: crate::StorageContext> fmt::Debug for Limited<Txn> {
 }
 
 impl<Txn: crate::StorageContext> Limited<Txn> {
-    pub(super) fn validate_materialization(&self) -> tc_error::TCResult<()> {
-        self.source.validate_materialization()
+    pub(super) fn validate_copy(&self) -> tc_error::TCResult<()> {
+        self.source.validate_copy()
     }
 
     pub fn schema(&self) -> &TableSchema {
@@ -428,8 +428,8 @@ impl<Txn: crate::StorageContext> Selection<Txn> {
         })
     }
 
-    pub(super) fn validate_materialization(&self) -> tc_error::TCResult<()> {
-        self.source.validate_materialization()
+    pub(super) fn validate_copy(&self) -> tc_error::TCResult<()> {
+        self.source.validate_copy()
     }
 
     pub fn schema(&self) -> &TableSchema {

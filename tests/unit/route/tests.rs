@@ -10,10 +10,10 @@ use tc_ir::{Scalar, Transact, Transaction};
 use tc_value::Value;
 
 use super::*;
-use crate::StorageContext;
 use crate::btree::BTreeColumnSchema;
 use crate::collection::BTreeView;
 use crate::test::{TempRoot, TestTxn};
+use crate::{CopyFrom, Restore, StorageContext};
 
 const SERVICE: PathLabel = path_label(&["service", "example", "data", "1.0.0"]);
 
@@ -200,10 +200,11 @@ async fn unmatched_literal_put_returns_owned_inputs() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn native_materialization_and_cold_hash_preserve_schema_and_contents() {
     Box::pin(async {
+        use tc_ir::Public;
+
         use crate::collection::CollectionSchema;
         use crate::table::{Column, TableSchema};
         use crate::tensor::TensorSchema;
-        use tc_ir::Public;
 
         for kind in 0..3 {
             let root = TempRoot::new("native-hash");
@@ -282,13 +283,21 @@ async fn native_materialization_and_cold_hash_preserve_schema_and_contents() {
             let expected = source.hash(txn.id()).await.unwrap();
             source.finalize(&txn.id()).await.unwrap();
             let reader = txn.at(2);
-            let snapshot = source
-                .materialize(&reader, cache().load(root.join("snapshot")).unwrap())
+            let snapshot_dir = cache().load(root.join("snapshot")).unwrap();
+            let snapshot = Collection::copy_from(&reader, snapshot_dir.clone(), &source)
                 .await
                 .unwrap();
 
             snapshot.sync_all().await.unwrap();
+            assert!(
+                Collection::copy_from(&reader, snapshot_dir.clone(), &source)
+                    .await
+                    .is_err()
+            );
+
+            assert_eq!(snapshot.hash(reader.id()).await.unwrap(), expected);
             drop(snapshot);
+            drop(snapshot_dir);
             let reopened =
                 Collection::<TestTxn>::load(cache().load(root.join("snapshot")).unwrap(), schema)
                     .await
@@ -619,14 +628,17 @@ async fn btree_returned_views_cannot_mutate_or_drive_owner_lifecycle() {
         assert!(view.commit(txn.id()).await.is_err());
         assert!(view.rollback(&txn.id()).await.is_err());
         assert!(view.finalize(&txn.id()).await.is_err());
-        assert!(view.restore_from(&txn, &owner).await.is_err());
-        assert!(owner.restore_from(&txn, &view).await.is_err());
+        assert!(view.restore(&txn, &owner).await.is_err());
+        assert!(owner.restore(&txn, &view).await.is_err());
     }
 
-    let copied = full
-        .materialize(&txn, txn.subcontext_unique().context().await.unwrap())
-        .await
-        .unwrap();
+    let copied = BTreeView::copy_from(
+        &txn,
+        txn.subcontext_unique().context().await.unwrap(),
+        &full,
+    )
+    .await
+    .unwrap();
 
     copied
         .persistent()
@@ -642,7 +654,6 @@ async fn btree_returned_views_cannot_mutate_or_drive_owner_lifecycle() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn tensor_handlers_reject_unused_parameters() {
     use futures::FutureExt;
-
     use tc_ir::Route;
 
     Box::pin(async {
@@ -967,12 +978,12 @@ async fn restoration_uses_one_semantic_schema_rule() {
     use std::time::Duration;
 
     use futures::FutureExt;
+    use tc_value::{NumberType, ValueType};
 
     use crate::btree::{BTree, BTreeSchema, StorageConfig};
     use crate::table::{Column, PersistentTable, TableSchema};
     use crate::tensor::TensorSchema;
     use crate::test::tx;
-    use tc_value::{NumberType, ValueType};
 
     Box::pin(async {
         let txn = TestTxn::fresh(10);
@@ -1019,21 +1030,14 @@ async fn restoration_uses_one_semantic_schema_rule() {
             let source = BTreeView::new(columns, source).unwrap();
             let context = txn.context().await.unwrap();
             let held = context.write().await;
-            let direct = target
-                .restore_from(&txn, &source)
+            let error = Collection::BTree(Box::new(target.clone()))
+                .restore(&txn, &Collection::BTree(Box::new(source)))
                 .now_or_never()
                 .expect("schema rejection precedes staging")
                 .unwrap_err();
 
-            let through_enum = Collection::BTree(Box::new(target.clone()))
-                .restore_from(&txn, &Collection::BTree(Box::new(source)))
-                .now_or_never()
-                .expect("enum delegates synchronous rejection")
-                .unwrap_err();
-
-            assert_eq!(direct.code(), tc_error::ErrorKind::BadRequest);
-            assert_eq!(through_enum.code(), direct.code());
-            assert!(!direct.requires_recovery());
+            assert_eq!(error.code(), tc_error::ErrorKind::BadRequest);
+            assert!(!error.requires_recovery());
             drop(held);
             assert_eq!(
                 tokio::time::timeout(Duration::from_secs(2), target.count(tx(11)))
@@ -1064,7 +1068,7 @@ async fn restoration_uses_one_semantic_schema_rule() {
 
         source.insert_row(&later, vec![5_u64.into()]).await.unwrap();
         let source = BTreeView::new(columns, source).unwrap();
-        target.restore_from(&later, &source).await.unwrap();
+        target.restore(&later, &source).await.unwrap();
         assert!(
             target
                 .contains_row(later.id(), &[5_u64.into()])
@@ -1133,20 +1137,13 @@ async fn restoration_uses_one_semantic_schema_rule() {
 
             let context = txn.context().await.unwrap();
             let held = context.write().await;
-            let direct = target
-                .restore_from(&txn, &source)
+            let error = Collection::from(target.clone())
+                .restore(&txn, &Collection::from(source))
                 .now_or_never()
                 .expect("schema rejection precedes staging")
                 .unwrap_err();
 
-            let through_enum = Collection::from(target.clone())
-                .restore_from(&txn, &Collection::from(source))
-                .now_or_never()
-                .expect("enum delegates synchronous rejection")
-                .unwrap_err();
-
-            assert_eq!(direct.code(), tc_error::ErrorKind::BadRequest);
-            assert_eq!(through_enum.code(), direct.code());
+            assert_eq!(error.code(), tc_error::ErrorKind::BadRequest);
             drop(held);
             assert_eq!(
                 tokio::time::timeout(Duration::from_secs(2), target.count(tx(11)))
@@ -1180,7 +1177,7 @@ async fn restoration_uses_one_semantic_schema_rule() {
             .unwrap();
 
         Collection::from(target.clone())
-            .restore_from(&later, &Collection::from(source))
+            .restore(&later, &Collection::from(source))
             .await
             .unwrap();
 
@@ -1217,20 +1214,13 @@ async fn restoration_uses_one_semantic_schema_rule() {
 
                 let context = txn.context().await.unwrap();
                 let held = context.write().await;
-                let direct = target
-                    .restore_from(&txn, &source)
+                let error = Collection::from(target.clone())
+                    .restore(&txn, &Collection::from(source))
                     .now_or_never()
                     .expect("schema rejection precedes staging")
                     .unwrap_err();
 
-                let through_enum = Collection::from(target.clone())
-                    .restore_from(&txn, &Collection::from(source))
-                    .now_or_never()
-                    .expect("enum delegates synchronous rejection")
-                    .unwrap_err();
-
-                assert_eq!(direct.code(), tc_error::ErrorKind::BadRequest);
-                assert_eq!(through_enum.code(), direct.code());
+                assert_eq!(error.code(), tc_error::ErrorKind::BadRequest);
                 drop(held);
                 assert_eq!(
                     tokio::time::timeout(
@@ -1255,7 +1245,7 @@ async fn restoration_uses_one_semantic_schema_rule() {
                 .await
                 .unwrap();
 
-            target.restore_from(&later, &source).await.unwrap();
+            target.restore(&later, &source).await.unwrap();
             assert_eq!(
                 target.read_value(later.id(), &[1, 2]).await.unwrap(),
                 9.0.into()
@@ -1272,14 +1262,14 @@ async fn concrete_views_preserve_error_policy_and_release_sources() {
     use std::cell::RefCell;
 
     use futures::TryStreamExt;
+    use tc_ir::IntoView;
+    use tc_value::{NumberType, ValueType};
 
     use crate::CollectionView;
     use crate::btree::StorageConfig;
     use crate::collection::CollectionSchema;
     use crate::table::{Column, TableSchema};
     use crate::test::storage::STORAGE_ERRORS;
-    use tc_ir::IntoView;
-    use tc_value::{NumberType, ValueType};
 
     Box::pin(async {
         for table in [false, true] {
@@ -1397,10 +1387,11 @@ async fn concrete_views_preserve_error_policy_and_release_sources() {
 
 #[test]
 fn semantic_schema_construction_moves_fields_and_reports_errors() {
+    use tc_value::class::NativeClass;
+
     use crate::btree::BTreeSchema;
     use crate::collection::CollectionSchema;
     use crate::tensor::TensorSchema;
-    use tc_value::class::NativeClass;
 
     let name = String::from("identifier");
     let pointer = name.as_ptr();
@@ -1478,7 +1469,7 @@ fn semantic_schema_construction_moves_fields_and_reports_errors() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn concrete_and_enum_lifecycle_decisions_agree() {
+async fn collection_lifecycle_preserves_owner_view_and_local_semantics() {
     use safecast::CastFrom;
 
     use crate::btree::StorageConfig;
@@ -1514,25 +1505,17 @@ async fn concrete_and_enum_lifecycle_decisions_agree() {
             .await
             .unwrap();
 
+            owner.commit(tx(10)).await.unwrap();
+            owner.commit(tx(10)).await.unwrap();
+            assert!(owner.rollback(&tx(10)).await.is_err());
+            owner.rollback(&tx(12)).await.unwrap();
+            owner.finalize(&tx(11)).await.unwrap();
+
             let view = match &owner {
-                Collection::BTree(tree) => {
-                    tree.commit(tx(10)).await.unwrap();
-                    owner.commit(tx(10)).await.unwrap();
-                    assert!(tree.rollback(&tx(10)).await.is_err());
-                    tree.rollback(&tx(12)).await.unwrap();
-                    tree.finalize(&tx(11)).await.unwrap();
-                    Collection::BTree(Box::new(
-                        tree.slice((Bound::Unbounded, Bound::Unbounded), false),
-                    ))
-                }
-                Collection::Table(table) => {
-                    table.commit(tx(10)).await.unwrap();
-                    owner.commit(tx(10)).await.unwrap();
-                    assert!(table.rollback(&tx(10)).await.is_err());
-                    table.rollback(&tx(12)).await.unwrap();
-                    table.finalize(&tx(11)).await.unwrap();
-                    Collection::from(table.read_view())
-                }
+                Collection::BTree(tree) => Collection::BTree(Box::new(
+                    tree.slice((Bound::Unbounded, Bound::Unbounded), false),
+                )),
+                Collection::Table(table) => Collection::from(table.read_view()),
                 Collection::Tensor(_) => unreachable!(),
             };
 
@@ -1541,26 +1524,11 @@ async fn concrete_and_enum_lifecycle_decisions_agree() {
             owner.finalize(&tx(11)).await.unwrap();
             owner.sync().await.unwrap();
             owner.sync_all().await.unwrap();
-            match &view {
-                Collection::BTree(tree) => {
-                    assert!(tree.commit(tx(13)).await.is_err());
-                    assert!(tree.rollback(&tx(13)).await.is_err());
-                    assert!(tree.finalize(&tx(13)).await.is_err());
-                    assert!(tree.sync().await.is_err());
-                    assert!(tree.sync_all().await.is_err());
-                }
-                Collection::Table(table) => {
-                    assert!(table.commit(tx(13)).await.is_err());
-                    assert!(table.rollback(&tx(13)).await.is_err());
-                    assert!(table.finalize(&tx(13)).await.is_err());
-                }
-                Collection::Tensor(_) => unreachable!(),
-            }
-
             assert!(view.commit(tx(13)).await.is_err());
             assert!(view.rollback(&tx(13)).await.is_err());
             assert!(view.finalize(&tx(13)).await.is_err());
-            owner.commit(tx(14)).await.unwrap();
+            assert!(view.sync().await.is_err());
+            assert!(view.sync_all().await.is_err());
             owner.commit(tx(14)).await.unwrap();
         }
 
@@ -1576,11 +1544,8 @@ async fn concrete_and_enum_lifecycle_decisions_agree() {
         .table;
 
         assert!(matches!(local, Table::Local(_)));
+        let delegated = Collection::from(local.clone());
         for _ in 0..2 {
-            local.commit(tx(10)).await.unwrap();
-            local.rollback(&tx(10)).await.unwrap();
-            local.finalize(&tx(10)).await.unwrap();
-            let delegated = Collection::from(local.clone());
             delegated.commit(tx(10)).await.unwrap();
             delegated.rollback(&tx(10)).await.unwrap();
             delegated.finalize(&tx(10)).await.unwrap();

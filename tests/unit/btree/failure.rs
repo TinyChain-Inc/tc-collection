@@ -1,7 +1,8 @@
-use super::{BTree, contains_key};
-use crate::StorageContext;
-use crate::test::tensor::{Txn, setup};
 use tc_ir::Transaction;
+
+use super::{BTree, contains_key};
+use crate::test::tensor::{Txn, setup};
+use crate::{Restore, StorageContext};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn selected_delta_and_scan_setup_survive_finalized_workspace_cleanup() {
@@ -72,10 +73,11 @@ async fn selected_delta_and_scan_setup_survive_finalized_workspace_cleanup() {
 
 #[tokio::test]
 async fn restoration_and_reinsertion_preserve_numeric_representation() {
+    use tc_value::{NumberType, Value, ValueType};
+
     use crate::Collection;
     use crate::btree::{BTreeColumnSchema, BTreeSchema};
     use crate::collection::BTreeView;
-    use tc_value::{NumberType, Value, ValueType};
 
     let (_, txn) = setup().await;
     let columns = vec![BTreeColumnSchema {
@@ -117,7 +119,7 @@ async fn restoration_and_reinsertion_preserve_numeric_representation() {
     .await
     .unwrap();
 
-    target.restore_from(&writer, &source).await.unwrap();
+    target.restore(&writer, &source).await.unwrap();
     let collection = Collection::BTree(Box::new(BTreeView::new(columns, target.clone()).unwrap()));
     assert_eq!(collection.hash(writer.id()).await.unwrap(), expected);
     target
@@ -151,12 +153,12 @@ async fn restoration_and_reinsertion_preserve_numeric_representation() {
 async fn equal_norm_keys_preserve_identity_and_hash_through_finalization() {
     use futures::TryStreamExt;
     use number_general::{Complex, Number};
+    use tc_ir::Transact;
+    use tc_value::{NumberType, Value, ValueType};
 
     use crate::Collection;
     use crate::btree::{BTreeColumnSchema, BTreeSchema};
     use crate::collection::BTreeView;
-    use tc_ir::Transact;
-    use tc_value::{NumberType, Value, ValueType};
 
     let (_, txn) = setup().await;
     let schema = vec![BTreeColumnSchema {
@@ -258,7 +260,6 @@ async fn interrupted_tree_mutation_is_discarded_by_rollback() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn deep_visible_versions_use_normal_worker_stacks() {
     use futures::TryStreamExt;
-
     use tc_ir::{NetworkTime, TxnId};
 
     for phase in ["drop", "poll"] {
@@ -409,7 +410,7 @@ async fn restoration_self_and_conflicting_sources_are_bounded() {
                 .unwrap();
 
             target
-                .restore_from(&txn, &target.clone())
+                .restore(&txn, &target.clone())
                 .now_or_never()
                 .expect("self-restore does not wait")
                 .unwrap();
@@ -419,7 +420,7 @@ async fn restoration_self_and_conflicting_sources_are_bounded() {
 
             let context = txn.context().await.unwrap();
             let context_guard = context.write().await;
-            let mut restore = Box::pin(target.restore_from(&txn, source));
+            let mut restore = Box::pin(target.restore(&txn, source));
             assert!(
                 tokio::task::unconstrained(restore.as_mut())
                     .now_or_never()
@@ -435,7 +436,7 @@ async fn restoration_self_and_conflicting_sources_are_bounded() {
             );
 
             let reverse_result = source
-                .restore_from(&txn, target)
+                .restore(&txn, target)
                 .now_or_never()
                 .expect("reciprocal restore rejects without waiting");
 
@@ -473,7 +474,7 @@ async fn restoration_self_and_conflicting_sources_are_bounded() {
         target.finalize(txn.at(9).id()).await.unwrap();
         seed(target.clone(), txn.clone(), 3).await;
         seed(source.clone(), txn.clone(), 2).await;
-        target.restore_from(&txn, &source).await.unwrap();
+        target.restore(&txn, &source).await.unwrap();
         assert!(has(target.clone(), txn.clone(), 2).await);
         assert!(!has(target.clone(), txn.clone(), 3).await);
         target.rollback(txn.id()).unwrap();
@@ -481,11 +482,11 @@ async fn restoration_self_and_conflicting_sources_are_bounded() {
         assert!(!has(target.clone(), txn.clone(), 2).await);
         source.commit(txn.id()).await.unwrap();
         let later = txn.at(11);
-        target.restore_from(&later, &source).await.unwrap();
+        target.restore(&later, &source).await.unwrap();
         target.commit(later.id()).await.unwrap();
-        assert!(target.restore_from(&later, &target).await.is_err());
+        assert!(target.restore(&later, &target).await.is_err());
         target.finalize(later.id()).await.unwrap();
-        assert!(target.restore_from(&later, &target).await.is_err());
+        assert!(target.restore(&later, &target).await.is_err());
         target.sync_all().await.unwrap();
         let path = dir.read().await.path().to_owned();
         drop(target);
@@ -527,7 +528,7 @@ async fn restoration_source_failure_preserves_pending_data() {
             .await
             .unwrap() = b_tree::Node::Leaf(vec![Default::default()]);
 
-        let error = target.restore_from(&txn, &source).await.unwrap_err();
+        let error = target.restore(&txn, &source).await.unwrap_err();
         assert!(error.requires_recovery());
         assert!(
             target

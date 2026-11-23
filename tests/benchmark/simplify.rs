@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use collate::Collate;
 use futures::{TryStreamExt, stream};
+use tc_collection::Restore;
+use tc_value::{Value, ValueCollator};
 
 use super::*;
-use tc_value::{Value, ValueCollator};
 
 #[derive(Clone)]
 struct Counted<C> {
@@ -48,7 +49,12 @@ pub(super) async fn run() {
 
 async fn primary_reads() {
     for indexes in [0, 1, 8] {
-        let (_root, txn) = TestTxn::owned(storage_id(1), 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let (_root, txn) = TestTxn::owned(
+            storage_id(1),
+            RESIDENT_CACHE_BYTES,
+            MATERIALIZED_TENSOR_BYTES,
+        );
+
         let column = |name: &str| Column {
             name: name.parse().unwrap(),
             dtype: ValueType::Number(NumberType::Number),
@@ -99,8 +105,11 @@ async fn restoration() {
     for table in [false, true] {
         for rows in [256u64, 4096] {
             for depth in [0, 16] {
-                let (_root, txn) =
-                    TestTxn::owned(storage_id(1), 64 * 1024 * 1024, 64 * 1024 * 1024);
+                let (_root, txn) = TestTxn::owned(
+                    storage_id(1),
+                    RESIDENT_CACHE_BYTES,
+                    MATERIALIZED_TENSOR_BYTES,
+                );
 
                 let target = create(&txn, table).await;
                 let source = create(&txn, table).await;
@@ -129,7 +138,7 @@ async fn restoration() {
                 );
 
                 let start = Instant::now();
-                target.restore_from(&reader, &source).await.unwrap();
+                target.restore(&reader, &source).await.unwrap();
                 record(&workload, "restore", start.elapsed());
                 assert_eq!(
                     target.hash(reader.id()).await.unwrap(),
@@ -144,7 +153,12 @@ async fn restoration() {
 
 async fn tied_keys() {
     for size in [64, 256, 1024] {
-        let (_root, txn) = TestTxn::owned(storage_id(1), 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let (_root, txn) = TestTxn::owned(
+            storage_id(1),
+            RESIDENT_CACHE_BYTES,
+            MATERIALIZED_TENSOR_BYTES,
+        );
+
         let count = Arc::new(AtomicUsize::new(0));
         let native = b_tree::BTreeLock::create(
             tc_collection::btree::BTreeSchema::new(StorageConfig::default(), 1, None).unwrap(),
@@ -228,7 +242,12 @@ async fn unions() {
 
 async fn tensor_history() {
     for depth in [0, 16, 128, 512] {
-        let (_root, txn) = TestTxn::owned(storage_id(1), 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let (_root, txn) = TestTxn::owned(
+            storage_id(1),
+            RESIDENT_CACHE_BYTES,
+            MATERIALIZED_TENSOR_BYTES,
+        );
+
         let schema = TensorSchema::new(
             NumberType::Float(number_general::FloatType::F64),
             vec![1024].into(),

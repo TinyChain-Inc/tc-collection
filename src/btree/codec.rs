@@ -1,9 +1,9 @@
 use destream::{de, en};
 use number_general::Number;
 use safecast::{CastFrom, TryCastFrom};
+use tc_value::{Value, ValueType};
 
 use super::{BTree, BTreeSchema};
-use tc_value::{Value, ValueType};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BTreeColumnSchema {

@@ -3,13 +3,13 @@ use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt};
 use safecast::{CastFrom, TryCastFrom};
+use tc_ir::{IntoView, Sha256Hash, Transact, TxnId};
+use tc_value::Value;
+use tc_value::class::NativeClass;
 
 use crate::btree::{BTree, BTreeColumnSchema, BTreeSlice};
 use crate::table::{PersistentTable, Table};
 use crate::tensor::Tensor;
-use tc_ir::{IntoView, Sha256Hash, Transact, TxnId};
-use tc_value::Value;
-use tc_value::class::NativeClass;
 
 /// Schema required to strictly reopen a native persistent collection.
 #[derive(Clone, Debug)]
@@ -106,39 +106,6 @@ enum BTreeSource<Txn: crate::StorageContext> {
 }
 
 impl<Txn: crate::StorageContext> BTreeView<Txn> {
-    /// Materialize without changing the observable key order.
-    pub async fn materialize(
-        &self,
-        txn: &Txn,
-        dir: freqfs::DirLock<Txn::File>,
-    ) -> tc_error::TCResult<Self> {
-        if matches!(&self.source, BTreeSource::Slice(slice) if slice.is_reversed()) {
-            return Err(tc_error::TCError::bad_request(
-                "cannot materialize a reversed BTree view in canonical key order",
-            ));
-        }
-
-        let schema = crate::btree::BTreeSchema::try_from(self.schema())?;
-
-        let target = BTree::try_with_schema(dir, schema).await?;
-        let mut keys = self.keys(txn.id()).await?;
-        while let Some(mut key) = keys.try_next().await? {
-            target
-                .load_literal_row(if self.schema().len() == 1 {
-                    key.remove(0)
-                } else {
-                    Value::Tuple(key)
-                })
-                .await?;
-        }
-
-        target.sync().await?;
-        Ok(Self {
-            schema: self.schema.clone(),
-            source: BTreeSource::File(target),
-        })
-    }
-
     /// Pair semantic columns with a matching typed owner without native I/O.
     /// Untyped raw trees remain usable directly, but cannot back a typed view.
     /// Callers must relinquish native aliases before handing an owner to Chain.
@@ -176,18 +143,6 @@ impl<Txn: crate::StorageContext> BTreeView<Txn> {
     /// Make canonical storage durable without publishing pending versions.
     pub async fn sync_all(&self) -> tc_error::TCResult<()> {
         self.persistent()?.sync_all().await.map_err(Into::into)
-    }
-
-    pub(crate) async fn restore_from(&self, txn: &Txn, source: &Self) -> tc_error::TCResult<()> {
-        let target = self.persistent()?;
-        let original = source.persistent()?;
-        if self.schema() != source.schema() {
-            return Err(tc_error::TCError::bad_request(
-                "BTree restoration schema mismatch",
-            ));
-        }
-
-        target.restore_from(txn, original).await
     }
 
     /// Select a read-only view, including when the selected range is unbounded.
@@ -406,34 +361,6 @@ impl<Txn: crate::StorageContext> Collection<Txn> {
         }
     }
 
-    /// Materialize equivalent contents into independent unpublished native storage.
-    pub async fn materialize(
-        &self,
-        txn: &Txn,
-        dir: freqfs::DirLock<Txn::File>,
-    ) -> tc_error::TCResult<Self> {
-        match self {
-            Self::BTree(view) => view
-                .materialize(txn, dir)
-                .await
-                .map(|view| Self::BTree(Box::new(view))),
-            Self::Table(table) => table.materialize(txn, dir).await.map(Self::from),
-            Self::Tensor(tensor) => tensor.materialize(txn, dir).await.map(Self::Tensor),
-        }
-    }
-
-    /// Stage a same-kind, same-schema native replacement in the caller's transaction.
-    pub async fn restore_from(&self, txn: &Txn, source: &Self) -> tc_error::TCResult<()> {
-        match (self, source) {
-            (Self::BTree(target), Self::BTree(source)) => target.restore_from(txn, source).await,
-            (Self::Table(target), Self::Table(source)) => target.restore_from(txn, source).await,
-            (Self::Tensor(target), Self::Tensor(source)) => target.restore_from(txn, source).await,
-            _ => Err(tc_error::TCError::bad_request(
-                "unsupported collection restoration",
-            )),
-        }
-    }
-
     /// Synchronize canonical storage without publishing pending transaction versions.
     pub async fn sync(&self) -> tc_error::TCResult<()> {
         match self {
@@ -463,6 +390,94 @@ impl<Txn: crate::StorageContext> Collection<Txn> {
         match self {
             Self::Table(table) => Some(table),
             _ => None,
+        }
+    }
+}
+
+impl<Txn: crate::StorageContext> crate::Restore for BTreeView<Txn> {
+    type Txn = Txn;
+
+    async fn restore(&self, txn: &Txn, source: &Self) -> tc_error::TCResult<()> {
+        let target = self.persistent()?;
+        let original = source.persistent()?;
+        if self.schema() != source.schema() {
+            return Err(tc_error::TCError::bad_request(
+                "BTree restoration schema mismatch",
+            ));
+        }
+
+        target.restore(txn, original).await
+    }
+}
+
+impl<Txn: crate::StorageContext> crate::Restore for Collection<Txn> {
+    type Txn = Txn;
+
+    /// Stage a same-kind, same-schema native replacement in the caller's transaction.
+    async fn restore(&self, txn: &Txn, source: &Self) -> tc_error::TCResult<()> {
+        match (self, source) {
+            (Self::BTree(target), Self::BTree(source)) => target.restore(txn, source).await,
+            (Self::Table(target), Self::Table(source)) => target.restore(txn, source).await,
+            (Self::Tensor(target), Self::Tensor(source)) => target.restore(txn, source).await,
+            _ => Err(tc_error::TCError::bad_request(
+                "unsupported collection restoration",
+            )),
+        }
+    }
+}
+
+impl<Txn: crate::StorageContext> crate::CopyFrom<&BTreeView<Txn>> for BTreeView<Txn> {
+    type Txn = Txn;
+
+    async fn copy_from(
+        txn: &Txn,
+        dir: freqfs::DirLock<Txn::File>,
+        source: &BTreeView<Txn>,
+    ) -> tc_error::TCResult<Self> {
+        if matches!(&source.source, BTreeSource::Slice(slice) if slice.is_reversed()) {
+            return Err(tc_error::TCError::bad_request(
+                "cannot materialize a reversed BTree view in canonical key order",
+            ));
+        }
+
+        let schema = crate::btree::BTreeSchema::try_from(source.schema())?;
+
+        let target = BTree::try_with_schema(dir, schema).await?;
+        let mut keys = source.keys(txn.id()).await?;
+        while let Some(mut key) = keys.try_next().await? {
+            target
+                .load_literal_row(if source.schema().len() == 1 {
+                    key.remove(0)
+                } else {
+                    Value::Tuple(key)
+                })
+                .await?;
+        }
+
+        target.sync().await?;
+        Ok(Self {
+            schema: source.schema.clone(),
+            source: BTreeSource::File(target),
+        })
+    }
+}
+
+impl<Txn: crate::StorageContext> crate::CopyFrom<&Collection<Txn>> for Collection<Txn> {
+    type Txn = Txn;
+
+    async fn copy_from(
+        txn: &Txn,
+        dir: freqfs::DirLock<Txn::File>,
+        source: &Collection<Txn>,
+    ) -> tc_error::TCResult<Self> {
+        match source {
+            Self::BTree(view) => BTreeView::copy_from(txn, dir, view.as_ref())
+                .await
+                .map(|view| Self::BTree(Box::new(view))),
+            Self::Table(table) => PersistentTable::copy_from(txn, dir, table.as_ref())
+                .await
+                .map(Self::from),
+            Self::Tensor(tensor) => Tensor::copy_from(txn, dir, tensor).await.map(Self::Tensor),
         }
     }
 }

@@ -6,16 +6,16 @@ use std::sync::Arc;
 use b_table::Row;
 use futures::TryStreamExt;
 use futures::future::join_all;
+use tc_value::{Value, ValueType};
 use tokio::sync::{Barrier, mpsc, oneshot};
 use tokio::time::{Duration, timeout};
 
 use super::{
     Column, ColumnRange, Limited, PersistentTable, Range, Rows, Selection, TableSchema, TableSlice,
 };
-use crate::PersistentFile;
 use crate::btree::StorageConfig;
 use crate::test::{TestTxn, init_root, load_roots, tx};
-use tc_value::{Value, ValueType};
+use crate::{CopyFrom, PersistentFile};
 
 fn simple_schema() -> TableSchema {
     let key = vec![Column {
@@ -3018,7 +3018,7 @@ async fn materialization_delegates_view_representability_and_retains_independent
                 .unwrap();
 
             assert!(
-                view.materialize(&txn, dir.clone())
+                crate::table::PersistentTable::copy_from(&txn, dir.clone(), &view)
                     .await
                     .unwrap_err()
                     .to_string()
@@ -3034,10 +3034,10 @@ async fn materialization_delegates_view_representability_and_retains_independent
             .create_dir("accepted".into())
             .unwrap();
 
-        let copy = super::Table::from(table.clone())
-            .materialize(&txn, dir)
-            .await
-            .unwrap();
+        let copy =
+            crate::table::PersistentTable::copy_from(&txn, dir, &super::Table::from(table.clone()))
+                .await
+                .unwrap();
 
         table
             .upsert_row(&txn, vec![1u64.into()], vec!["changed".into()])
@@ -3615,9 +3615,9 @@ async fn nested_slices_intersect_and_reject_disjoint_constraints() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn selection_metadata_matches_requested_value_order() {
     use collate::Collate;
+    use tc_ir::IntoView;
 
     use crate::StorageContext;
-    use tc_ir::IntoView;
 
     Box::pin(async {
         let root = init_root("ordered-projection");

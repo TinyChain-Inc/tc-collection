@@ -1,12 +1,12 @@
 use futures::stream::BoxStream;
+use tc_error::TCResult;
+use tc_ir::IntoView;
+use tc_value::Value;
 
 use crate::Collection;
 use crate::btree::{BTreeColumnSchema, Keys};
 use crate::table::TableSchema;
 use crate::tensor::TensorView as NativeTensorView;
-use tc_error::TCResult;
-use tc_ir::IntoView;
-use tc_value::Value;
 
 /// A transaction-consistent BTree representation prepared for terminal projection.
 pub struct BTreeView {

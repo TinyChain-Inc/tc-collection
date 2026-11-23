@@ -16,14 +16,14 @@ pub use b_table::{ColumnRange, Range, Row};
 use collate::CollateRef;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
+use tc_error::{TCError, TCResult};
+use tc_ir::{Id, Map, Transact, TxnId};
+use tc_value::Value;
 
 pub use codec::DecodedTablePayload;
 pub use file::PersistentTable;
 pub use schema::{Column, TableIndexSchema, TableSchema};
 pub use stream::Rows;
-use tc_error::{TCError, TCResult};
-use tc_ir::{Id, Map, Transact, TxnId};
-use tc_value::Value;
 pub use view::{Limited, Selection, TableSlice};
 
 /// A relational database table, or a view of one.
@@ -85,59 +85,6 @@ impl<Txn: crate::StorageContext> Table<Txn> {
                 .map_ok(|row| row.into_vec()),
         )
         .await?)
-    }
-
-    /// Materialize a view whose order can be represented by canonical storage.
-    pub async fn materialize(
-        &self,
-        txn: &Txn,
-        dir: freqfs::DirLock<Txn::File>,
-    ) -> TCResult<PersistentTable<Txn>> {
-        match self {
-            Self::File(_) | Self::Local(_) => {}
-            Self::Slice(view) => view.validate_materialization()?,
-            Self::Limited(view) => view.validate_materialization()?,
-            Self::Selection(view) => view.validate_materialization()?,
-        }
-
-        let target = PersistentTable::try_new(dir, self.schema().clone()).await?;
-
-        let mut rows = self.row_stream(txn.id()).await?;
-        let collator = crate::persistence::value_order();
-        let key_len = self.schema().key().len();
-        if let Some(mut previous) = rows.try_next().await? {
-            while let Some(row) = rows.try_next().await? {
-                let previous_key = &previous[..key_len];
-                let key = &row[..key_len];
-                let tied = collator.range_collator().cmp_ref(previous_key, key).is_eq();
-                if previous_key == key || (tied && target.contains_literal_key(key).await?) {
-                    return Err(freqfs::IntegrityError::invalid_data(
-                        "ambiguous Table primary key during copying",
-                    )
-                    .into());
-                }
-
-                if collator.key_collator().cmp(&previous, &row).is_gt() {
-                    return Err(TCError::bad_request(
-                        "cannot materialize Table rows outside canonical key order",
-                    ));
-                }
-
-                let completed = std::mem::replace(&mut previous, row);
-                target.load_literal_row(completed.into_vec()).await?;
-            }
-
-            target.load_literal_row(previous.into_vec()).await?;
-        }
-
-        target.sync().await?;
-        Ok(target)
-    }
-
-    pub(crate) async fn restore_from(&self, txn: &Txn, source: &Self) -> TCResult<()> {
-        self.persistent()?
-            .restore_from(txn, source.persistent()?)
-            .await
     }
 
     pub fn is_persistent(&self) -> bool {
@@ -311,10 +258,7 @@ impl<Txn: crate::StorageContext> Table<Txn> {
         txn: &Txn,
         key: Vec<Value>,
         values: Vec<Value>,
-    ) -> TCResult<()>
-    where
-        Txn: crate::StorageContext,
-    {
+    ) -> TCResult<()> {
         match self {
             Self::File(table) => table.upsert_row(txn, key, values).await,
             Self::Local(table) => file::upsert(table, key, values)
@@ -329,10 +273,7 @@ impl<Txn: crate::StorageContext> Table<Txn> {
         txn: &Txn,
         key: Vec<Value>,
         values: Vec<Value>,
-    ) -> TCResult<()>
-    where
-        Txn: crate::StorageContext,
-    {
+    ) -> TCResult<()> {
         match self {
             Self::File(table) => table.insert_row(txn, key, values).await,
             Self::Local(table) => {
@@ -352,10 +293,7 @@ impl<Txn: crate::StorageContext> Table<Txn> {
         }
     }
 
-    pub(crate) async fn delete_row(&self, txn: &Txn, key: Vec<Value>) -> TCResult<()>
-    where
-        Txn: crate::StorageContext,
-    {
+    pub(crate) async fn delete_row(&self, txn: &Txn, key: Vec<Value>) -> TCResult<()> {
         match self {
             Self::File(table) => table.delete_row(txn, key).await,
             Self::Local(table) => file::delete_row(table, &key)
@@ -368,10 +306,7 @@ impl<Txn: crate::StorageContext> Table<Txn> {
         }
     }
 
-    pub(crate) async fn truncate(&self, txn: &Txn, range: Range<Id, Value>) -> TCResult<()>
-    where
-        Txn: crate::StorageContext,
-    {
+    pub(crate) async fn truncate(&self, txn: &Txn, range: Range<Id, Value>) -> TCResult<()> {
         match self {
             Self::File(table) => table.truncate(txn, range).await,
             Self::Local(table) => view::truncate_local(table, txn, range).await,
@@ -386,10 +321,7 @@ impl<Txn: crate::StorageContext> Table<Txn> {
         txn: &Txn,
         range: Range<Id, Value>,
         values: Map<Value>,
-    ) -> TCResult<()>
-    where
-        Txn: crate::StorageContext,
-    {
+    ) -> TCResult<()> {
         match self {
             Self::File(table) => table.update(txn, range, values).await,
             Self::Local(table) => view::update_local(table, txn, range, values).await,
@@ -424,6 +356,64 @@ impl<Txn: crate::StorageContext> Transact for Table<Txn> {
                 _ => Transact::finalize(self.persistent()?, &txn_id).await,
             }
         }
+    }
+}
+
+impl<Txn: crate::StorageContext> crate::CopyFrom<&Table<Txn>> for PersistentTable<Txn> {
+    type Txn = Txn;
+
+    async fn copy_from(
+        txn: &Txn,
+        dir: freqfs::DirLock<Txn::File>,
+        source: &Table<Txn>,
+    ) -> tc_error::TCResult<Self> {
+        match source {
+            Table::File(_) | Table::Local(_) => {}
+            Table::Slice(view) => view.validate_copy()?,
+            Table::Limited(view) => view.validate_copy()?,
+            Table::Selection(view) => view.validate_copy()?,
+        }
+
+        let target = PersistentTable::try_new(dir, source.schema().clone()).await?;
+
+        let mut rows = source.row_stream(txn.id()).await?;
+        let collator = crate::persistence::value_order();
+        let key_len = source.schema().key().len();
+        if let Some(mut previous) = rows.try_next().await? {
+            while let Some(row) = rows.try_next().await? {
+                let previous_key = &previous[..key_len];
+                let key = &row[..key_len];
+                let tied = collator.range_collator().cmp_ref(previous_key, key).is_eq();
+                if previous_key == key || (tied && target.contains_literal_key(key).await?) {
+                    return Err(freqfs::IntegrityError::invalid_data(
+                        "ambiguous Table primary key during copying",
+                    )
+                    .into());
+                }
+
+                if collator.key_collator().cmp(&previous, &row).is_gt() {
+                    return Err(TCError::bad_request(
+                        "cannot materialize Table rows outside canonical key order",
+                    ));
+                }
+
+                let completed = std::mem::replace(&mut previous, row);
+                target.load_literal_row(completed.into_vec()).await?;
+            }
+
+            target.load_literal_row(previous.into_vec()).await?;
+        }
+
+        target.sync().await?;
+        Ok(target)
+    }
+}
+
+impl<Txn: crate::StorageContext> crate::Restore for Table<Txn> {
+    type Txn = Txn;
+
+    async fn restore(&self, txn: &Txn, source: &Self) -> tc_error::TCResult<()> {
+        self.persistent()?.restore(txn, source.persistent()?).await
     }
 }
 

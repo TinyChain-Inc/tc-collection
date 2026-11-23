@@ -3,12 +3,12 @@
 use number_general::Number;
 use pathlink::{PathBuf, PathSegment};
 use safecast::CastInto;
-
-use super::{AxisRange, Data, Range, Shape as TensorShape, Tensor, TensorSchema, Typed};
-use crate::{Collection, CollectionState, StorageContext};
 use tc_error::{TCError, TCResult};
 use tc_ir::Map;
 use tc_value::{NumberType, Value, number_type_from_path, number_type_path};
+
+use super::{AxisRange, Data, Range, Shape as TensorShape, Tensor, TensorSchema, Typed};
+use crate::{Collection, CollectionState, StorageContext};
 
 // Generate concrete borrowing handlers; argument policy stays at this boundary.
 macro_rules! unary_handler {
@@ -59,13 +59,9 @@ use unary::{
 use unary::{Angle, Conj, Im, Re};
 
 struct Root<'a, Txn: StorageContext>(&'a Tensor<Txn>);
-
 struct Dtype<'a, Txn: StorageContext>(&'a Tensor<Txn>);
-
 struct Shape<'a, Txn: StorageContext>(&'a Tensor<Txn>);
-
 struct Size<'a, Txn: StorageContext>(&'a Tensor<Txn>);
-
 struct Ndim<'a, Txn: StorageContext>(&'a Tensor<Txn>);
 
 impl<S: CollectionState<Txn = Txn>, Txn: StorageContext> tc_ir::Route<S> for Tensor<Txn> {

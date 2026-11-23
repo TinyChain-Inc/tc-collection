@@ -1,11 +1,11 @@
 use futures::TryStreamExt;
+use tc_ir::Transaction;
 
 use super::{Delta, PersistentTable, Range, TableFile, TableSchema, upsert};
-use crate::StorageContext;
 use crate::btree::StorageConfig;
 use crate::table::Column;
 use crate::test::tensor::{Txn, setup};
-use tc_ir::Transaction;
+use crate::{CopyFrom, Restore, StorageContext};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn selected_delta_baseline_and_scan_setup_survive_finalized_workspace_cleanup() {
@@ -261,10 +261,13 @@ async fn before_after_deltas_preserve_indexes_ties_and_repeated_changes() {
 
     let collection = Collection::from(table.clone());
     let hash = collection.hash(writer.id()).await.unwrap();
-    let copy = Table::from(table.clone())
-        .materialize(&writer, writer.subcontext_unique().context().await.unwrap())
-        .await
-        .unwrap();
+    let copy = crate::table::PersistentTable::copy_from(
+        &writer,
+        writer.subcontext_unique().context().await.unwrap(),
+        &Table::from(table.clone()),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         Collection::from(copy).hash(writer.id()).await.unwrap(),
@@ -475,7 +478,6 @@ async fn bulk_source_error_after_rows_requires_rollback() {
 async fn equal_norm_keys_preserve_identity_and_range_selection() {
     use collate::Collate;
     use number_general::{Complex, Number};
-
     use tc_value::ValueCollator;
 
     let (_, txn) = setup().await;
@@ -953,7 +955,7 @@ async fn restoration_self_and_conflicting_sources_are_bounded() {
                 .unwrap();
 
             target
-                .restore_from(&txn, &target.clone())
+                .restore(&txn, &target.clone())
                 .now_or_never()
                 .expect("self-restore does not wait")
                 .unwrap();
@@ -963,7 +965,7 @@ async fn restoration_self_and_conflicting_sources_are_bounded() {
 
             let context = txn.context().await.unwrap();
             let context_guard = context.write().await;
-            let mut restore = Box::pin(target.restore_from(&txn, source));
+            let mut restore = Box::pin(target.restore(&txn, source));
             assert!(
                 tokio::task::unconstrained(restore.as_mut())
                     .now_or_never()
@@ -979,7 +981,7 @@ async fn restoration_self_and_conflicting_sources_are_bounded() {
             );
 
             let reverse_result = source
-                .restore_from(&txn, target)
+                .restore(&txn, target)
                 .now_or_never()
                 .expect("reciprocal restore rejects without waiting");
 
@@ -1017,7 +1019,7 @@ async fn restoration_self_and_conflicting_sources_are_bounded() {
         target.finalize(txn.at(9).id()).await.unwrap();
         seed(target.clone(), txn.clone(), 3).await;
         seed(source.clone(), txn.clone(), 2).await;
-        target.restore_from(&txn, &source).await.unwrap();
+        target.restore(&txn, &source).await.unwrap();
         assert!(has(target.clone(), txn.clone(), 2).await);
         assert!(!has(target.clone(), txn.clone(), 3).await);
         target.rollback(txn.id()).unwrap();
@@ -1025,11 +1027,11 @@ async fn restoration_self_and_conflicting_sources_are_bounded() {
         assert!(!has(target.clone(), txn.clone(), 2).await);
         source.commit(txn.id()).await.unwrap();
         let later = txn.at(11);
-        target.restore_from(&later, &source).await.unwrap();
+        target.restore(&later, &source).await.unwrap();
         target.commit(later.id()).await.unwrap();
-        assert!(target.restore_from(&later, &target).await.is_err());
+        assert!(target.restore(&later, &target).await.is_err());
         target.finalize(later.id()).await.unwrap();
-        assert!(target.restore_from(&later, &target).await.is_err());
+        assert!(target.restore(&later, &target).await.is_err());
         target.sync_all().await.unwrap();
         let path = dir.read().await.path().to_owned();
         drop(target);
@@ -1096,7 +1098,7 @@ async fn restoration_source_failure_preserves_pending_data() {
             .await
             .unwrap() = b_tree::Node::Leaf(vec![Default::default()]);
 
-        let error = target.restore_from(&txn, &source).await.unwrap_err();
+        let error = target.restore(&txn, &source).await.unwrap_err();
         assert!(error.requires_recovery());
         assert!(
             target
@@ -1210,7 +1212,10 @@ async fn copying_preserves_equal_norm_keys_and_rejects_ambiguity() {
 
         let view = Table::from(source.clone());
         let out = txn.subcontext_unique().context().await.unwrap();
-        let copy = view.materialize(&txn, out.clone()).await.unwrap();
+        let copy = crate::table::PersistentTable::copy_from(&txn, out.clone(), &view)
+            .await
+            .unwrap();
+
         assert_eq!(copy.count(txn.id()).await.unwrap(), keys.len() as u64);
         assert_eq!(copy.schema(), source.schema());
         assert_eq!(
@@ -1236,10 +1241,13 @@ async fn copying_preserves_equal_norm_keys_and_rejects_ambiguity() {
             ])
             .unwrap();
 
-        let projected = Table::from(reordered)
-            .materialize(&txn, txn.subcontext_unique().context().await.unwrap())
-            .await
-            .unwrap();
+        let projected = crate::table::PersistentTable::copy_from(
+            &txn,
+            txn.subcontext_unique().context().await.unwrap(),
+            &Table::from(reordered),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             projected
@@ -1253,10 +1261,13 @@ async fn copying_preserves_equal_norm_keys_and_rejects_ambiguity() {
 
         let reversed = source.slice(Range::default(), &[], true);
 
-        let error = Table::from(reversed)
-            .materialize(&txn, txn.subcontext_unique().context().await.unwrap())
-            .await
-            .unwrap_err();
+        let error = crate::table::PersistentTable::copy_from(
+            &txn,
+            txn.subcontext_unique().context().await.unwrap(),
+            &Table::from(reversed),
+        )
+        .await
+        .unwrap_err();
 
         assert!(!error.requires_recovery());
         assert!(error.to_string().contains("canonical key order"));
@@ -1278,7 +1289,10 @@ async fn copying_preserves_equal_norm_keys_and_rejects_ambiguity() {
 
         let held = delta.inserts.write().await;
         let cancelled = txn.subcontext_unique().context().await.unwrap();
-        let mut copying = Box::pin(view.materialize(&txn, cancelled));
+        let mut copying = Box::pin(crate::table::PersistentTable::copy_from(
+            &txn, cancelled, &view,
+        ));
+
         assert!(
             tokio::task::unconstrained(copying.as_mut())
                 .now_or_never()
@@ -1367,10 +1381,13 @@ async fn copying_preserves_equal_norm_keys_and_rejects_ambiguity() {
             };
 
             *root.write::<b_table::Node<Value>>().await.unwrap() = b_tree::Node::Leaf(rows.clone());
-            let error = Table::from(source.clone())
-                .materialize(&txn, txn.subcontext_unique().context().await.unwrap())
-                .await
-                .unwrap_err();
+            let error = crate::table::PersistentTable::copy_from(
+                &txn,
+                txn.subcontext_unique().context().await.unwrap(),
+                &Table::from(source.clone()),
+            )
+            .await
+            .unwrap_err();
 
             assert!(error.requires_recovery());
             if duplicate {

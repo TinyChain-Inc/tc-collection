@@ -4,13 +4,13 @@ use fensor::TensorSource;
 use futures::TryStreamExt;
 use number_general::{FloatType, Number, UIntType};
 use safecast::CastInto;
-pub(super) use support::{Txn, create, setup};
-use support::{id, values};
+use tc_ir::{IntoView, Transact, Transaction};
 
 use super::*;
 use crate::test::tensor as support;
-use crate::{Collection, PersistentFile};
-use tc_ir::{IntoView, Transact, Transaction};
+use crate::{Collection, CopyFrom, PersistentFile, Restore};
+pub(super) use support::{Txn, create, setup};
+use support::{id, values};
 
 macro_rules! test {
     ($name:ident, $body:expr) => {
@@ -29,15 +29,18 @@ test!(decisions_ordered_visibility_and_cutoff, async {
         tensor.read_value(id(9), &[0]).await.unwrap(),
         Number::from(0.0)
     );
+
     assert_eq!(
         tensor.read_value(id(10), &[0]).await.unwrap(),
         Number::from(7.0)
     );
+
     assert!(
         tokio::time::timeout(Duration::from_millis(20), tensor.read_value(id(11), &[0]))
             .await
             .is_err()
     );
+
     tensor.commit(id(10)).await.unwrap();
     tensor.commit(id(10)).await.unwrap();
     assert_eq!(
@@ -48,6 +51,7 @@ test!(decisions_ordered_visibility_and_cutoff, async {
             .message(),
         txn_lock::Error::Committed.to_string()
     );
+
     assert_eq!(
         tokio::time::timeout(Duration::from_millis(200), tensor.read_value(id(11), &[0]))
             .await
@@ -60,29 +64,35 @@ test!(decisions_ordered_visibility_and_cutoff, async {
         tensor.read_value(id(11), &[0]).await.unwrap(),
         Number::from(7.0)
     );
+
     assert_eq!(
         tensor.read_value(id(9), &[0]).await.unwrap(),
         Number::from(0.0)
     );
+
     tensor
         .write_value(&txn.at(12), &[0], 8.0.into())
         .await
         .unwrap();
+
     tensor.rollback(&id(12)).await.unwrap();
     tensor.rollback(&id(12)).await.unwrap();
     assert_eq!(
         tensor.read_value(id(13), &[0]).await.unwrap(),
         Number::from(7.0)
     );
+
     tensor
         .write_value(&txn.at(14), &[1], 3.0.into())
         .await
         .unwrap();
+
     tensor.commit(id(14)).await.unwrap();
     assert_eq!(
         tensor.read_value(id(13), &[1]).await.unwrap(),
         Number::from(0.0)
     );
+
     tensor.finalize(&id(10)).await.unwrap();
     tensor.finalize(&id(10)).await.unwrap();
     assert!(tensor.commit(id(10)).await.is_err());
@@ -95,6 +105,7 @@ test!(decisions_ordered_visibility_and_cutoff, async {
             .message(),
         txn_lock::Error::Outdated.to_string()
     );
+
     assert_eq!(
         tokio::time::timeout(Duration::from_millis(200), tensor.read_value(id(15), &[0]))
             .await
@@ -107,6 +118,7 @@ test!(decisions_ordered_visibility_and_cutoff, async {
         values(&tensor, id(15)).await,
         [7.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     );
+
     tensor.finalize(&id(14)).await.unwrap();
 });
 
@@ -122,10 +134,12 @@ test!(
                 .await
                 .is_err()
         );
+
         tensor
             .write_value(&txn.at(11), &[1, 3], 3.0.into())
             .await
             .unwrap();
+
         let transposed = tensor.clone().transpose(None).unwrap();
         assert!(
             transposed
@@ -133,6 +147,7 @@ test!(
                 .await
                 .is_err()
         );
+
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(20),
@@ -141,11 +156,13 @@ test!(
             .await
             .is_err()
         );
+
         tensor.finalize(&id(11)).await.unwrap(); // cutoff discards both pending deltas
         assert_eq!(
             tensor.read_value(id(13), &[0, 0]).await.unwrap(),
             Number::from(0.0)
         );
+
         tensor
             .write_value(&txn.at(14), &[0, 0], 5.0.into())
             .await
@@ -158,6 +175,7 @@ test!(self_assignment_stages_before_publishing, async {
     let tensor = Tensor::dense_f64(&txn, vec![2, 2], vec![1.0, 2.0, 3.0, 4.0])
         .await
         .unwrap();
+
     let transposed = tensor.clone().transpose(None).unwrap();
     tensor.write_tensor(&txn, transposed).await.unwrap();
     assert_eq!(values(&tensor, txn.id()).await, [1.0, 3.0, 2.0, 4.0]);
@@ -168,6 +186,7 @@ test!(self_assignment_stages_before_publishing, async {
         .clone()
         .slice(vec![AxisRange::At(1), AxisRange::In(0, 2, 1)].into())
         .unwrap();
+
     tensor
         .write_tensor_range(
             &txn.at(11),
@@ -176,6 +195,7 @@ test!(self_assignment_stages_before_publishing, async {
         )
         .await
         .unwrap();
+
     assert_eq!(values(&tensor, id(11)).await, [3.0, 4.0, 3.0, 4.0]);
 });
 
@@ -211,6 +231,7 @@ test!(transformed_views_cannot_regain_mutation_authority, async {
                 .unwrap(),
             tensor.clone().broadcast(vec![2, 2].into()).unwrap(),
         ];
+
         for view in views {
             let view = view.clone();
             assert!(!view.is_persistent());
@@ -222,13 +243,15 @@ test!(transformed_views_cannot_regain_mutation_authority, async {
                     .await
                     .is_err()
             );
+
             assert!(view.write_tensor(&txn, tensor.clone()).await.is_err());
             assert!(
                 view.write_tensor_range(&txn, full.clone(), tensor.clone())
                     .await
                     .is_err()
             );
-            assert!(view.restore_from(&txn, &tensor).await.is_err());
+
+            assert!(view.restore(&txn, &tensor).await.is_err());
             assert!(view.commit(txn.id()).await.is_err());
             assert!(view.rollback(&txn.id()).await.is_err());
             assert!(view.finalize(&txn.id()).await.is_err());
@@ -249,6 +272,7 @@ test!(transformed_views_cannot_regain_mutation_authority, async {
                     .to_string()
                     .contains("Tensor geometry is read-only")
             );
+
             assert!(
                 tensor
                     .write_tensor_range(&txn, selection, tensor.clone())
@@ -257,14 +281,17 @@ test!(transformed_views_cannot_regain_mutation_authority, async {
                     .to_string()
                     .contains("Tensor assignment requires writable geometry and matching shapes")
             );
+
             assert_eq!(values(&tensor, txn.id()).await, [0.0, 3.0, 0.0, 0.0]);
         }
-        let copied = tensor
-            .clone()
-            .into_read_only()
-            .materialize(&txn, txn.subcontext_unique().context().await.unwrap())
-            .await
-            .unwrap();
+        let copied = crate::tensor::Tensor::copy_from(
+            &txn,
+            txn.subcontext_unique().context().await.unwrap(),
+            &tensor.clone().into_read_only(),
+        )
+        .await
+        .unwrap();
+
         assert!(copied.is_persistent());
         copied.fill(&txn, 5.0.into()).await.unwrap();
         copied.commit(txn.id()).await.unwrap();
@@ -288,6 +315,7 @@ test!(
             .write_value(&txn.at(12), &[1], 9.0.into())
             .await
             .unwrap();
+
         tensor.commit(id(12)).await.unwrap();
 
         for value in [0.0_f64, -3., 0., 0.] {
@@ -309,6 +337,7 @@ test!(expressions_and_streams_retain_and_release_leases, async {
     let tensor = Tensor::dense_f64(&txn, vec![4], vec![1.0, 2.0, 3.0, 4.0])
         .await
         .unwrap();
+
     let expr = tensor.add(txn.id(), &tensor).await.unwrap();
     assert!(tensor.write_value(&txn, &[0], 5.0.into()).await.is_err());
     assert!(expr.write_value(&txn, &[0], 5.0.into()).await.is_err());
@@ -331,11 +360,13 @@ test!(expressions_and_streams_retain_and_release_leases, async {
                 .clone()
                 .slice(vec![AxisRange::In(2, 4, 1)].into())
                 .unwrap();
+
             let (first, second) = if broad_first {
                 (&tensor, &narrow)
             } else {
                 (&narrow, &tensor)
             };
+
             let first = first.elements(txn.id()).await.unwrap();
             let second = second.elements(txn.id()).await.unwrap();
             drop(second);
@@ -343,6 +374,7 @@ test!(expressions_and_streams_retain_and_release_leases, async {
                 tensor.write_value(&txn, &[2], 5.0.into()).await.is_err(),
                 "retained overlap must exclude a point write (sparse={sparse}, broad_first={broad_first})"
             );
+
             assert!(tensor.fill(&txn, 9.0.into()).await.is_err());
             if !broad_first {
                 tensor.write_value(&txn, &[6], 7.0.into()).await.unwrap();
@@ -353,6 +385,7 @@ test!(expressions_and_streams_retain_and_release_leases, async {
                 tensor.read_value(txn.id(), &[2]).await.unwrap(),
                 Number::from(5.0)
             );
+
             tensor.fill(&txn, 9.0.into()).await.unwrap();
             assert_eq!(values(&tensor, txn.id()).await, [9.0; 8]);
         }
@@ -460,6 +493,7 @@ test!(
             .write_value(&txn.at(9), &[0], 1.0.into())
             .await
             .unwrap();
+
         assert!(left.add(id(10), &right).await.is_err());
         left.write_value(&txn, &[0], 2.0.into()).await.unwrap();
     }
@@ -475,28 +509,34 @@ test!(sparse_zero_versions_suppress_older_occupancy, async {
         .write_value(&txn.at(12), &[0, 0], 0.0.into())
         .await
         .unwrap();
+
     tensor.commit(id(12)).await.unwrap();
     assert_eq!(
         values(&tensor, id(11)).await,
         [4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0]
     );
+
     assert_eq!(
         values(&tensor, id(13)).await,
         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0]
     );
+
     let Data::F64(typed) = &tensor.data else {
         unreachable!()
     };
+
     let owner = typed.owner().unwrap();
     let snapshot = owner
         .try_snapshot(id(13), 0..owner.geometry().block_count())
         .unwrap();
+
     let keys: Vec<_> = snapshot
         .occupied_blocks(0..owner.geometry().block_count())
         .take(2)
         .try_collect()
         .await
         .unwrap();
+
     assert_eq!(keys.len(), 1);
     drop(snapshot);
     tensor.finalize(&id(12)).await.unwrap();
@@ -504,11 +544,13 @@ test!(sparse_zero_versions_suppress_older_occupancy, async {
         .write_value(&txn.at(14), &[1, 3], 0.0.into())
         .await
         .unwrap();
+
     tensor.commit(id(14)).await.unwrap();
     tensor.finalize(&id(14)).await.unwrap();
     let snapshot = owner
         .try_snapshot(id(15), 0..owner.geometry().block_count())
         .unwrap();
+
     assert!(
         snapshot
             .occupied_blocks(0..owner.geometry().block_count())
@@ -532,19 +574,23 @@ test!(
             .write_value(&txn.at(11), &[3], 9.0.into())
             .await
             .unwrap();
+
         tensor.commit(id(11)).await.unwrap();
         tensor.sync_all().await.unwrap();
         let path = dir.read().await.path().to_owned();
         let cache =
             freqfs::Cache::<PersistentFile>::new(128 * 1024, None, 0, Duration::from_secs(3));
+
         let reopened = Tensor::<Txn>::load(cache.load(path).unwrap(), schema)
             .await
             .unwrap();
+
         assert_eq!(values(&reopened, id(10)).await, [3.0, 0.0, 0.0, 0.0]);
         reopened
             .write_value(&txn.at(11), &[3], 9.0.into())
             .await
             .unwrap();
+
         reopened.commit(id(11)).await.unwrap();
         assert_eq!(values(&reopened, id(12)).await, [3.0, 0.0, 0.0, 9.0]);
     }
@@ -555,30 +601,38 @@ test!(copy_restore_and_hash_ignore_physical_layout, async {
     let (left, _) = create(&txn, vec![2, 3].into(), true, 2).await;
     let (right, _) = create(&txn, vec![2, 3].into(), true, 4).await;
     left.write_value(&txn, &[1, 2], 7.0.into()).await.unwrap();
-    right.restore_from(&txn, &left).await.unwrap();
+    right.restore(&txn, &left).await.unwrap();
     let left_collection = Collection::Tensor(left.clone());
     let right_collection = Collection::Tensor(right.clone());
     assert_eq!(
         left_collection.hash(txn.id()).await.unwrap(),
         right_collection.hash(txn.id()).await.unwrap()
     );
-    let copy = left
-        .materialize(&txn, txn.subcontext_unique().context().await.unwrap())
-        .await
-        .unwrap();
+
+    let copy = crate::tensor::Tensor::copy_from(
+        &txn,
+        txn.subcontext_unique().context().await.unwrap(),
+        &left,
+    )
+    .await
+    .unwrap();
+
     let full_copy = left
         .copy_values(&txn, txn.subcontext_unique().context().await.unwrap())
         .await
         .unwrap();
+
     left.fill(&txn, 0.0.into()).await.unwrap();
     assert_eq!(
         values(&copy, txn.id()).await,
         [0.0, 0.0, 0.0, 0.0, 0.0, 7.0]
     );
+
     assert_eq!(
         values(&full_copy, txn.id()).await,
         values(&copy, txn.id()).await
     );
+
     right.rollback(&txn.id()).await.unwrap();
     assert_eq!(values(&right, id(11)).await, [0.0; 6]);
 });
@@ -598,9 +652,11 @@ test!(
         )
         .await
         .unwrap();
+
         let tensor = Tensor::<Txn> {
             data: Data::F64(Typed::stored(native)),
         };
+
         let cases = [
             (tensor.clone(), layout),
             (tensor.round(txn.id()).await.unwrap(), layout),
@@ -619,15 +675,20 @@ test!(
         ];
 
         for (source, expected_layout) in cases {
-            let copy = source
-                .materialize(&txn, txn.subcontext_unique().context().await.unwrap())
-                .await
-                .unwrap();
+            let copy = crate::tensor::Tensor::copy_from(
+                &txn,
+                txn.subcontext_unique().context().await.unwrap(),
+                &source,
+            )
+            .await
+            .unwrap();
+
             assert_eq!(copy.layout(), expected_layout);
             assert_eq!(
                 values(&copy, txn.id()).await,
                 values(&source, txn.id()).await
             );
+
             let dir = txn.subcontext_unique().context().await.unwrap();
             let full_copy = source.copy_values(&txn, dir.clone()).await.unwrap();
             assert_eq!(full_copy.layout(), expected_layout);
@@ -635,6 +696,7 @@ test!(
                 values(&full_copy, txn.id()).await,
                 values(&source, txn.id()).await
             );
+
             let schema = full_copy.schema().unwrap();
             drop(full_copy);
             let reopened = Tensor::<Txn>::load(dir, schema).await.unwrap();
@@ -649,15 +711,21 @@ test!(
             .write_value(&txn, &[1, 4096], 7.0.into())
             .await
             .unwrap();
+
         let view = source
             .round(txn.id())
             .await
             .unwrap()
             .transpose(None)
             .unwrap();
-        let unsupported = view
-            .materialize(&txn, txn.subcontext_unique().context().await.unwrap())
-            .await;
+
+        let unsupported = crate::tensor::Tensor::copy_from(
+            &txn,
+            txn.subcontext_unique().context().await.unwrap(),
+            &view,
+        )
+        .await;
+
         let error = unsupported.err().unwrap();
         assert_eq!(error.code(), tc_error::ErrorKind::BadRequest);
         assert!(error.to_string().contains("copy"));
@@ -665,15 +733,18 @@ test!(
             .copy_values(&txn, txn.subcontext_unique().context().await.unwrap())
             .await
             .unwrap();
+
         assert_eq!(
             values(&full_copy, txn.id()).await,
             values(&view, txn.id()).await
         );
+
         drop(view);
         source
             .write_value(&txn, &[1, 4096], 3.0.into())
             .await
             .unwrap();
+
         assert_eq!(
             full_copy.read_value(txn.id(), &[4096, 1]).await.unwrap(),
             7.0.into()
@@ -688,10 +759,12 @@ test!(dense_and_sparse_codecs_preserve_semantic_schema, async {
     for axis in [None, Some(0), Some(1)] {
         let schema =
             TensorSchema::new(NumberType::Float(FloatType::F64), vec![2, 3].into(), axis).unwrap();
+
         let wire = Value::from(schema.clone());
         let Value::Tuple(fields) = &wire else {
             panic!("schema must be a tuple")
         };
+
         assert_eq!(fields.len(), if axis.is_some() { 3 } else { 2 });
         if let Some(axis) = axis {
             assert_eq!(fields[2], Value::from(axis as u64));
@@ -704,6 +777,7 @@ test!(dense_and_sparse_codecs_preserve_semantic_schema, async {
         )
         .await
         .unwrap();
+
         tensor.write_value(&txn, &[1, 2], 7.0.into()).await.unwrap();
         for binary in [false, true] {
             let view = tensor.clone().into_view(txn.clone()).await.unwrap();
@@ -715,26 +789,34 @@ test!(dense_and_sparse_codecs_preserve_semantic_schema, async {
                 let encoded = destream_json::encode(view)
                     .unwrap()
                     .map_err(std::io::Error::other);
+
                 destream_json::try_decode(txn.clone(), encoded)
                     .await
                     .unwrap()
             };
+
             assert_eq!(decoded.schema().unwrap(), schema);
             let copied_dir = txn.subcontext_unique().context().await.unwrap();
-            let copied = decoded.materialize(&txn, copied_dir.clone()).await.unwrap();
+            let copied = crate::tensor::Tensor::copy_from(&txn, copied_dir.clone(), &decoded)
+                .await
+                .unwrap();
+
             assert_eq!(
                 values(&copied, txn.id()).await,
                 values(&decoded, txn.id()).await
             );
+
             copied.sync_all().await.unwrap();
             drop(copied);
             let reopened = Tensor::<Txn>::load(copied_dir, schema.clone())
                 .await
                 .unwrap();
+
             assert_eq!(
                 values(&reopened, txn.id()).await,
                 values(&decoded, txn.id()).await
             );
+
             assert_eq!(
                 values(&decoded, txn.id()).await,
                 [0.0, 0.0, 0.0, 0.0, 0.0, 7.0]
@@ -756,6 +838,7 @@ test!(finalize_and_sync_share_no_cross_domain_guards, async {
     })
     .await
     .unwrap();
+
     assert_eq!(values(&tensor, id(11)).await, [3.0; 8]);
 });
 
@@ -769,77 +852,19 @@ test!(
             .write_value(&txn, &[999_999_999_999], 7.0.into())
             .await
             .unwrap();
+
         let sum = tokio::time::timeout(Duration::from_secs(5), tensor.sum(txn.id(), None, false))
             .await
             .unwrap()
             .unwrap();
+
         let TensorReduceResult::Scalar(sum) = sum else {
             panic!("scalar sum")
         };
+
         assert_eq!(sum, Number::from(10.0));
     }
 );
-
-test!(failed_staged_assignment_preserves_pending_state, async {
-    let (_, txn) = setup().await;
-    let limit = fensor::MAX_BATCH_ELEMENTS;
-    let size = limit + 3;
-    let (tensor, _) = create(&txn, vec![size as u64].into(), false, 256).await;
-    tensor.write_value(&txn, &[0], 7.0.into()).await.unwrap();
-    let Data::F64(value) = &tensor.data else {
-        unreachable!()
-    };
-    let mut expected = vec![0.; size];
-    expected[0] = 7.;
-
-    for (name, count, source_error, message) in [
-        ("early source failure", 1, true, "supplied stream failed"),
-        (
-            "source failure after batch",
-            limit,
-            true,
-            "supplied stream failed",
-        ),
-        (
-            "too few",
-            size - 1,
-            false,
-            "too few Tensor assignment values",
-        ),
-        (
-            "too many",
-            size + 1,
-            false,
-            "too many Tensor assignment values",
-        ),
-    ] {
-        let input = (0..count)
-            .map(|_| Ok(1.0))
-            .chain(source_error.then(|| Err(TCError::bad_request("supplied stream failed"))));
-        let error = Typed::write_elements(
-            &fensor::TensorView::new(value.owner().unwrap().clone()),
-            &txn,
-            futures::stream::iter(input),
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains(message), "{name}: {error}");
-        assert_eq!(values(&tensor, txn.id()).await, expected, "{name}");
-    }
-    tensor.commit(txn.id()).await.unwrap();
-    assert_eq!(values(&tensor, id(11)).await, expected);
-
-    let next = txn.at(12);
-    Typed::write_elements(
-        &fensor::TensorView::new(value.owner().unwrap().clone()),
-        &next,
-        futures::stream::iter((0..size).map(|_| Ok(2.0))),
-    )
-    .await
-    .unwrap();
-    tensor.commit(next.id()).await.unwrap();
-    assert_eq!(values(&tensor, id(13)).await, vec![2.; size]);
-});
 
 test!(
     failed_materialization_retains_delta_and_reports_error,
@@ -860,6 +885,7 @@ test!(
             let Data::F64(value) = &tensor.data else {
                 unreachable!()
             };
+
             let bad_block = value
                 .owner()
                 .unwrap()
@@ -867,6 +893,7 @@ test!(
                 .block_position(&[2])
                 .unwrap()
                 .0;
+
             if sparse {
                 let values = dir.read().await.get_dir("values").unwrap().clone();
                 let primary = values.read().await.get_dir("primary").unwrap().clone();
@@ -876,14 +903,17 @@ test!(
                     .get_file("00000000-0000-0000-0000-000000000000")
                     .unwrap()
                     .clone();
+
                 let mut node = root.write::<fensor::SparseNode<f64>>().await.unwrap();
                 let b_tree::Node::Leaf(rows) = &mut *node else {
                     panic!("two canonical rows fit in one leaf")
                 };
+
                 let row = rows
                     .iter_mut()
                     .find(|row| row[0] == fensor::SparseCell::Key(bad_block))
                     .unwrap();
+
                 row[1] = fensor::SparseCell::Key(99);
             } else {
                 let blocks = dir.read().await.get_dir("blocks").cloned().unwrap();
@@ -893,20 +923,24 @@ test!(
                 tensor.finalize(&next.id()).await.unwrap_err().code(),
                 tc_error::ErrorKind::Internal
             );
+
             let Data::F64(value) = &tensor.data else {
                 unreachable!()
             };
+
             let native = {
                 let state = value.owner().unwrap().core.state.read().unwrap();
                 assert_eq!(state.finalized, Some(txn.id()));
                 assert!(state.committed.contains_key(&next.id()));
                 state.persistent.clone()
             };
+
             assert_eq!(
                 native.read_logical_block(0).await.unwrap()[0],
                 3.0,
                 "first block was materialized"
             );
+
             // Failed canonical application requires caller-owned disposal, not retry.
             drop(retained);
             drop(native);
@@ -969,6 +1003,7 @@ test!(all_real_dtypes_evaluate_stream_and_roundtrip, async {
         NumberType::Float(FloatType::F32),
         NumberType::Float(FloatType::F64),
     ];
+
     for dtype in dtypes {
         for sparse in [false, true] {
             let schema = TensorSchema::new(dtype, vec![2, 2].into(), sparse.then_some(1)).unwrap();
@@ -976,6 +1011,7 @@ test!(all_real_dtypes_evaluate_stream_and_roundtrip, async {
                 Tensor::<Txn>::create(txn.subcontext_unique().context().await.unwrap(), schema, 2)
                     .await
                     .unwrap();
+
             tensor.write_value(&txn, &[0, 0], 2u8.into()).await.unwrap();
             tensor.write_value(&txn, &[1, 1], 3u8.into()).await.unwrap();
             let doubled = tensor.add(txn.id(), &tensor).await.unwrap();
@@ -984,9 +1020,11 @@ test!(all_real_dtypes_evaluate_stream_and_roundtrip, async {
             let encoded = destream_json::encode(tensor.into_view(txn.clone()).await.unwrap())
                 .unwrap()
                 .map_err(std::io::Error::other);
+
             let decoded: Tensor<Txn> = destream_json::try_decode(txn.clone(), encoded)
                 .await
                 .unwrap();
+
             assert_eq!(decoded.number_type(), dtype);
             assert_eq!(values(&decoded, txn.id()).await, [2.0, 0.0, 0.0, 3.0]);
         }
@@ -1004,12 +1042,15 @@ test!(all_real_dtypes_evaluate_stream_and_roundtrip, async {
                 .await
                 .unwrap()
         };
+
         let encoded = destream_json::encode(tensor.into_view(txn.clone()).await.unwrap())
             .unwrap()
             .map_err(std::io::Error::other);
+
         let decoded: Tensor<Txn> = destream_json::try_decode(txn.clone(), encoded)
             .await
             .unwrap();
+
         assert_eq!(decoded.number_type(), dtype);
         assert_eq!(decoded.shape(), &[2, 2]);
         assert_eq!(values(&decoded, txn.id()).await, expected);
@@ -1023,6 +1064,7 @@ test!(complex_fourier_and_codec_use_native_semantics, async {
     let tensor = Tensor::dense_c64(&txn, vec![2, 2], vec![Complex64::new(1.0, 2.0); 4])
         .await
         .unwrap();
+
     let roundtrip = tensor
         .fft2(txn.id())
         .await
@@ -1030,20 +1072,24 @@ test!(complex_fourier_and_codec_use_native_semantics, async {
         .ifft2(txn.id())
         .await
         .unwrap();
+
     let value = roundtrip.read_value(txn.id(), &[0, 0]).await.unwrap();
     let value: Complex64 = value.cast_into();
     assert!((value - Complex64::new(4.0, 8.0)).norm() < 1e-12);
     let encoded = destream_json::encode(tensor.into_view(txn.clone()).await.unwrap())
         .unwrap()
         .map_err(std::io::Error::other);
+
     let decoded: Tensor<Txn> = destream_json::try_decode(txn.clone(), encoded)
         .await
         .unwrap();
+
     let value: Complex64 = decoded
         .read_value(txn.id(), &[1, 1])
         .await
         .unwrap()
         .cast_into();
+
     assert_eq!(value, Complex64::new(1.0, 2.0));
 });
 
@@ -1052,6 +1098,7 @@ test!(computed_self_assignment_consumes_its_input_leases, async {
     let tensor = Tensor::dense_f64(&txn, vec![2], vec![1.0, 2.0])
         .await
         .unwrap();
+
     tensor.write_value(&txn, &[0], 3.0.into()).await.unwrap();
     let expression = tensor.add_scalar(txn.id(), 1.0.into()).await.unwrap();
     tensor.write_tensor(&txn, expression).await.unwrap();
@@ -1095,31 +1142,37 @@ test!(
                     .await
                     .is_err()
             );
+
             let (l, r) = tokio::join!(
                 tensor.fill_range(&txn, left.clone(), 3.0.into()),
                 tensor.fill_range(&txn, right.clone(), 7.0.into()),
             );
+
             l.unwrap();
             r.unwrap();
             assert_eq!(
                 values(&tensor, txn.id()).await,
                 [3.0, 3.0, 0.0, 0.0, 0.0, 0.0, 7.0, 7.0]
             );
+
             tensor.rollback(&txn.id()).await.unwrap();
             tensor
                 .fill_range(&txn.at(11), left.clone(), 2.0.into())
                 .await
                 .unwrap();
+
             tensor
                 .fill_range(&txn.at(12), right, 8.0.into())
                 .await
                 .unwrap();
+
             assert!(
                 tensor
                     .fill_range(&txn.at(12), left, 4.0.into())
                     .await
                     .is_err()
             );
+
             tensor.commit(id(11)).await.unwrap();
             tensor.commit(id(12)).await.unwrap();
             assert_eq!(
@@ -1137,6 +1190,7 @@ test!(native_sparse_statistics_include_implicit_zeros, async {
         let Data::F64(value) = &tensor.data else {
             unreachable!()
         };
+
         fensor::TensorWrite::write_value(
             &value.owner().unwrap().canonical().unwrap(),
             &[0, 0],
@@ -1149,6 +1203,7 @@ test!(native_sparse_statistics_include_implicit_zeros, async {
         let Data::F64(value) = &tensor.data else {
             unreachable!()
         };
+
         fensor::TensorWrite::write_value(
             &value.owner().unwrap().canonical().unwrap(),
             &[0, 2],
@@ -1176,6 +1231,7 @@ test!(native_sparse_statistics_include_implicit_zeros, async {
         let TensorReduceResult::Scalar(value) = result else {
             panic!("scalar reduction")
         };
+
         let actual: f64 = safecast::CastInto::cast_into(value);
         assert!((actual - expected).abs() < 1e-12);
     }
@@ -1184,11 +1240,13 @@ test!(native_sparse_statistics_include_implicit_zeros, async {
     else {
         panic!("axis reduction")
     };
+
     let output = values(&means, txn.id()).await;
     assert_eq!(output, [0.0, -2.0]);
     let TensorReduceResult::Scalar(mean) = tensor.mean(txn.id(), None, false).await.unwrap() else {
         panic!("mean");
     };
+
     assert_eq!(mean, 1.0.into());
 });
 
@@ -1262,9 +1320,11 @@ test!(streamed_codec_rejects_invalid_payloads, async {
     let dense = Value::from(
         TensorSchema::new(NumberType::Float(FloatType::F64), vec![2].into(), None).unwrap(),
     );
+
     let sparse = Value::from(
         TensorSchema::new(NumberType::Float(FloatType::F64), vec![2].into(), Some(0)).unwrap(),
     );
+
     let dtype = tc_value::number_type_path(&NumberType::Float(FloatType::F64)).to_string();
     for axis in [
         Value::Number((-1i64).into()),
@@ -1278,15 +1338,18 @@ test!(streamed_codec_rejects_invalid_payloads, async {
             Value::Tuple(vec![Value::from(2u64), Value::from(3u64)]),
             axis,
         ]);
+
         assert!(TensorSchema::try_from(schema.clone()).is_err());
         let json = destream_json::encode(&schema)
             .unwrap()
             .map_err(std::io::Error::other);
+
         assert!(
             destream_json::try_decode::<_, _, TensorSchema>((), json)
                 .await
                 .is_err()
         );
+
         assert!(
             tbon::de::try_decode::<_, _, TensorSchema>((), tbon::en::encode(&schema).unwrap())
                 .await
@@ -1302,9 +1365,11 @@ test!(streamed_codec_rejects_invalid_payloads, async {
                 .map_err(std::io::Error::other),
         )
         .await;
+
         let tbon =
             tbon::de::try_decode::<_, _, TensorSchema>((), tbon::en::encode(&schema).unwrap())
                 .await;
+
         assert_eq!(json.is_ok(), rank == MAX_TENSOR_METADATA_RANK);
         assert_eq!(tbon.is_ok(), rank == MAX_TENSOR_METADATA_RANK);
     }
@@ -1342,6 +1407,7 @@ test!(streamed_codec_rejects_invalid_payloads, async {
         let error = destream_json::try_decode::<_, _, TensorSchema>((), encoded)
             .await
             .unwrap_err();
+
         assert!(error.to_string().contains(expected), "{name}: {error}");
     }
     for (name, entry, expected) in [
@@ -1374,6 +1440,7 @@ test!(streamed_codec_rejects_invalid_payloads, async {
             Ok(_) => panic!("{name}: accepted invalid sparse entry"),
             Err(error) => error,
         };
+
         assert!(error.to_string().contains(expected), "{name}: {error}");
     }
     for input in [
@@ -1396,6 +1463,7 @@ test!(streamed_codec_rejects_invalid_payloads, async {
             Value::Number(value.into()),
         ])
     };
+
     for payload in [
         vec![dense.clone(), Value::Tuple(vec![Value::Number(1u8.into())])],
         vec![
@@ -1426,6 +1494,7 @@ test!(streamed_codec_rejects_invalid_payloads, async {
         let encoded = destream_json::encode(Value::Tuple(payload))
             .unwrap()
             .map_err(std::io::Error::other);
+
         assert!(
             destream_json::try_decode::<_, _, Tensor<Txn>>(txn.clone(), encoded)
                 .await
@@ -1453,18 +1522,21 @@ test!(dense_and_sparse_stream_errors_drop_source_leases, async {
         } else {
             tensor.elements(next.id()).await.unwrap()
         };
+
         assert!(
             tensor
                 .write_value(&next, &[0, 0], 2.0.into())
                 .await
                 .is_err()
         );
+
         assert!(stream.try_next().await.unwrap().is_some());
         drop(stream);
         tensor
             .write_value(&next, &[0, 0], 2.0.into())
             .await
             .unwrap();
+
         tensor.rollback(&next.id()).await.unwrap();
         {
             if sparse {
@@ -1477,6 +1549,7 @@ test!(dense_and_sparse_stream_errors_drop_source_leases, async {
                         .map(|(name, _)| directory.get_file(name).unwrap().clone())
                         .collect()
                 };
+
                 let mut corrupted = 0;
                 // Values belong to leaves; compact routing separators contain no
                 // payload copy which could hide this corruption.
@@ -1485,6 +1558,7 @@ test!(dense_and_sparse_stream_errors_drop_source_leases, async {
                     let b_tree::Node::Leaf(rows) = &mut *node else {
                         continue;
                     };
+
                     for row in rows {
                         if row[0] == fensor::SparseCell::Key(0) {
                             row[1] = fensor::SparseCell::Key(99);
@@ -1507,6 +1581,7 @@ test!(dense_and_sparse_stream_errors_drop_source_leases, async {
             } else {
                 tensor.elements(txn.at(12).id()).await.unwrap()
             };
+
             assert!(stream.try_next().await.is_err());
             assert!(stream.try_next().await.unwrap().is_none());
             // Reads no longer reserve the block after failure, even while the
@@ -1516,11 +1591,13 @@ test!(dense_and_sparse_stream_errors_drop_source_leases, async {
                 .write_value(&txn.at(12), &[0, 0], 3.0.into())
                 .await
                 .unwrap_err();
+
             let expected = if sparse {
                 "invalid sparse payload"
             } else {
                 "missing"
             };
+
             assert!(error.to_string().contains(expected), "{error}");
         }
     }
@@ -1536,6 +1613,7 @@ test!(tensor_facade_read_write_value_roundtrip, async {
         .read_value(txn.id(), &[1, 0])
         .await
         .expect("read value");
+
     let value: f64 = value.cast_into();
     assert_eq!(value, 3.0);
 
@@ -1558,6 +1636,7 @@ test!(tensor_facade_cast_roundtrip, async {
         .cast(txn.id(), NumberType::Float(FloatType::F64))
         .await
         .expect("cast f64");
+
     assert_eq!(as_f64.number_type(), NumberType::Float(FloatType::F64));
     assert_eq!(values(&as_f64, txn.id()).await, vec![1.0, 2.0, 3.0, 4.0]);
 
@@ -1565,6 +1644,7 @@ test!(tensor_facade_cast_roundtrip, async {
         .cast(txn.id(), NumberType::UInt(UIntType::U64))
         .await
         .expect("cast u64");
+
     assert_eq!(as_u64.number_type(), NumberType::UInt(UIntType::U64));
     assert_eq!(values(&as_u64, txn.id()).await, vec![1.0, 2.0, 3.0, 4.0]);
 });
@@ -1578,6 +1658,7 @@ test!(tensor_facade_reduce_and_reduce_axes, async {
     let TensorReduceResult::Scalar(sum) = tensor.sum(txn.id(), None, false).await.unwrap() else {
         panic!("scalar sum");
     };
+
     let sum: f64 = sum.cast_into();
     assert_eq!(sum, 10.0);
 
@@ -1585,6 +1666,7 @@ test!(tensor_facade_reduce_and_reduce_axes, async {
         .sum(txn.id(), Some(vec![1]), false)
         .await
         .expect("reduce axis 1");
+
     let TensorReduceResult::Tensor(reduced) = reduced else {
         panic!("expected tensor reduction output");
     };
@@ -1598,6 +1680,7 @@ test!(tensor_facade_broadcast_roundtrip, async {
     let tensor = Tensor::dense_f32(&txn, vec![2, 1], vec![1.0, 2.0])
         .await
         .expect("tensor");
+
     let broadcast = tensor.broadcast(vec![2, 3].into()).expect("broadcast");
 
     assert_eq!(broadcast.shape(), &[2, 3]);
@@ -1612,6 +1695,7 @@ test!(tensor_facade_matmul_roundtrip, async {
     let left = Tensor::dense_f32(&txn, vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
         .await
         .expect("left");
+
     let right = Tensor::dense_f32(&txn, vec![3, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
         .await
         .expect("right");
@@ -1629,6 +1713,7 @@ test!(tensor_facade_slice_roundtrip, async {
     let tensor = Tensor::dense_u64(&txn, vec![2, 3], vec![1, 2, 3, 4, 5, 6])
         .await
         .expect("tensor");
+
     let range: Range = vec![AxisRange::In(0, 2, 1), AxisRange::In(1, 3, 1)]
         .into_iter()
         .collect();
@@ -1643,7 +1728,6 @@ async fn tensor_metadata_boundaries_reject_unrepresentable_results() {
     Box::pin(async {
         use fensor::{TensorTransform, TensorView};
         use futures::FutureExt;
-
         use tc_value::Value;
 
         let (_, txn) = setup().await;
@@ -1770,14 +1854,14 @@ async fn restoration_normalizes_scalar_sparse_layouts() {
 
         let (target, _) = create(&txn, vec![2, 3].into(), true, 2).await;
         assert_eq!(source.schema().unwrap(), target.schema().unwrap());
-        target.restore_from(&txn, &source).await.unwrap();
+        target.restore(&txn, &source).await.unwrap();
         assert_eq!(
             values(&target, txn.id()).await,
             vec![0., 0., 0., 0., 0., 7.]
         );
 
         Collection::from(target.clone())
-            .restore_from(&txn, &Collection::from(source))
+            .restore(&txn, &Collection::from(source))
             .await
             .unwrap();
 

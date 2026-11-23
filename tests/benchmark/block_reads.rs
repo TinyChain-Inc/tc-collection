@@ -6,10 +6,10 @@ use std::time::Instant;
 use fensor::TensorSource;
 use futures::{FutureExt, TryStreamExt, stream};
 use number_general::{FloatType, Number, NumberType};
-
-use super::{PersistentFile, StorageContext, Tensor, TensorSchema, Txn, id, record, setup};
 use tc_collection::tensor::AxisRange;
 use tc_ir::{Transact, Transaction};
+
+use super::{PersistentFile, StorageContext, Tensor, TensorSchema, Txn, id, record, setup};
 
 async fn scan(tensor: &Tensor<Txn>, expected: &[f64]) {
     let mut values = tensor.elements(id(40)).await.unwrap();

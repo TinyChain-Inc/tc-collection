@@ -159,10 +159,18 @@ COLLECTION_BENCH_SUITE=overlay cargo test --release --features benchmarks --test
 ```
 
 `COLLECTION_BENCH_CACHE_BYTES` selects the benchmark fixture's cache budget;
-the default remains 262144 bytes. Use the same value for both paired builds and
-record it with the results. A 67108864-byte run provides an adequately provisioned
-control alongside the default cache-pressure workload. Correctness fixtures keep
-their existing budgets.
+the default is `DEFAULT_CACHE_BYTES` in the shared Tensor fixture (256 KiB).
+This small resident target permits eviction in larger workloads while keeping
+fixture memory modest; it is a reproducible pressure baseline, not a tuned optimum.
+Use the same value for both paired builds and record it with the results.
+A 64 MiB run provides a larger-cache comparison; verify its measured cache
+behavior before treating it as a fully resident control. The separate Tensor
+materialization ceiling is 64 KiB and does not limit streamed logical size.
+General storage fixtures use a 16 MiB resident target and a separate 256 MiB
+materialization ceiling so ordinary tests do not incidentally test admission.
+Boundary tests override these policies. None of these defaults claims an exact
+working-set threshold; workload, payload geometry, metadata, and platform affect
+the retained footprint.
 
 Available suites are `finalization`, `mutation`, `assignment`, `construction`,
 `restoration`, `overlay`, `reads`, `integrity`, `zero_replacements`, and

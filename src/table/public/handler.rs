@@ -6,13 +6,13 @@
 use b_table::Range;
 use number_general::{Number, NumberClass, UIntType};
 use safecast::{CastFrom, Match, TryCastInto};
+use tc_error::{TCResult, bad_request};
+use tc_ir::{Id, Map, Scalar};
+use tc_value::Value;
 
 use super::selector::{KeyOrRange, cast_into_range};
 use crate::CollectionState;
 use crate::table::Table;
-use tc_error::{TCResult, bad_request};
-use tc_ir::{Id, Map, Scalar};
-use tc_value::Value;
 
 /// Handler for schema and column-name routes.
 ///

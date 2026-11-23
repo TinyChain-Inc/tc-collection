@@ -5,13 +5,13 @@ use std::sync::Arc;
 use freqfs::Cache;
 use futures::TryStreamExt;
 use futures::future::join_all;
+use tc_value::Value;
 use tokio::sync::Barrier;
 use tokio::time::{Duration, sleep, timeout};
 
 use super::{BTree, BTreeSlice};
 use crate::PersistentFile;
 use crate::test::{TestTxn, init_root, load_roots, tx};
-use tc_value::Value;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn pending_is_visible_only_to_its_txn() {

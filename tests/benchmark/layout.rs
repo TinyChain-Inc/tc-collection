@@ -6,10 +6,10 @@ use fensor::TensorSource;
 use futures::{FutureExt, TryStreamExt, stream};
 use number_general::{FloatType, Number, NumberType};
 use safecast::CastFrom;
-
-use super::{PersistentFile, StorageContext, Tensor, TensorSchema, Txn, id, record, setup};
 use tc_collection::tensor::TensorReduceResult;
 use tc_ir::{Transact, Transaction};
+
+use super::{PersistentFile, StorageContext, Tensor, TensorSchema, Txn, id, record, setup};
 
 async fn consume(source: &Tensor<Txn>, expected: f64, count: usize, mode: &str) {
     if mode == "sum" {

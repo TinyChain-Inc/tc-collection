@@ -1,9 +1,10 @@
 //! Transform Tensor terminal handlers.
 
+use tc_error::TCError;
+
 use super::super::Tensor;
 use super::{axes, dtype, no_parameters, optional, parameter, shape, state};
-use crate::{CollectionState, StorageContext};
-use tc_error::TCError;
+use crate::{CollectionState, CopyFrom, StorageContext};
 
 pub(super) struct Matmul<'a, Txn: StorageContext>(pub(super) &'a Tensor<Txn>);
 
@@ -234,9 +235,12 @@ impl<'a, S: CollectionState<Txn = Txn>, Txn: StorageContext> tc_ir::Handler<'a, 
             Box::pin(async move {
                 let _ = key;
                 Ok(state(
-                    self.0
-                        .materialize(txn, txn.subcontext_unique().context().await?)
-                        .await?,
+                    crate::tensor::Tensor::copy_from(
+                        txn,
+                        txn.subcontext_unique().context().await?,
+                        self.0,
+                    )
+                    .await?,
                 ))
             })
         }))

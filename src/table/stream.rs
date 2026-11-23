@@ -8,10 +8,10 @@ use std::task::{Context, Poll};
 
 use b_table::Row;
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
-
-use super::schema::TableSchema;
 use tc_ir::Id;
 use tc_value::Value;
+
+use super::schema::TableSchema;
 
 pub(crate) type RowStream = BoxStream<'static, Result<Row<Value>, std::io::Error>>;
 

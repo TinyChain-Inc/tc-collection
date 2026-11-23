@@ -1,4 +1,10 @@
 //! Core transactional BTree behavior and range/snapshot query logic.
+//!
+//! `KeyOwner` owns visibility, reservations, and lifecycle decisions; this module
+//! owns how a key delta is read and applied. A read sees canonical storage plus
+//! committed versions through its transaction ID and its own pending delta.
+//! Native trees hold payloads; the collection state lock only protects handles
+//! and decisions. See TRANSACTIONAL_COLLECTION_CONTRACT.md for caller obligations.
 use std::cmp::Ordering;
 use std::fmt;
 use std::marker::PhantomData;
@@ -10,11 +16,11 @@ use collate::Collate;
 use freqfs::DirLock;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-
-use crate::persistence::{CollectionOwner, KeyOwner, PersistentDelta, VisibleSnapshot};
 use tc_error::{TCError, TCResult};
 use tc_ir::{Transact, TxnId};
 use tc_value::{Value, ValueCollator, ValueType};
+
+use crate::persistence::{CollectionOwner, KeyOwner, PersistentDelta, VisibleSnapshot};
 
 const UNARY_KEY_ARITY: usize = 1;
 
@@ -231,6 +237,9 @@ async fn delete_key<F: crate::CollectionFile>(
 }
 
 struct Delta<F: crate::CollectionFile> {
+    // Inserts win over deletes within this transaction. Keeping a deletion marker
+    // after reinsertion is intentional: applying deletes before inserts produces
+    // the same membership as lookup and streaming overlays.
     inserts: BTreeLock<BTreeSchema, ValueCollator, F>,
     deletes: BTreeLock<BTreeSchema, ValueCollator, F>,
 }
@@ -264,6 +273,7 @@ impl<F: crate::CollectionFile> Delta<F> {
     }
 
     async fn delete(&self, key: Vec<Value>) -> std::io::Result<()> {
+        // Remove a same-transaction insertion, then hide any older occurrence.
         delete_key(&self.inserts, &key).await?;
         insert_key(&self.deletes, key).await?;
         Ok(())
@@ -414,61 +424,6 @@ impl<Txn: crate::StorageContext> BTree<Txn> {
         Ok(())
     }
 
-    /// Stage a native replacement without changing the pending delta on failure.
-    /// Self-restoration is a no-op; conflicting source admission returns without waiting.
-    pub async fn restore_from(&self, txn: &Txn, source: &Self) -> tc_error::TCResult<()> {
-        let id = txn.id();
-        self.owner.read_state().assert_writable(id)?;
-        if Arc::ptr_eq(&self.owner, &source.owner) {
-            return Ok(());
-        }
-
-        let schema = self.owner.read_state().persistent.schema().clone();
-        let source_schema = source.owner.read_state().persistent.schema().clone();
-        if schema.key_arity != source_schema.key_arity
-            || schema.key_types != source_schema.key_types
-        {
-            return Err(TCError::bad_request("BTree restoration schema mismatch"));
-        }
-
-        let _permit = self
-            .owner
-            .try_acquire_write_permit(id, txn_lock::set::Range::All)?;
-
-        let base = self.owner.committed_snapshot(id)?;
-
-        let source_permit = source
-            .owner
-            .try_acquire_read_permit(id, txn_lock::set::Range::All)?;
-
-        let source_snapshot = source.owner.visible_snapshot(id)?;
-        let stream =
-            Self::visible_keys(source_snapshot, (Bound::Unbounded, Bound::Unbounded), false)
-                .await?;
-
-        let mut keys = super::Keys::new(stream, source_permit);
-        let workspace = txn.subcontext_unique().context().await?;
-        let delta = Delta::create(schema, workspace).await?;
-        let mut baseline =
-            Self::visible_keys(base, (Bound::Unbounded, Bound::Unbounded), false).await?;
-
-        while let Some(key) = baseline.try_next().await? {
-            insert_key(&delta.deletes, key).await?;
-        }
-
-        drop(baseline);
-
-        while let Some(key) = keys.try_next().await? {
-            delta.insert(key).await?;
-        }
-
-        drop(keys);
-        let mut state = self.owner.write_state();
-        state.assert_writable(id)?;
-        state.pending.insert(id, delta);
-        Ok(())
-    }
-
     pub fn finalized(&self) -> TCResult<Option<TxnId>> {
         self.owner.finalized()
     }
@@ -533,6 +488,10 @@ impl<Txn: crate::StorageContext> BTree<Txn> {
                 }
             });
 
+        // Layers arrive oldest first, with this transaction's pending delta last.
+        // Subtract each layer's deletes before merging its inserts. Rechecking
+        // retirement after I/O avoids retaining a workspace already materialized
+        // into canonical storage, including obsolete workspace-open errors.
         for (id, delta) in snapshot.deltas {
             if snapshot.visibility.retired(id) {
                 continue;
@@ -582,10 +541,7 @@ impl<Txn: crate::StorageContext> BTree<Txn> {
         Ok(())
     }
 
-    pub async fn insert_row(&self, txn: &Txn, key: Vec<Value>) -> TCResult<()>
-    where
-        Txn: crate::StorageContext,
-    {
+    pub async fn insert_row(&self, txn: &Txn, key: Vec<Value>) -> TCResult<()> {
         let txn_id = txn.id();
         let key = self
             .owner
@@ -606,10 +562,7 @@ impl<Txn: crate::StorageContext> BTree<Txn> {
         Ok(())
     }
 
-    pub async fn delete_row(&self, txn: &Txn, key: Vec<Value>) -> TCResult<()>
-    where
-        Txn: crate::StorageContext,
-    {
+    pub async fn delete_row(&self, txn: &Txn, key: Vec<Value>) -> TCResult<()> {
         let txn_id = txn.id();
         let key = self
             .owner
@@ -938,6 +891,69 @@ impl<Txn: crate::StorageContext> Transact for BTree<Txn> {
     ) -> impl std::future::Future<Output = tc_error::TCResult<()>> + Send {
         let txn_id = *txn_id;
         async move { BTree::finalize(self, txn_id).await }
+    }
+}
+
+impl<Txn: crate::StorageContext> crate::Restore for BTree<Txn> {
+    type Txn = Txn;
+
+    /// Restore through a staged key delta; see [`crate::Restore`].
+    async fn restore(&self, txn: &Txn, source: &Self) -> tc_error::TCResult<()> {
+        let id = txn.id();
+        self.owner.read_state().assert_writable(id)?;
+        if Arc::ptr_eq(&self.owner, &source.owner) {
+            return Ok(());
+        }
+
+        let schema = self.owner.read_state().persistent.schema().clone();
+        let source_schema = source.owner.read_state().persistent.schema().clone();
+        if schema.key_arity != source_schema.key_arity
+            || schema.key_types != source_schema.key_types
+        {
+            return Err(TCError::bad_request("BTree restoration schema mismatch"));
+        }
+
+        let _permit = self
+            .owner
+            .try_acquire_write_permit(id, txn_lock::set::Range::All)?;
+
+        let base = self.owner.committed_snapshot(id)?;
+
+        // Replacement is relative to committed state, not the old pending delta:
+        // successful publication below replaces that delta in its entirety.
+
+        let source_permit = source
+            .owner
+            .try_acquire_read_permit(id, txn_lock::set::Range::All)?;
+
+        let source_snapshot = source.owner.visible_snapshot(id)?;
+        let stream =
+            Self::visible_keys(source_snapshot, (Bound::Unbounded, Bound::Unbounded), false)
+                .await?;
+
+        let mut keys = super::Keys::new(stream, source_permit);
+        let workspace = txn.subcontext_unique().context().await?;
+        let delta = Delta::create(schema, workspace).await?;
+        let mut baseline =
+            Self::visible_keys(base, (Bound::Unbounded, Bound::Unbounded), false).await?;
+
+        while let Some(key) = baseline.try_next().await? {
+            insert_key(&delta.deletes, key).await?;
+        }
+
+        drop(baseline);
+
+        while let Some(key) = keys.try_next().await? {
+            delta.insert(key).await?;
+        }
+
+        drop(keys);
+        // Staging has completed without changing pending visibility. Recheck the
+        // decision after I/O before publishing; the caller owns workspace cleanup.
+        let mut state = self.owner.write_state();
+        state.assert_writable(id)?;
+        state.pending.insert(id, delta);
+        Ok(())
     }
 }
 

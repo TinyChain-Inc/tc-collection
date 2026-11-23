@@ -3,11 +3,11 @@ use std::sync::atomic::Ordering;
 
 use fensor::TensorSource;
 use futures::StreamExt;
+use tc_ir::{Transact, Transaction};
 
 use super::{TOUCHED_PAGE_ENTRIES, observation};
 use crate::tensor::Data;
 use crate::tensor::tests::{create, setup};
-use tc_ir::{Transact, Transaction};
 
 // Synthetic layers use real shared visibility state; injected completion models
 // canonical application before the finalized frontier is advanced.
@@ -482,7 +482,6 @@ async fn later_snapshots_survive_finalized_workspace_cleanup() {
     Box::pin(async {
         use fensor::TensorSource;
         use futures::TryStreamExt;
-
         use tc_ir::{NetworkTime, TxnId};
 
         for sparse in [false, true] {

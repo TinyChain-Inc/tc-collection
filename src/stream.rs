@@ -4,9 +4,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures::stream::BoxStream;
+use tc_value::Value;
 
 pub(crate) use overlay::Overlay;
-use tc_value::Value;
 
 pub(crate) type ReadPermit = txn_lock::semaphore::PermitRead<txn_lock::set::Range<Vec<Value>>>;
 

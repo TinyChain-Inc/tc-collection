@@ -3,11 +3,11 @@
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use number_general::Number;
+use tc_error::TCResult;
+use tc_ir::IntoView;
 
 use super::{Tensor, TensorSchema};
 use crate::StorageContext;
-use tc_error::TCResult;
-use tc_ir::IntoView;
 
 pub struct TensorView {
     pub(crate) schema: TensorSchema,

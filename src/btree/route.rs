@@ -2,27 +2,22 @@ use std::ops::Bound;
 
 use pathlink::PathSegment;
 use safecast::{CastInto, TryCastFrom};
-
-use crate::Collection;
-use crate::collection::BTreeView;
-use crate::route::CollectionState;
 use tc_error::{TCError, TCResult};
 use tc_ir::{Id, Map};
 use tc_value::Value;
 
+use crate::Collection;
+use crate::collection::BTreeView;
+use crate::route::CollectionState;
+
 type BTreeBounds = (Bound<Value>, Bound<Value>);
+
 struct BTreeHandler<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
-
 struct Contains<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
-
 struct Count<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
-
 struct IsEmpty<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
-
 struct Slice<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
-
 struct Insert<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
-
 struct Delete<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
 
 impl<S, Txn> tc_ir::Route<S> for BTreeView<Txn>

@@ -1,11 +1,11 @@
 use destream::de;
 use futures::StreamExt;
-
-use super::file::{TableFile, upsert};
-use super::{Table, TableSchema};
 use tc_error::{TCError, TCResult};
 use tc_ir::IntoView;
 use tc_value::Value;
+
+use super::file::{TableFile, upsert};
+use super::{Table, TableSchema};
 
 #[derive(Clone, Debug)]
 pub struct DecodedTablePayload<Txn: crate::StorageContext> {

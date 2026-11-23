@@ -3,6 +3,10 @@
 //! Lock order: reserve the transaction range, briefly inspect collection state,
 //! release that guard, then enter one native index or payload domain at a time.
 //! Lifecycle callers quiesce covered work; lifecycle methods never reserve ranges.
+//! `CollectionOwner` owns transaction decisions; this module translates Tensor
+//! mutations into logical-block deltas. Computation and physical payload/index
+//! maintenance remain delegated to fensor. Caller obligations are defined in
+//! TRANSACTIONAL_COLLECTION_CONTRACT.md.
 
 use std::io;
 use std::marker::PhantomData;
@@ -20,20 +24,16 @@ use fensor::{
 use freqfs::DirLock;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-
-use crate::persistence::{CollectionOwner, PersistentDelta, Visibility};
-use crate::{CollectionFile, StorageContext};
 use tc_error::{TCError, TCResult};
 use tc_ir::TxnId;
 
+use crate::persistence::{CollectionOwner, PersistentDelta, Visibility};
+use crate::{CollectionFile, StorageContext};
+
 pub(super) type BlockRange = std::ops::Range<u64>;
-
 type BlockOwner<F, T> = CollectionOwner<Delta<F, T>, Collator<u64>, BlockRange>;
-
 type Layer<F, T> = (TxnId, Arc<Delta<F, T>>);
-
 type ReadPermit = txn_lock::semaphore::PermitRead<BlockRange>;
-
 type Touched<F> = BTreeLock<TouchedSchema, Collator<u64>, F>;
 
 const TOUCHED_PAGE_ENTRIES: usize = 4096;
@@ -43,7 +43,6 @@ struct TouchedSchema;
 
 impl Schema for TouchedSchema {
     type Error = io::Error;
-
     type Value = u64;
 
     fn block_size(&self) -> usize {
@@ -216,6 +215,10 @@ impl<F: CollectionFile + TensorFileEntry<T>, T: TensorElement> Delta<F, T> {
             .validate_block(id, &values)
             .map_err(native_error)?;
 
+        // Store the replacement before declaring the block touched. Sparse zero
+        // payloads can be absent, so touched membership is the authoritative
+        // override marker. These are fallible in-place writes: errors require the
+        // caller's rollback/recovery policy, not an assumption of atomicity here.
         self.payload
             .replace(id, values)
             .await
@@ -757,6 +760,10 @@ where
         id: TxnId,
         permit: Option<ReadPermit>,
     ) -> TCResult<Snapshot<Txn::File, T>> {
+        // Retain native/delta handles, not copied payloads. Read snapshots own a
+        // range permit; a writer already holding its reservation passes None.
+        // Visibility tracks the shared frontier so later reads can hand retired
+        // workspace layers off to canonical storage after materialization.
         let visible = self.core.visible_snapshot(id)?;
 
         Ok(Snapshot {
@@ -806,6 +813,9 @@ where
             .try_acquire_write_permit(txn.id(), block..block + 1)?;
 
         let pending = self.pending(txn).await?;
+        // A point mutation replaces a whole logical block. Read our own pending
+        // changes as well as committed history, preserving neighboring values;
+        // the block write reservation covers this entire read/modify/write.
         let snapshot = self.snapshot(txn.id(), None)?;
         let mut values = snapshot.read_logical_block(block).await?;
         values[offset] = value;
@@ -814,6 +824,8 @@ where
     }
 
     pub async fn stage(&self, txn: &Txn) -> TCResult<Arc<Delta<Txn::File, T>>> {
+        // An unpublished patch has independent storage. Its caller retains the
+        // operation's reservations and finishes source reads before publication.
         self.assert_writable(txn.id())?;
         Ok(Delta::create(
             txn.subcontext_unique().context().await?,
@@ -836,6 +848,8 @@ where
             }
         };
 
+        // Release bookkeeping before native I/O. Merge only touched blocks so a
+        // disjoint write in the same transaction is not replaced by this patch.
         patch.apply_to_delta(&pending).await?;
         Ok(())
     }
@@ -888,6 +902,8 @@ where
     }
 
     pub fn install(&self, id: TxnId, delta: Arc<Delta<Txn::File, T>>) -> TCResult<()> {
+        // Full restoration replaces pending ownership after staging succeeds;
+        // unlike publish, it deliberately discards earlier pending block writes.
         let replaced = {
             let mut state = self.core.write_state();
             state.assert_writable(id)?;

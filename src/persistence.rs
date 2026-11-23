@@ -8,7 +8,6 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use collate::{Collate, OverlapsRange};
 use freqfs::DirLock;
-
 use tc_error::TCResult;
 use tc_ir::TxnId;
 
@@ -21,6 +20,8 @@ pub(crate) trait PersistentDelta: Send + Sync + 'static {
 
 pub(crate) struct State<D: PersistentDelta> {
     pub persistent: D::Native,
+    // None records a committed decision without allocating an empty delta. Its
+    // presence still prevents late writes and makes repeated commit idempotent.
     pub committed: BTreeMap<TxnId, Option<Arc<D>>>,
     pub pending: BTreeMap<TxnId, Arc<D>>,
     pub finalized: Option<TxnId>,
@@ -198,6 +199,8 @@ where
         state.assert_readable(txn_id)?;
         let mut snapshot = self.snapshot(&state, txn_id);
 
+        // Other transactions' pending deltas are never visible. Appending our own
+        // last gives scan overlays the same precedence as newest-first point reads.
         if let Some(delta) = state.pending.get(&txn_id).cloned() {
             snapshot.deltas.push((txn_id, delta));
         }
@@ -250,6 +253,8 @@ where
         };
 
         let delta = construction.await?;
+        // Concurrent disjoint writes may have prepared another workspace. Keep
+        // the one already published, and never publish after commit/finalization.
         let mut state = self.write_state();
         state.assert_writable(txn_id)?;
         Ok(state.pending.entry(txn_id).or_insert(delta).clone())
@@ -292,6 +297,8 @@ where
     }
 
     pub fn commit(&self, txn_id: TxnId) -> TCResult<()> {
+        // Callers have sealed mutations. Moving the handle publishes visibility
+        // without changing payloads, so retained result snapshots remain valid.
         {
             let mut state = self.write_state();
             if state.finalized.is_some_and(|cutoff| txn_id <= cutoff) {
@@ -304,11 +311,15 @@ where
             }
         }
 
+        // Release reservations only after the decision is visible. No payload is
+        // applied or synchronized here; durability belongs to the enclosing owner.
         self.semaphore.finalize(&txn_id, false)?;
         Ok(())
     }
 
     pub fn rollback(&self, txn_id: TxnId) -> TCResult<()> {
+        // Callers have stopped operations and released this transaction's streams.
+        // Reject an already committed decision rather than reversing visibility.
         {
             let mut state = self.write_state();
             if state.finalized.is_some_and(|finalized| txn_id <= finalized) {
@@ -325,6 +336,9 @@ where
     }
 
     pub async fn finalize(&self, txn_id: TxnId) -> TCResult<()> {
+        // Callers serialize lifecycle work and quiesce operations through cutoff.
+        // Capture handles briefly, then apply in transaction order without holding
+        // bookkeeping across native I/O or acquiring another range reservation.
         let (persistent, committed_to_apply) = {
             let state = self.read_state();
             if state.finalized.is_some_and(|cutoff| txn_id <= cutoff) {
@@ -344,6 +358,10 @@ where
             delta.apply_to(&persistent).await?;
         }
 
+        // Advance only after every application succeeds. A failure above may have
+        // changed canonical payloads: retaining the old frontier is not rollback.
+        // Propagate the error for caller-coordinated recovery. On success, prune
+        // both committed history and abandoned pending work through the cutoff.
         {
             let mut state = self.write_state();
             state.committed.retain(|id, _| *id > txn_id);

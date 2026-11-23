@@ -6,10 +6,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use freqfs::DirLock;
-
-use super::{PersistentFile, StorageContext};
 use tc_error::TCResult;
 use tc_ir::{NetworkTime, Transaction, TxnId};
+
+use super::{PersistentFile, StorageContext};
+
+// A generous but finite ceiling for ordinary literal construction. Tests of
+// materialization admission override it; this is not a cache residency target.
+pub const DEFAULT_MATERIALIZED_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct TempRoot(PathBuf);
@@ -76,7 +80,7 @@ impl TestTxn {
             root,
             path: Vec::new(),
             next: Arc::new(AtomicU64::new(0)),
-            materialized_bytes: 256 * 1024 * 1024,
+            materialized_bytes: DEFAULT_MATERIALIZED_BYTES,
             temp: None,
         }
     }

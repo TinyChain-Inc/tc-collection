@@ -316,7 +316,14 @@ delegating delta validation and application to concrete key, row, or logical-blo
 retain creation, loading, workspace construction, hashing, copying and restoration.
 There is no independent publication owner or acceptance metadata.
 
-Collection materialization delegates recursively to the concrete owner and streams an independent transaction-consistent value into unpublished delegated storage.
+`CopyFrom::copy_from(txn, dir, source)` constructs an independent transactional
+collection by recursively delegating to its concrete owner. Sources are borrowed
+for the copy and read through the supplied transaction. The caller exclusively
+delegates empty, unpublished destination storage; native constructors reject
+nonempty storage without changing its contents. Copying streams contents and
+synchronizes the result without deciding the source transaction. On failure or
+cancellation, partial unpublished output belongs to caller cleanup. `Restore::restore`
+instead replaces pending state in an existing owner.
 Tensor selects native destination layout at this boundary: retain valid reported
 sparse-axis hints, including shape-preserving unary and cast values; otherwise use
 the schema's scalar-sparse default. Dense values use dense storage. This packing
@@ -329,7 +336,7 @@ bounded row-major numerical batches and reuses exact typed zero digests, includi
 independent signs of complex components. Its digest is identical to hashing each
 logical element separately; sparse hashing still consumes logical cardinality.
 The caller coordinates publication
-and retention. Native `restore_from` validates kind and semantic schema, builds
+and retention. `Restore::restore` validates kind and semantic schema, builds
 insert/delete deltas in a separate delegated workspace, and installs the pending
 replacement only after construction succeeds. Rollback preserves the previous
 committed value. Self-restoration, including a cloned alias, is a no-op after
@@ -378,6 +385,11 @@ model changes.
 
 ## Tensor values and numerical execution
 
+Native geometry uses compact row-major chunks of at most 4,096 elements. Each
+sparse-coordinate prefix has an independent dense suffix region, with a partial
+final chunk when needed. Block capacity determines physical conflict boundaries
+and may span rows; reopening preserves the stored geometry.
+
 Tensor schemas encode `[dtype_path, shape]` for dense values and
 `[dtype_path, shape, sparse_axis]` for sparse values. The optional zero-based axis
 identifies the last sparse dimension; the final axis denotes scalar-sparse
@@ -386,6 +398,12 @@ of axis. This replaces the layout-string schema directly; callers and durable
 records must use the current schema representation. Native storage metadata is
 unchanged.
 
+Complete dense wire payloads are `[[dtype_path, shape], values]`; sparse payloads
+are `[[dtype_path, shape, sparse_axis], [[coordinate, value], ...]]`. Encoding
+streams values and omits numerical zeros from sparse payloads. Omitting the axis
+selects dense storage; no layout string is encoded. Typed payload tags determine
+dtype on reopening, independently of casts.
+
 Collection Tensor metadata requires a nonempty shape with positive dimensions and
 at most 4096 axes. Typed construction, literals, decoding, transformed results,
 schema extraction, and copy-layout preparation share this representability
@@ -393,6 +411,11 @@ boundary. Unsupported scalar, empty, or over-rank Tensor results return structur
 errors; existing scalar GET and complete-reduction results remain Numbers. Native
 fensor views retain their own capabilities. Validation does not materialize values
 or change numerical policy.
+
+Native literal constructors check supplied element bytes against the delegated
+`materialized_tensor_bytes` allowance after allocation. This is not an aggregate
+memory bound or a limit on streamed logical size. Streamed construction and copying
+use fensor's storage-block capacity independently of this whole-value allowance.
 
 Tensor POST handlers consume recognized parameters and reject leftover keys before
 snapshot acquisition or numerical execution. Missing/invalid recognized arguments
@@ -418,6 +441,9 @@ storage remain unchanged. Assignment checks mutation generations across reservat
 conversion; partial publication requires caller-owned rollback.
 
 Fensor owns geometry, native storage, numerical operations, and bounded evaluation.
+Supported backend/dtype combinations follow fensor and ha-ndarray. Native mean,
+population standard deviation, and Euclidean norm return f64 for real inputs;
+complex mean returns c64, while complex standard deviation and norm return f64.
 Dense and sparse values use the same numerical kernels. Implicit zeros participate
 in reductions as ordinary values. Pointwise operations that would produce a
 nonzero implicit background require explicit lazy `as_dense` conversion. Tensor
@@ -433,6 +459,14 @@ owned sources; collections continue supplying transaction-visible storage.
 and native construction, including implicit sparse zeros. Ordinary copying and
 materialization do not select this operation automatically when indexed
 traversal is unsupported.
+
+Eligible sparse encoding, copying, and reductions traverse occupied blocks and
+account for implicit zeros. Supported forward slices and permutations retain
+indexed planning through owned expressions. Larger sparse selections with
+unsupported mapping or ordering fail explicitly rather than scanning their whole
+logical shape. Bounded point reads and explicit row-major reads remain available;
+computed matrix/Fourier results retain their own logical evaluation. No operation
+implicitly sorts or persists intermediate results.
 
 Literal PUT dispatch consumes its inputs only on a matching constructor;
 `Collection::from_put` returns `LiteralPut::Unmatched` with the original owned

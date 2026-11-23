@@ -11,11 +11,11 @@ use std::ops::Bound;
 
 use b_table::{ColumnRange, IndexSchema, Range};
 use safecast::TryCastInto;
-
-use super::super::TableSchema;
 use tc_error::{TCResult, bad_request, not_found};
 use tc_ir::Id;
 use tc_value::Value;
+
+use super::super::TableSchema;
 
 /// A table selector parsed from a request: all rows, a single key, or a range.
 ///

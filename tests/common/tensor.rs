@@ -5,22 +5,31 @@ use freqfs::DirLock;
 use futures::{FutureExt, TryStreamExt};
 use number_general::FloatType;
 use safecast::CastInto;
+use tc_ir::{NetworkTime, TxnId};
+use tc_value::NumberType;
 
 pub use super::storage::{TempRoot, TestTxn as Txn};
 use super::{PersistentFile, StorageContext, Tensor, TensorSchema};
-use tc_ir::{NetworkTime, TxnId};
-use tc_value::NumberType;
+
+// A small resident target shared by regressions and benchmarks: 32,768 f64
+// values before metadata. Larger workloads can exercise eviction without large
+// fixture memory. This is a reproducible baseline, not a measured optimum.
+pub const DEFAULT_CACHE_BYTES: usize = 256 * 1024;
+
+// Limit explicit Tensor materialization to 8,192 f64 values before metadata;
+// streaming larger logical tensors remains supported and is tested separately.
+const MATERIALIZED_BYTES: usize = 64 * 1024;
 
 pub fn id(n: u16) -> TxnId {
     TxnId::from_parts(NetworkTime::from_nanos(1), n)
 }
 
 pub async fn setup() -> (Arc<TempRoot>, Txn) {
-    setup_with_capacity(256 * 1024).await
+    setup_with_capacity(DEFAULT_CACHE_BYTES).await
 }
 
 pub async fn setup_with_capacity(capacity: usize) -> (Arc<TempRoot>, Txn) {
-    Txn::owned(id(10), capacity, 64 * 1024)
+    Txn::owned(id(10), capacity, MATERIALIZED_BYTES)
 }
 
 pub async fn create(

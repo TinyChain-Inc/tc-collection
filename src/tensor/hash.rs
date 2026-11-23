@@ -1,7 +1,6 @@
 use async_hash::{Hash, SequenceHash, Sha256};
 use futures::TryStreamExt;
 use number_general::{Complex, Float, Number};
-
 use tc_error::TCResult;
 use tc_ir::Sha256Hash;
 

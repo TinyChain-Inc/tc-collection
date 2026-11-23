@@ -2,12 +2,11 @@
 use std::time::{Duration, Instant};
 
 use futures::{StreamExt, TryStreamExt};
-
 use tc_collection::btree::{BTreeColumnSchema, StorageConfig};
 use tc_collection::collection::CollectionSchema;
 use tc_collection::table::{Column, Table, TableSchema};
 use tc_collection::tensor::{Tensor, TensorSchema};
-use tc_collection::{Collection, PersistentFile, StorageContext};
+use tc_collection::{Collection, CopyFrom, PersistentFile, StorageContext};
 use tc_ir::{Transact, Transaction};
 use tc_value::{NumberType, ValueType};
 
@@ -17,6 +16,14 @@ use storage::TestTxn;
 
 #[path = "benchmark/simplify.rs"]
 mod simplify;
+
+// Generous residency for comparing overlay and delegation costs. This target is
+// deliberately larger than the Tensor pressure baseline, not a proven no-eviction
+// threshold; confirm residency from measurements for the workload being compared.
+const RESIDENT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+// Independent admission ceiling for explicit Tensor buffers, not cache storage.
+const MATERIALIZED_TENSOR_BYTES: usize = 64 * 1024 * 1024;
 
 fn record(workload: &str, operation: &str, elapsed: Duration) {
     println!(
@@ -123,7 +130,12 @@ async fn count(collection: &Collection<TestTxn>, txn: &TestTxn) -> usize {
 async fn history() {
     for table in [false, true] {
         for versions in [0, 1, 16, 128, 1024, 4096] {
-            let (_root, txn) = TestTxn::owned(storage_id(1), 64 * 1024 * 1024, 64 * 1024 * 1024);
+            let (_root, txn) = TestTxn::owned(
+                storage_id(1),
+                RESIDENT_CACHE_BYTES,
+                MATERIALIZED_TENSOR_BYTES,
+            );
+
             let collection = create(&txn, table).await;
             for key in 0..32 {
                 insert(&collection, &txn, key).await;
@@ -214,11 +226,16 @@ async fn history() {
 
 async fn load() {
     for table in [false, true] {
-        let (_work, txn) = TestTxn::owned(storage_id(1), 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let (_work, txn) = TestTxn::owned(
+            storage_id(1),
+            RESIDENT_CACHE_BYTES,
+            MATERIALIZED_TENSOR_BYTES,
+        );
+
         let root = storage::TempRoot::new("cold-data");
         let (schema, released) = {
             let cache = freqfs::Cache::<PersistentFile>::new(
-                64 * 1024 * 1024,
+                RESIDENT_CACHE_BYTES,
                 None,
                 0,
                 Duration::from_secs(3),
@@ -231,7 +248,10 @@ async fn load() {
             }
 
             source.commit(txn.id()).await.unwrap();
-            let stored = source.materialize(&txn.at(2), native).await.unwrap();
+            let stored = Collection::copy_from(&txn.at(2), native, &source)
+                .await
+                .unwrap();
+
             stored.sync_all().await.unwrap();
             (stored.schema().unwrap(), std::sync::Arc::downgrade(&cache))
         };
@@ -245,8 +265,12 @@ async fn load() {
         .unwrap();
 
         let start = Instant::now();
-        let cache =
-            freqfs::Cache::<PersistentFile>::new(64 * 1024 * 1024, None, 0, Duration::from_secs(3));
+        let cache = freqfs::Cache::<PersistentFile>::new(
+            RESIDENT_CACHE_BYTES,
+            None,
+            0,
+            Duration::from_secs(3),
+        );
 
         let loaded = Collection::<TestTxn>::load(cache.load(root.to_path_buf()).unwrap(), schema)
             .await
@@ -264,7 +288,12 @@ async fn load() {
 async fn slow_reader() {
     for table in [false, true] {
         for partial in [false, true] {
-            let (_root, txn) = TestTxn::owned(storage_id(1), 64 * 1024 * 1024, 64 * 1024 * 1024);
+            let (_root, txn) = TestTxn::owned(
+                storage_id(1),
+                RESIDENT_CACHE_BYTES,
+                MATERIALIZED_TENSOR_BYTES,
+            );
+
             let collection = create(&txn, table).await;
             for key in 0..32 {
                 insert(&collection, &txn, key).await;
@@ -341,7 +370,12 @@ fn storage_id(n: u16) -> tc_ir::TxnId {
 
 async fn capture() {
     for table in [false, true] {
-        let (_root, txn) = TestTxn::owned(storage_id(1), 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let (_root, txn) = TestTxn::owned(
+            storage_id(1),
+            RESIDENT_CACHE_BYTES,
+            MATERIALIZED_TENSOR_BYTES,
+        );
+
         let collection = create(&txn, table).await;
         for key in 0..4096 {
             insert(&collection, &txn, key).await;
@@ -356,7 +390,12 @@ async fn capture() {
     for sparse in [false, true] {
         for exponent in [14, 18, 22] {
             let size = 1_u64 << exponent;
-            let (_root, txn) = TestTxn::owned(storage_id(1), 64 * 1024 * 1024, 64 * 1024 * 1024);
+            let (_root, txn) = TestTxn::owned(
+                storage_id(1),
+                RESIDENT_CACHE_BYTES,
+                MATERIALIZED_TENSOR_BYTES,
+            );
+
             let schema = TensorSchema::new(
                 NumberType::Float(number_general::FloatType::F64),
                 vec![size].into(),
@@ -399,7 +438,10 @@ async fn capture() {
 async fn measure_capture(source: &Collection<TestTxn>, txn: &TestTxn, workload: &str) {
     let destination = txn.subcontext_unique().context().await.unwrap();
     let start = Instant::now();
-    let captured = source.materialize(txn, destination).await.unwrap();
+    let captured = Collection::copy_from(txn, destination, source)
+        .await
+        .unwrap();
+
     record(workload, "materialize", start.elapsed());
     let start = Instant::now();
     let hash = captured.hash(txn.id()).await.unwrap();
