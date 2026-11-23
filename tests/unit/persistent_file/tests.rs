@@ -262,6 +262,60 @@ async fn sparse_nodes_retain_bits_and_reject_unbounded_or_wrong_payloads() {
 
 #[tokio::test]
 async fn tensor_files_preserve_dtype_tags_and_bound_decoding() {
+    async fn assert_tag(tag: u8, entry: PersistentFile) {
+        let (actual, _): (u8, de::IgnoredAny) =
+            tbon::de::try_decode((), tbon::en::encode(&entry).unwrap())
+                .await
+                .unwrap();
+
+        assert_eq!(actual, tag);
+        assert_eq!(
+            std::mem::discriminant(&decode_entry(&entry).await),
+            std::mem::discriminant(&entry)
+        );
+    }
+
+    // Expected tags are the persisted wire contract, independent of the catalog.
+    macro_rules! check_dtype {
+        ($dense:ident, $metadata:ident, $sparse:ident; $tag:literal, $meta_tag:literal, $sparse_tag:literal) => {
+            assert_tag($tag, PersistentFile::$dense(vec![Default::default()])).await;
+            assert_tag(
+                $meta_tag,
+                PersistentFile::$metadata(
+                    fensor::TensorMetadata::new(vec![1].into(), fensor::Layout::Dense, 1).unwrap(),
+                ),
+            )
+            .await;
+
+            assert_tag(
+                $sparse_tag,
+                PersistentFile::$sparse(b_tree::Node::Leaf(vec![vec![
+                    fensor::SparseCell::Key(0),
+                    fensor::SparseCell::Payload(vec![Default::default()]),
+                ]])),
+            )
+            .await;
+        };
+    }
+
+    assert_tag(0, PersistentFile::Node(b_tree::Node::Leaf(vec![]))).await;
+    assert_tag(1, PersistentFile::TensorIndex(b_tree::Node::Leaf(vec![]))).await;
+    check_dtype!(U8, MetadataU8, SparseU8; 2, 3, 30);
+    check_dtype!(U16, MetadataU16, SparseU16; 4, 5, 31);
+    check_dtype!(U32, MetadataU32, SparseU32; 6, 7, 32);
+    check_dtype!(U64, MetadataU64, SparseU64; 8, 9, 33);
+    check_dtype!(I8, MetadataI8, SparseI8; 10, 11, 34);
+    check_dtype!(I16, MetadataI16, SparseI16; 12, 13, 35);
+    check_dtype!(I32, MetadataI32, SparseI32; 14, 15, 36);
+    check_dtype!(I64, MetadataI64, SparseI64; 16, 17, 37);
+    check_dtype!(F32, MetadataF32, SparseF32; 18, 19, 38);
+    check_dtype!(F64, MetadataF64, SparseF64; 20, 21, 39);
+    #[cfg(feature = "complex")]
+    {
+        check_dtype!(C32, MetadataC32, SparseC32; 22, 23, 40);
+        check_dtype!(C64, MetadataC64, SparseC64; 24, 25, 41);
+    }
+
     let entry = PersistentFile::F64(vec![1.0, 2.0]);
     let decoded = decode_entry(&entry).await;
     assert!(AsType::<Vec<f64>>::as_type(&decoded).is_some());

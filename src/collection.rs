@@ -194,13 +194,6 @@ impl<Txn: crate::StorageContext> BTreeView<Txn> {
             BTreeSource::Slice(slice) => slice.is_empty(txn_id).await,
         }
     }
-
-    pub async fn finalized_key_stream(&self) -> std::io::Result<b_tree::Keys<Value>> {
-        match &self.source {
-            BTreeSource::File(btree) => btree.finalized_key_stream().await,
-            BTreeSource::Slice(slice) => slice.finalized_key_stream().await,
-        }
-    }
 }
 
 impl<Txn: crate::StorageContext> IntoView for BTreeView<Txn> {

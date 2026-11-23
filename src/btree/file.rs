@@ -424,33 +424,6 @@ impl<Txn: crate::StorageContext> BTree<Txn> {
         Ok(())
     }
 
-    pub fn finalized(&self) -> TCResult<Option<TxnId>> {
-        self.owner.finalized()
-    }
-
-    pub async fn finalized_key_stream(&self) -> std::io::Result<b_tree::Keys<Value>> {
-        self.finalized_key_stream_in(
-            (Bound::<Value>::Unbounded, Bound::<Value>::Unbounded),
-            false,
-        )
-        .await
-    }
-
-    pub async fn finalized_key_stream_in(
-        &self,
-        bounds: (Bound<Value>, Bound<Value>),
-        reverse: bool,
-    ) -> std::io::Result<b_tree::Keys<Value>> {
-        let persistent = {
-            let state = self.owner.read_state();
-            state.persistent.clone()
-        };
-
-        let stream = key_stream_in(&persistent, bounds, reverse).await?;
-        // Release native stream ownership on error or EOF, before outer drop.
-        Ok(crate::stream::GuardedStream::new(stream, ()).boxed())
-    }
-
     /// Stream the keys visible to `txn_id` while retaining the range read permit.
     pub async fn keys(
         &self,
@@ -810,12 +783,6 @@ impl<Txn: crate::StorageContext> BTreeSlice<Txn> {
                 (self.lower.clone(), self.upper.clone()),
                 self.reverse,
             )
-            .await
-    }
-
-    pub async fn finalized_key_stream(&self) -> std::io::Result<b_tree::Keys<Value>> {
-        self.btree
-            .finalized_key_stream_in((self.lower.clone(), self.upper.clone()), self.reverse)
             .await
     }
 

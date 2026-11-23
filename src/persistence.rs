@@ -190,10 +190,6 @@ where
         self.state.write().expect("collection state poisoned")
     }
 
-    pub fn finalized(&self) -> TCResult<Option<TxnId>> {
-        Ok(self.read_state().finalized)
-    }
-
     pub fn visible_snapshot(&self, txn_id: TxnId) -> TCResult<VisibleSnapshot<D>> {
         let state = self.read_state();
         state.assert_readable(txn_id)?;

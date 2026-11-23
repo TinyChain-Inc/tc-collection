@@ -19,7 +19,7 @@ async fn poisoned_state_fails_closed() {
 
     use futures::FutureExt;
 
-    assert!(catch_unwind(AssertUnwindSafe(|| owner.finalized())).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| owner.read_state())).is_err());
     assert!(catch_unwind(AssertUnwindSafe(|| owner.visible_snapshot(id))).is_err());
     assert!(catch_unwind(AssertUnwindSafe(|| owner.try_acquire_read_permit(id, 0..1))).is_err());
     assert!(

@@ -1,11 +1,18 @@
 use futures::TryStreamExt;
-use tc_ir::Transaction;
+use tc_error::TCResult;
+use tc_ir::{Transaction, TxnId};
 
 use super::{Delta, PersistentTable, Range, TableFile, TableSchema, upsert};
 use crate::btree::StorageConfig;
 use crate::table::Column;
 use crate::test::tensor::{Txn, setup};
 use crate::{CopyFrom, Restore, StorageContext};
+
+impl<Txn: StorageContext> PersistentTable<Txn> {
+    pub(in crate::table) fn finalized(&self) -> TCResult<Option<TxnId>> {
+        Ok(self.owner.read_state().finalized)
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn selected_delta_baseline_and_scan_setup_survive_finalized_workspace_cleanup() {

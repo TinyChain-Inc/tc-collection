@@ -1,8 +1,15 @@
-use tc_ir::Transaction;
+use tc_error::TCResult;
+use tc_ir::{Transaction, TxnId};
 
 use super::{BTree, contains_key};
 use crate::test::tensor::{Txn, setup};
 use crate::{Restore, StorageContext};
+
+impl<Txn: StorageContext> BTree<Txn> {
+    pub(in crate::btree) fn finalized(&self) -> TCResult<Option<TxnId>> {
+        Ok(self.owner.read_state().finalized)
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn selected_delta_and_scan_setup_survive_finalized_workspace_cleanup() {

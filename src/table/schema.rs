@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use b_table::{ColumnRange, IndexSchema, Range, Schema};
+use b_table::{IndexSchema, Schema};
 use b_tree::Schema as BTreeSchema;
 use safecast::{CastFrom, TryCastFrom};
 use tc_error::TCError;
@@ -54,13 +54,6 @@ impl TableIndexSchema {
 
     pub fn storage(&self) -> &StorageConfig {
         &self.storage
-    }
-
-    pub fn into_columns(self) -> impl Iterator<Item = Column> {
-        self.column_names
-            .into_iter()
-            .zip(self.column_types)
-            .map(|(name, dtype)| Column { name, dtype })
     }
 }
 
@@ -217,23 +210,6 @@ impl TableSchema {
 
     pub fn column_count(&self) -> usize {
         self.key.len() + self.values.len()
-    }
-
-    pub fn range_from_key(&self, key: &[Value]) -> Result<Range<Id, Value>, TCError> {
-        if key.len() != self.key.len() {
-            return Err(tc_error::bad_request!(
-                "key arity {} does not match schema key arity {}",
-                key.len(),
-                self.key.len()
-            ));
-        }
-
-        let mut range = HashMap::with_capacity(key.len());
-        for (name, val) in self.key.iter().zip(key) {
-            range.insert(name.clone(), ColumnRange::Eq(val.clone()));
-        }
-
-        Ok(range.into())
     }
 
     pub fn storage(&self) -> &StorageConfig {

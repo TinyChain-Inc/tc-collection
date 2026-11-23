@@ -254,10 +254,6 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         persistent.contains(key).await
     }
 
-    pub fn finalized(&self) -> TCResult<Option<TxnId>> {
-        self.owner.finalized()
-    }
-
     /// Sync the canonical (persistent) state to disk.
     ///
     /// Buffered writeback does not acknowledge durability. Pending workspace
