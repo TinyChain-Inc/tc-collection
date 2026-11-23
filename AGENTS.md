@@ -22,6 +22,9 @@ are non-normative integration context when this repository is used as a submodul
   duplicating universal State matching.
 - Keep routes, views, and codecs separate: routes know behavior, views acquire
   consistent streams and guards, and codecs know wire structure.
+- Construct Table schemas from Value through `TryFrom<Value, Error = TCError>`.
+  Keep semantic construction fallible instead of maintaining a separate
+  castability predicate which can disagree with the constructor.
 - Stream large scans and keysets. Do not collect unknown-length keys or rows into
   an intermediate vector, map, or set.
 - Receive bootstrap- or transaction-delegated storage/allocation handles. Never

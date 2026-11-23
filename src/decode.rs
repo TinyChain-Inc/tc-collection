@@ -1,32 +1,34 @@
-use destream::de;
+use destream::de::{self, FromStream};
 
-use crate::{
-    Collection, CollectionType, btree::DecodedBTreePayload, collection::BTreeView,
-    table::DecodedTablePayload, tensor::Tensor,
-};
+use crate::btree::DecodedBTreePayload;
+use crate::collection::BTreeView;
+use crate::table::DecodedTablePayload;
+use crate::tensor::Tensor;
+use crate::{Collection, CollectionType};
 
 /// Decode one collection payload after the universal state visitor identifies its class.
-pub async fn decode_collection<Txn, A>(
+pub async fn decode_collection<Txn, D>(
     class: CollectionType,
     txn: Txn,
-    map: &mut A,
-) -> Result<Collection<Txn>, A::Error>
+    decoder: &mut D,
+) -> Result<Collection<Txn>, D::Error>
 where
     Txn: crate::StorageContext,
-    A: de::MapAccess,
+    D: de::Decoder,
 {
     match class {
         CollectionType::BTree(_) => {
-            let payload = map.next_value::<DecodedBTreePayload<Txn>>(txn).await?;
-            Ok(Collection::BTree(Box::new(BTreeView::new(
-                payload.schema,
-                payload.btree,
-            ))))
+            let payload = DecodedBTreePayload::<Txn>::from_stream(txn, decoder).await?;
+            Ok(Collection::BTree(Box::new(
+                BTreeView::new(payload.schema, payload.btree).map_err(de::Error::custom)?,
+            )))
         }
         CollectionType::Table(_) => {
-            let payload = map.next_value::<DecodedTablePayload<Txn>>(txn).await?;
+            let payload = DecodedTablePayload::<Txn>::from_stream(txn, decoder).await?;
             Ok(Collection::from(payload.table))
         }
-        CollectionType::Tensor(_) => map.next_value::<Tensor>(()).await.map(Collection::Tensor),
+        CollectionType::Tensor(_) => Tensor::<Txn>::from_stream(txn, decoder)
+            .await
+            .map(Collection::Tensor),
     }
 }

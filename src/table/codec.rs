@@ -1,9 +1,11 @@
 use destream::de;
-use safecast::TryCastFrom;
-use tc_value::{Value, ValueCollator};
+use futures::StreamExt;
 
 use super::file::{TableFile, upsert};
 use super::{Table, TableSchema};
+use tc_error::{TCError, TCResult};
+use tc_ir::IntoView;
+use tc_value::Value;
 
 #[derive(Clone, Debug)]
 pub struct DecodedTablePayload<Txn: crate::StorageContext> {
@@ -37,9 +39,10 @@ impl<Txn: crate::StorageContext> de::FromStream for Rows<Txn> {
                 let schema = self.table.schema().clone();
                 let key_len = schema.key().len();
                 while let Some(row) = seq.next_element::<Value>(()).await? {
-                    let Value::Tuple(row) = row else {
+                    let Value::Tuple(mut row) = row else {
                         return Err(de::Error::custom("table row must be a tuple"));
                     };
+
                     if row.len() != schema.column_count() {
                         return Err(de::Error::custom(format!(
                             "table row has {} columns but schema has {}",
@@ -47,14 +50,13 @@ impl<Txn: crate::StorageContext> de::FromStream for Rows<Txn> {
                             schema.column_count()
                         )));
                     }
-                    upsert(
-                        &self.table,
-                        row[..key_len].to_vec(),
-                        row[key_len..].to_vec(),
-                    )
-                    .await
-                    .map_err(de::Error::custom)?;
+
+                    let values = row.split_off(key_len);
+                    upsert(&self.table, row, values)
+                        .await
+                        .map_err(de::Error::custom)?;
                 }
+
                 Ok(Rows(std::marker::PhantomData))
             }
         }
@@ -93,15 +95,17 @@ impl<Txn: crate::StorageContext> de::FromStream for DecodedTablePayload<Txn> {
                     .next_element::<Value>(())
                     .await?
                     .ok_or_else(|| de::Error::custom("missing Table schema"))?;
-                let schema = TableSchema::try_cast_from(schema, |schema| {
-                    de::Error::custom(format!("invalid Table schema: {schema:?}"))
-                })?;
-                let table = b_table::TableLock::create(schema, ValueCollator::default(), self.dir)
-                    .map_err(de::Error::custom)?;
+
+                let schema = TableSchema::try_from(schema).map_err(de::Error::custom)?;
+                let table =
+                    b_table::TableLock::create(schema, crate::persistence::value_order(), self.dir)
+                        .await
+                        .map_err(de::Error::custom)?;
 
                 seq.next_element::<Rows<Txn>>(table.clone())
                     .await?
                     .ok_or_else(|| de::Error::custom("missing Table rows"))?;
+
                 if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
                     return Err(de::Error::custom("Table payload must be [schema, rows]"));
                 }
@@ -118,5 +122,27 @@ impl<Txn: crate::StorageContext> de::FromStream for DecodedTablePayload<Txn> {
                 txn: std::marker::PhantomData,
             })
             .await
+    }
+}
+
+impl<Txn: crate::StorageContext> IntoView for Table<Txn> {
+    type Txn = Txn;
+
+    type View = crate::view::TableView;
+
+    async fn into_view(self, txn: Txn) -> TCResult<Self::View> {
+        let schema = self.schema().clone();
+        let rows = self
+            .row_stream(txn.id())
+            .await
+            .map_err(|error| txn.storage_error(error))?
+            .map(move |row| {
+                row.map(|row| Value::Tuple(row.into_vec()))
+                    .map_err(TCError::from)
+                    .map_err(|error| txn.storage_error(error))
+            })
+            .boxed();
+
+        Ok(crate::view::TableView { schema, rows })
     }
 }

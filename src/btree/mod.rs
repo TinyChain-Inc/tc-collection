@@ -12,4 +12,5 @@ pub use file::{BTree, BTreeSchema, BTreeSlice, StorageConfig};
 pub use stream::Keys;
 
 #[cfg(test)]
+#[path = "../../tests/unit/btree/tests.rs"]
 mod tests;

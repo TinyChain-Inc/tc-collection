@@ -1,453 +1,509 @@
-use number_general::{FloatType, Number, UIntType};
+//! Select each Tensor route once; operation families own terminal handlers.
+
+use number_general::Number;
 use pathlink::{PathBuf, PathSegment};
 use safecast::CastInto;
+
+use super::{AxisRange, Data, Range, Shape as TensorShape, Tensor, TensorSchema, Typed};
+use crate::{Collection, CollectionState, StorageContext};
 use tc_error::{TCError, TCResult};
-use tc_ir::{Id, Map, Scalar};
+use tc_ir::Map;
 use tc_value::{NumberType, Value, number_type_from_path, number_type_path};
 
-use crate::Collection;
-use crate::route::CollectionState;
-use crate::tensor::{
-    AxisRange, Range, Tensor, TensorReduceResult, batched_matmul, broadcast_add,
-    broadcast_reduce_sum, tensor_op_result, tensor_transpose,
+// Generate concrete borrowing handlers; argument policy stays at this boundary.
+macro_rules! unary_handler {
+    ($($(#[$attr:meta])* $handler:ident => $method:ident),* $(,)?) => {
+        $($(#[$attr])*
+        pub(super) struct $handler<'a, Txn: $crate::StorageContext>(
+            pub(super) &'a $crate::tensor::Tensor<Txn>,
+        );
+
+        $(#[$attr])*
+        impl<'a, S, Txn> tc_ir::Handler<'a, S> for $handler<'a, Txn>
+        where
+            S: $crate::CollectionState<Txn = Txn>,
+            Txn: $crate::StorageContext,
+        {
+            fn post<'txn>(self: Box<Self>) -> Option<tc_ir::PostHandler<'a, 'txn, S>>
+            where
+                'txn: 'a,
+            {
+                Some(Box::new(move |txn, params| {
+                    Box::pin(async move {
+                        super::no_parameters(&params)?;
+                        Ok(super::state(self.0.$method(txn.id()).await?))
+                    })
+                }))
+            }
+        })*
+    };
+}
+
+mod binary;
+mod reduce;
+mod transform;
+mod unary;
+
+use binary::{Add, And, Cond, Div, Eq, Ge, Gt, Le, Log, Lt, Mul, Ne, Or, Pow, Rem, Sub, Xor};
+use reduce::{All, Any, BroadcastReduce, Max, Mean, Min, Norm, Product, Std, Sum};
+use transform::{
+    AsDense, Broadcast, Cast, Copy, CopyValues, Diag, ExpandDims, Flip, Matmul, Mt, Reshape,
+    Squeeze, Transpose,
 };
+#[cfg(feature = "complex")]
+use transform::{Fft, Fft2, Ifft, Ifft2, Mh};
+use unary::{
+    Abs, Acos, Asin, Atan, Cos, Cosh, Exp, IsInf, IsNan, Ln, Not, Round, Sin, Sinh, Tan, Tanh,
+};
+#[cfg(feature = "complex")]
+use unary::{Angle, Conj, Im, Re};
 
-type GetTensorFn<S> = fn(&Tensor, S) -> TCResult<S>;
-type PostTensorFn<S> = fn(&Tensor, Map<S>) -> TCResult<S>;
+struct Root<'a, Txn: StorageContext>(&'a Tensor<Txn>);
 
-struct GetTensor<'a, S> {
-    tensor: &'a Tensor,
-    operation: GetTensorFn<S>,
-    state: std::marker::PhantomData<fn() -> S>,
-}
+struct Dtype<'a, Txn: StorageContext>(&'a Tensor<Txn>);
 
-struct PostTensor<'a, S> {
-    tensor: &'a Tensor,
-    operation: PostTensorFn<S>,
-    state: std::marker::PhantomData<fn() -> S>,
-}
+struct Shape<'a, Txn: StorageContext>(&'a Tensor<Txn>);
 
-struct Transpose<'a, S> {
-    tensor: &'a Tensor,
-    state: std::marker::PhantomData<fn() -> S>,
-}
+struct Size<'a, Txn: StorageContext>(&'a Tensor<Txn>);
 
-impl<S: CollectionState> tc_ir::Route<S> for Tensor {
+struct Ndim<'a, Txn: StorageContext>(&'a Tensor<Txn>);
+
+impl<S: CollectionState<Txn = Txn>, Txn: StorageContext> tc_ir::Route<S> for Tensor<Txn> {
     fn route<'a>(&'a self, path: &[PathSegment]) -> Option<Box<dyn tc_ir::Handler<'a, S> + 'a>> {
-        let handler: Box<dyn tc_ir::Handler<'a, S> + 'a> = match path {
-            [] => Box::new(GetTensor {
-                tensor: self,
-                operation: |tensor, key| {
-                    tensor_state(
-                        tensor
-                            .clone()
-                            .slice(tensor_range_from_state(key, tensor.shape())?),
-                    )
-                },
-                state: std::marker::PhantomData,
-            }),
+        match path {
+            [] => Some(Box::new(Root(self))),
             [segment] => match segment.as_str() {
-                "broadcast" => get_tensor(self, |tensor, key| {
-                    tensor_state(tensor.clone().broadcast(shape_from_state(key)?))
-                }),
-                "cast" => get_tensor(self, |tensor, key| {
-                    tensor_state(tensor.clone().cast(tensor_dtype_from_state(key)?))
-                }),
-                "expand_dims" => get_tensor(self, |tensor, key| {
-                    tensor_state(tensor.clone().expand_dims(optional_shape_from_state(key)?))
-                }),
-                "reshape" => get_tensor(self, |tensor, key| {
-                    tensor_state(tensor.clone().reshape(shape_from_state(key)?))
-                }),
-                "transpose" => Box::new(Transpose {
-                    tensor: self,
-                    state: std::marker::PhantomData,
-                }),
-                "dtype" => post_tensor(self, |tensor, _| {
-                    Ok(S::from(Value::String(
-                        number_type_path(&tensor.number_type()).to_string(),
-                    )))
-                }),
-                "ndim" => post_tensor(self, |tensor, _| {
-                    Ok(S::from(Value::Number(Number::from(
-                        tensor.shape().len() as u64
-                    ))))
-                }),
-                "shape" => post_tensor(self, |tensor, _| {
-                    Ok(S::from(Scalar::Tuple(
-                        tensor
-                            .shape()
-                            .iter()
-                            .map(|dim| Scalar::Value(Value::Number(Number::from(*dim as u64))))
-                            .collect(),
-                    )))
-                }),
-                "size" => post_tensor(self, |tensor, _| {
-                    Ok(S::from(Value::Number(Number::from(tensor.size() as u64))))
-                }),
-                "all" => post_tensor(self, |tensor, _| tensor_truthy_state(tensor, true)),
-                "any" => post_tensor(self, |tensor, _| tensor_truthy_state(tensor, false)),
-                "cond" => post_tensor(self, |tensor, params| {
-                    tensor_state(Tensor::cond(
-                        tensor,
-                        &tensor_param(&params, "then")?,
-                        &tensor_param(&params, "or_else")?,
-                    ))
-                }),
-                "max" => post_tensor(self, |tensor, params| tensor_reduce(tensor, params, "max")),
-                "min" => post_tensor(self, |tensor, params| tensor_reduce(tensor, params, "min")),
-                "mean" => post_tensor(self, |tensor, params| tensor_reduce(tensor, params, "mean")),
-                "norm" => post_tensor(self, |tensor, params| tensor_reduce(tensor, params, "norm")),
-                "product" => post_tensor(self, |tensor, params| {
-                    tensor_reduce(tensor, params, "product")
-                }),
-                "std" => post_tensor(self, |tensor, params| tensor_reduce(tensor, params, "std")),
-                "sum" => post_tensor(self, |tensor, params| tensor_reduce(tensor, params, "sum")),
-                "broadcast_reduce" => post_tensor(self, |tensor, params| {
-                    Ok(S::from(Collection::Tensor(tensor_op_result(
-                        broadcast_reduce_sum(tensor, &shape_param(&params, "target_shape")?),
-                    )?)))
-                }),
-                "matmul" => post_tensor(self, |tensor, params| {
-                    Ok(S::from(Collection::Tensor(tensor_op_result(
-                        batched_matmul(tensor, &tensor_param(&params, "r")?),
-                    )?)))
-                }),
-                "add" => post_tensor(self, |tensor, params| {
-                    Ok(S::from(Collection::Tensor(tensor_op_result(
-                        broadcast_add(tensor, &tensor_param(&params, "r")?),
-                    )?)))
-                }),
-                "sub" => post_tensor(self, |tensor, params| tensor_binary(tensor, params, "sub")),
-                "mul" => post_tensor(self, |tensor, params| tensor_binary(tensor, params, "mul")),
-                "div" => post_tensor(self, |tensor, params| tensor_binary(tensor, params, "div")),
-                "and" => post_tensor(self, |tensor, params| tensor_binary(tensor, params, "and")),
-                "or" => post_tensor(self, |tensor, params| tensor_binary(tensor, params, "or")),
-                "xor" => post_tensor(self, |tensor, params| tensor_binary(tensor, params, "xor")),
-                "not" => post_tensor(self, |tensor, _| tensor_state(tensor.unary_not())),
-                _ => return None,
+                "add" => Some(Box::new(Add(self))),
+                "sub" => Some(Box::new(Sub(self))),
+                "mul" => Some(Box::new(Mul(self))),
+                "div" => Some(Box::new(Div(self))),
+                "pow" => Some(Box::new(Pow(self))),
+                "rem" => Some(Box::new(Rem(self))),
+                "log" => Some(Box::new(Log(self))),
+                "eq" => Some(Box::new(Eq(self))),
+                "ne" => Some(Box::new(Ne(self))),
+                "gt" => Some(Box::new(Gt(self))),
+                "ge" => Some(Box::new(Ge(self))),
+                "lt" => Some(Box::new(Lt(self))),
+                "le" => Some(Box::new(Le(self))),
+                "and" => Some(Box::new(And(self))),
+                "or" => Some(Box::new(Or(self))),
+                "xor" => Some(Box::new(Xor(self))),
+                "matmul" => Some(Box::new(Matmul(self))),
+                "not" => Some(Box::new(Not(self))),
+                "abs" => Some(Box::new(Abs(self))),
+                "exp" => Some(Box::new(Exp(self))),
+                "ln" => Some(Box::new(Ln(self))),
+                "round" => Some(Box::new(Round(self))),
+                "sin" => Some(Box::new(Sin(self))),
+                "asin" => Some(Box::new(Asin(self))),
+                "sinh" => Some(Box::new(Sinh(self))),
+                "cos" => Some(Box::new(Cos(self))),
+                "acos" => Some(Box::new(Acos(self))),
+                "cosh" => Some(Box::new(Cosh(self))),
+                "tan" => Some(Box::new(Tan(self))),
+                "atan" => Some(Box::new(Atan(self))),
+                "tanh" => Some(Box::new(Tanh(self))),
+                "is_nan" => Some(Box::new(IsNan(self))),
+                "is_inf" => Some(Box::new(IsInf(self))),
+                "mt" => Some(Box::new(Mt(self))),
+                "diag" => Some(Box::new(Diag(self))),
+                #[cfg(feature = "complex")]
+                "conj" => Some(Box::new(Conj(self))),
+                #[cfg(feature = "complex")]
+                "re" => Some(Box::new(Re(self))),
+                #[cfg(feature = "complex")]
+                "im" => Some(Box::new(Im(self))),
+                #[cfg(feature = "complex")]
+                "angle" => Some(Box::new(Angle(self))),
+                #[cfg(feature = "complex")]
+                "mh" => Some(Box::new(Mh(self))),
+                #[cfg(feature = "complex")]
+                "fft2" => Some(Box::new(Fft2(self))),
+                #[cfg(feature = "complex")]
+                "ifft2" => Some(Box::new(Ifft2(self))),
+                #[cfg(feature = "complex")]
+                "fft" => Some(Box::new(Fft(self))),
+                #[cfg(feature = "complex")]
+                "ifft" => Some(Box::new(Ifft(self))),
+                "sum" => Some(Box::new(Sum(self))),
+                "product" => Some(Box::new(Product(self))),
+                "min" => Some(Box::new(Min(self))),
+                "max" => Some(Box::new(Max(self))),
+                "mean" => Some(Box::new(Mean(self))),
+                "norm" => Some(Box::new(Norm(self))),
+                "std" => Some(Box::new(Std(self))),
+                "dtype" => Some(Box::new(Dtype(self))),
+                "shape" => Some(Box::new(Shape(self))),
+                "size" => Some(Box::new(Size(self))),
+                "ndim" => Some(Box::new(Ndim(self))),
+                "reshape" => Some(Box::new(Reshape(self))),
+                "broadcast" => Some(Box::new(Broadcast(self))),
+                "expand_dims" => Some(Box::new(ExpandDims(self))),
+                "squeeze" => Some(Box::new(Squeeze(self))),
+                "flip" => Some(Box::new(Flip(self))),
+                "cast" => Some(Box::new(Cast(self))),
+                "transpose" => Some(Box::new(Transpose(self))),
+                "all" => Some(Box::new(All(self))),
+                "any" => Some(Box::new(Any(self))),
+                "cond" => Some(Box::new(Cond(self))),
+                "broadcast_reduce" => Some(Box::new(BroadcastReduce(self))),
+                "copy" => Some(Box::new(Copy(self))),
+                "copy_values" => Some(Box::new(CopyValues(self))),
+                "as_dense" => Some(Box::new(AsDense(self))),
+                _ => None,
             },
-            _ => return None,
-        };
-        Some(handler)
-    }
-}
-
-fn get_tensor<'a, S: CollectionState>(
-    tensor: &'a Tensor,
-    operation: GetTensorFn<S>,
-) -> Box<dyn tc_ir::Handler<'a, S> + 'a> {
-    Box::new(GetTensor {
-        tensor,
-        operation,
-        state: std::marker::PhantomData,
-    })
-}
-
-fn post_tensor<'a, S: CollectionState>(
-    tensor: &'a Tensor,
-    operation: PostTensorFn<S>,
-) -> Box<dyn tc_ir::Handler<'a, S> + 'a> {
-    Box::new(PostTensor {
-        tensor,
-        operation,
-        state: std::marker::PhantomData,
-    })
-}
-
-fn tensor_state<S: CollectionState>(tensor: Result<Tensor, impl std::fmt::Display>) -> TCResult<S> {
-    tensor
-        .map(Collection::Tensor)
-        .map(S::from)
-        .map_err(TCError::bad_request)
-}
-
-fn tensor_transpose_get<S: CollectionState>(tensor: &Tensor, key: S) -> TCResult<S> {
-    tensor_transpose(tensor, &shape_from_state(key)?)
-        .map(Collection::Tensor)
-        .map(S::from)
-        .map_err(TCError::bad_request)
-}
-
-fn tensor_transpose_post<S: CollectionState>(tensor: &Tensor, params: Map<S>) -> TCResult<S> {
-    Ok(S::from(Collection::Tensor(tensor_op_result(
-        tensor_transpose(tensor, &shape_param(&params, "perm")?),
-    )?)))
-}
-
-fn tensor_reduce<S: CollectionState>(tensor: &Tensor, params: Map<S>, op: &str) -> TCResult<S> {
-    match tensor
-        .reduce_axes(
-            op,
-            optional_axes_param(&params)?,
-            bool_param(&params, "keepdims")?,
-        )
-        .map_err(TCError::bad_request)?
-    {
-        TensorReduceResult::Scalar(number) => Ok(S::from(Value::Number(number))),
-        TensorReduceResult::Tensor(tensor) => Ok(S::from(Collection::Tensor(tensor))),
-    }
-}
-
-fn tensor_binary<S: CollectionState>(tensor: &Tensor, params: Map<S>, op: &str) -> TCResult<S> {
-    tensor
-        .binary_op(&tensor_param(&params, "r")?, op)
-        .map(Collection::Tensor)
-        .map(S::from)
-        .map_err(TCError::bad_request)
-}
-
-pub(crate) fn tensor_literal<S: CollectionState>(key: S, value: S) -> TCResult<Tensor> {
-    let key = key.into_tuple()?;
-    if key.len() != 2 {
-        return Err(TCError::bad_request(
-            "tensor literal key must be [dtype, shape]",
-        ));
-    }
-    let dtype = tensor_dtype_from_state(key[0].clone())?;
-    let shape = shape_from_state(key[1].clone())?;
-    let values = numbers_from_state(value, "tensor literal values")?;
-    match dtype {
-        NumberType::Float(FloatType::F32) => {
-            Tensor::dense_f32(shape, values.into_iter().map(CastInto::cast_into).collect())
-                .map_err(TCError::bad_request)
+            _ => None,
         }
-        NumberType::Float(FloatType::F64) => {
-            Tensor::dense_f64(shape, values.into_iter().map(CastInto::cast_into).collect())
-                .map_err(TCError::bad_request)
-        }
-        NumberType::UInt(UIntType::U64) => {
-            Tensor::dense_u64(shape, values.into_iter().map(CastInto::cast_into).collect())
-                .map_err(TCError::bad_request)
-        }
-        dtype => Err(TCError::bad_request(format!(
-            "unsupported tensor literal dtype {dtype}"
-        ))),
     }
 }
 
-fn tensor_param<S: CollectionState>(params: &Map<S>, name: &str) -> TCResult<Tensor> {
-    required_param(params, name)?.into_tensor()
+fn state<S: CollectionState>(tensor: Tensor<S::Txn>) -> S {
+    S::from(Collection::Tensor(tensor))
 }
-fn shape_param<S: CollectionState>(params: &Map<S>, name: &str) -> TCResult<Vec<usize>> {
-    shape_from_state(required_param(params, name)?)
+
+fn parameter<S: CollectionState>(params: &mut Map<S>, name: &str) -> TCResult<S> {
+    params
+        .remove(name)
+        .ok_or_else(|| TCError::bad_request(format!("missing Tensor parameter {name}")))
 }
-fn optional_axes_param<S: CollectionState>(params: &Map<S>) -> TCResult<Option<Vec<usize>>> {
-    if let Some(axes) = optional_param(params, "axes")? {
-        return optional_axes_from_state(axes);
+
+fn optional<S: CollectionState>(params: &mut Map<S>, name: &str) -> Option<S> {
+    params.remove(name).filter(|value| !value.is_none())
+}
+
+fn no_parameters<S>(params: &Map<S>) -> TCResult<()> {
+    if let Some(name) = params.keys().next() {
+        return Err(TCError::bad_request(format!(
+            "unexpected Tensor parameter {name}"
+        )));
     }
-    optional_param(params, "axis")?
-        .map(optional_axes_from_state)
-        .transpose()
-        .map(|axes| axes.flatten())
+
+    Ok(())
 }
-fn bool_param<S: CollectionState>(params: &Map<S>, name: &str) -> TCResult<bool> {
-    optional_param(params, name)?
-        .map(|value| value.into_value())
-        .transpose()?
-        .map(|value| match value {
-            Value::Number(number) => Ok(number.cast_into()),
-            other => Err(TCError::bad_request(format!(
-                "expected tensor {name} boolean, found {other:?}"
-            ))),
-        })
-        .transpose()
-        .map(|value| value.unwrap_or(false))
-}
-fn required_param<S: CollectionState>(params: &Map<S>, name: &str) -> TCResult<S> {
-    optional_param(params, name)?
-        .ok_or_else(|| TCError::bad_request(format!("missing tensor parameter {name}")))
-}
-fn optional_param<S: CollectionState>(params: &Map<S>, name: &str) -> TCResult<Option<S>> {
-    let id: Id = name
-        .parse()
-        .map_err(|err| TCError::internal(format!("invalid tensor parameter {name}: {err}")))?;
-    Ok(params.get(&id).cloned())
-}
-fn numbers_from_state<S: CollectionState>(state: S, context: &str) -> TCResult<Vec<Number>> {
+
+fn shape<S: CollectionState>(state: S) -> TCResult<TensorShape> {
     state
         .into_tuple()?
         .into_iter()
-        .map(|state| match state.into_value()? {
-            Value::Number(number) => Ok(number),
-            other => Err(TCError::bad_request(format!(
-                "expected {context} numbers, found {other:?}"
-            ))),
+        .map(|value| match value.into_value()? {
+            Value::Number(number) => super::schema::dimension(number),
+            _ => Err(TCError::bad_request("expected a Tensor dimension")),
         })
         .collect()
 }
-fn shape_from_state<S: CollectionState>(state: S) -> TCResult<Vec<usize>> {
-    numbers_from_state(state, "tensor shape")?
+
+fn axes<S: CollectionState>(state: S) -> TCResult<Vec<usize>> {
+    if let Some(number) = state.as_number() {
+        return Ok(vec![
+            usize::try_from(super::schema::dimension(number)?).map_err(TCError::bad_request)?,
+        ]);
+    }
+
+    shape(state)?
         .into_iter()
-        .map(|number| number_to_usize(number, "tensor shape dimension"))
+        .map(|axis| usize::try_from(axis).map_err(TCError::bad_request))
         .collect()
 }
-fn optional_shape_from_state<S: CollectionState>(state: S) -> TCResult<Option<Vec<usize>>> {
-    if state.is_none() {
-        Ok(None)
-    } else {
-        shape_from_state(state).map(Some)
-    }
-}
-fn optional_axes_from_state<S: CollectionState>(state: S) -> TCResult<Option<Vec<usize>>> {
-    if state.is_none() {
-        return Ok(None);
-    };
-    match state.clone().into_value() {
-        Ok(Value::Number(number)) => Ok(Some(vec![number_to_usize(
-            number,
-            "tensor reduction axis",
-        )?])),
-        _ => shape_from_state(state).map(Some),
-    }
-}
-fn tensor_dtype_from_state<S: CollectionState>(state: S) -> TCResult<NumberType> {
+
+fn dtype<S: CollectionState>(state: S) -> TCResult<NumberType> {
     let raw = match state.into_value()? {
-        Value::String(dtype) => dtype,
+        Value::String(raw) => raw,
         Value::Link(link) => link.to_string(),
-        other => {
-            return Err(TCError::bad_request(format!(
-                "expected tensor dtype string or link, found {other:?}"
-            )));
-        }
+        _ => return Err(TCError::bad_request("expected Tensor dtype path")),
     };
-    parse_tensor_number_type(&raw)
-        .ok_or_else(|| TCError::bad_request(format!("unsupported tensor dtype {raw}")))
-}
-fn parse_tensor_number_type(raw: &str) -> Option<NumberType> {
-    match raw {
-        "f32" => Some(NumberType::Float(FloatType::F32)),
-        "f64" => Some(NumberType::Float(FloatType::F64)),
-        "u64" => Some(NumberType::UInt(UIntType::U64)),
+
+    let dtype = match raw.as_str() {
+        "u8" => Some(NumberType::UInt(number_general::UIntType::U8)),
+        "u16" => Some(NumberType::UInt(number_general::UIntType::U16)),
+        "u32" => Some(NumberType::UInt(number_general::UIntType::U32)),
+        "u64" => Some(NumberType::UInt(number_general::UIntType::U64)),
+        "i8" => Some(NumberType::Int(number_general::IntType::I8)),
+        "i16" => Some(NumberType::Int(number_general::IntType::I16)),
+        "i32" => Some(NumberType::Int(number_general::IntType::I32)),
+        "i64" => Some(NumberType::Int(number_general::IntType::I64)),
+        "f32" => Some(NumberType::Float(number_general::FloatType::F32)),
+        "f64" => Some(NumberType::Float(number_general::FloatType::F64)),
+        "c32" => Some(NumberType::Complex(number_general::ComplexType::C32)),
+        "c64" => Some(NumberType::Complex(number_general::ComplexType::C64)),
         _ => raw
             .parse::<PathBuf>()
             .ok()
-            .and_then(|path| number_type_from_path(path.as_ref())),
-    }
-}
-fn tensor_range_from_state<S: CollectionState>(bounds: S, shape: &[usize]) -> TCResult<Range> {
-    let bounds = bounds.into_tuple()?;
-    if bounds.len() != shape.len() {
-        return Err(TCError::bad_request(format!(
-            "tensor slice bounds rank {} does not match tensor rank {}",
-            bounds.len(),
-            shape.len()
-        )));
+            .and_then(|path| number_type_from_path(&path)),
     };
-    bounds
+
+    dtype.ok_or_else(|| TCError::bad_request("unsupported Tensor dtype"))
+}
+
+fn range<S: CollectionState>(state: S, shape: &[u64]) -> TCResult<Range> {
+    if state.is_none() {
+        return Ok(shape.iter().map(|&dim| AxisRange::In(0, dim, 1)).collect());
+    }
+
+    let values = state.into_tuple()?;
+    if values.len() != shape.len() {
+        return Err(TCError::bad_request("Tensor selection rank mismatch"));
+    }
+
+    values
         .into_iter()
-        .zip(shape.iter().copied())
-        .enumerate()
-        .map(|(axis, (bound, dim))| tensor_axis_range_from_state(bound, axis, dim))
+        .zip(shape)
+        .map(|(value, &dim)| {
+            if value.is_none() {
+                return Ok(AxisRange::In(0, dim, 1));
+            }
+
+            if let Some(number) = value.as_number() {
+                let coord = super::schema::dimension(number)?;
+                if coord >= dim {
+                    return Err(TCError::bad_request("Tensor coordinate out of bounds"));
+                }
+
+                return Ok(AxisRange::At(coord));
+            }
+
+            let fields = value.into_tuple()?;
+            if fields.is_empty() || fields.len() > 3 {
+                return Err(TCError::bad_request("expected [start, stop, step]"));
+            }
+
+            let mut numbers = fields.into_iter().map(|value| match value.into_value()? {
+                Value::Number(number) => super::schema::dimension(number),
+                _ => Err(TCError::bad_request("expected unsigned range component")),
+            });
+
+            let start = numbers.next().expect("nonempty")?;
+            let stop = numbers.next().transpose()?.unwrap_or(dim);
+            let step = numbers.next().transpose()?.unwrap_or(1);
+            if step == 0 || start > stop || stop > dim {
+                return Err(TCError::bad_request("invalid Tensor range"));
+            }
+
+            Ok(AxisRange::In(start, stop, step))
+        })
         .collect()
 }
-fn tensor_axis_range_from_state<S: CollectionState>(
-    state: S,
-    axis: usize,
-    dim: usize,
-) -> TCResult<AxisRange> {
-    if let Ok(Value::Number(number)) = state.clone().into_value() {
-        let index = number_to_usize(number, "tensor slice index")?;
-        if index >= dim {
-            return Err(TCError::bad_request(format!(
-                "tensor slice index {index} is out of bounds for axis {axis} with dim {dim}"
-            )));
-        };
-        return Ok(AxisRange::At(index));
+
+impl<'a, S: CollectionState<Txn = Txn>, Txn: StorageContext> tc_ir::Handler<'a, S>
+    for Root<'a, Txn>
+{
+    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, S>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, key| {
+            Box::pin(async move {
+                let key = S::from(key);
+                if key.is_none() {
+                    return Ok(state(self.0.clone().into_read_only()));
+                }
+
+                let range = range(key, self.0.shape())?;
+                if range.iter().all(|axis| matches!(axis, AxisRange::At(_))) {
+                    let coord: Vec<u64> = range
+                        .iter()
+                        .map(|axis| match axis {
+                            AxisRange::At(coord) => *coord,
+                            _ => unreachable!(),
+                        })
+                        .collect();
+
+                    return Ok(S::from(Value::Number(
+                        self.0.read_value(txn.id(), &coord).await?,
+                    )));
+                }
+
+                Ok(state(self.0.clone().slice(range)?))
+            })
+        }))
     }
-    let parts = state.into_tuple()?;
-    if parts.is_empty() || parts.len() > 3 {
+
+    fn put<'txn>(self: Box<Self>) -> Option<tc_ir::PutHandler<'a, 'txn, S>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, key, value| {
+            Box::pin(async move {
+                let range = range(S::from(key), self.0.shape())?;
+                if let Some(number) = value.as_number() {
+                    if range.iter().all(|axis| matches!(axis, AxisRange::At(_))) {
+                        let coord: Vec<u64> = range
+                            .iter()
+                            .map(|axis| match axis {
+                                AxisRange::At(coord) => *coord,
+                                _ => unreachable!(),
+                            })
+                            .collect();
+
+                        return self.0.write_value(txn, &coord, number).await;
+                    }
+
+                    return self.0.fill_range(txn, range, number).await;
+                }
+
+                self.0
+                    .write_tensor_range(txn, range, value.into_tensor()?)
+                    .await
+            })
+        }))
+    }
+
+    fn delete<'txn>(self: Box<Self>) -> Option<tc_ir::DeleteHandler<'a, 'txn, S>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, key| {
+            Box::pin(async move {
+                let range = range(S::from(key), self.0.shape())?;
+                if range.iter().all(|axis| matches!(axis, AxisRange::At(_))) {
+                    let coord: Vec<u64> = range
+                        .iter()
+                        .map(|axis| match axis {
+                            AxisRange::At(coord) => *coord,
+                            _ => unreachable!(),
+                        })
+                        .collect();
+
+                    self.0.write_value(txn, &coord, Number::from(0u8)).await
+                } else {
+                    self.0.fill_range(txn, range, Number::from(0u8)).await
+                }
+            })
+        }))
+    }
+}
+
+impl<'a, S: CollectionState<Txn = Txn>, Txn: StorageContext> tc_ir::Handler<'a, S>
+    for Dtype<'a, Txn>
+{
+    fn post<'txn>(self: Box<Self>) -> Option<tc_ir::PostHandler<'a, 'txn, S>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, params| {
+            Box::pin(async move {
+                let _ = (txn, params);
+                Ok(S::from(Value::String(
+                    number_type_path(&self.0.number_type()).to_string(),
+                )))
+            })
+        }))
+    }
+}
+
+impl<'a, S: CollectionState<Txn = Txn>, Txn: StorageContext> tc_ir::Handler<'a, S>
+    for Shape<'a, Txn>
+{
+    fn post<'txn>(self: Box<Self>) -> Option<tc_ir::PostHandler<'a, 'txn, S>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, params| {
+            Box::pin(async move {
+                let _ = (txn, params);
+                Ok(S::from(Value::Tuple(
+                    self.0.shape().iter().copied().map(Value::from).collect(),
+                )))
+            })
+        }))
+    }
+}
+
+impl<'a, S: CollectionState<Txn = Txn>, Txn: StorageContext> tc_ir::Handler<'a, S>
+    for Size<'a, Txn>
+{
+    fn post<'txn>(self: Box<Self>) -> Option<tc_ir::PostHandler<'a, 'txn, S>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, params| {
+            Box::pin(async move {
+                let _ = (txn, params);
+                Ok(S::from(Value::from(self.0.size()?)))
+            })
+        }))
+    }
+}
+
+impl<'a, S: CollectionState<Txn = Txn>, Txn: StorageContext> tc_ir::Handler<'a, S>
+    for Ndim<'a, Txn>
+{
+    fn post<'txn>(self: Box<Self>) -> Option<tc_ir::PostHandler<'a, 'txn, S>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, params| {
+            Box::pin(async move {
+                let _ = (txn, params);
+                Ok(S::from(Value::from(self.0.shape().len() as u64)))
+            })
+        }))
+    }
+}
+
+pub(crate) async fn tensor_literal<S: CollectionState>(
+    txn: &S::Txn,
+    key: S,
+    values: S,
+) -> TCResult<Tensor<S::Txn>> {
+    let mut fields = key.into_tuple()?;
+    if !(2..=3).contains(&fields.len()) {
         return Err(TCError::bad_request(
-            "tensor slice range must have 1 to 3 components",
+            "Tensor literal key must be [dtype, shape, optional sparse axis]",
         ));
-    };
-    let start = state_usize(parts[0].clone(), "tensor slice start")?;
-    let stop = parts
-        .get(1)
-        .cloned()
-        .map(|value| state_usize(value, "tensor slice stop"))
-        .transpose()?
-        .unwrap_or(dim);
-    let step = parts
-        .get(2)
-        .cloned()
-        .map(|value| state_usize(value, "tensor slice step"))
-        .transpose()?
-        .unwrap_or(1);
-    if step == 0 || start > stop || stop > dim {
-        return Err(TCError::bad_request(format!(
-            "invalid tensor slice range for axis {axis}"
-        )));
-    };
-    Ok(AxisRange::In(start, stop, step))
-}
-fn state_usize<S: CollectionState>(state: S, context: &str) -> TCResult<usize> {
-    match state.into_value()? {
-        Value::Number(number) => number_to_usize(number, context),
-        other => Err(TCError::bad_request(format!(
-            "expected {context} number, found {other:?}"
-        ))),
     }
-}
-fn number_to_usize(number: Number, context: &str) -> TCResult<usize> {
-    let value: i64 = number.cast_into();
-    if value < 0 {
-        return Err(TCError::bad_request(format!(
-            "expected {context} to be non-negative"
-        )));
+
+    let sparse_axis = match (fields.len() == 3).then(|| fields.pop().expect("literal arity")) {
+        None => None,
+        Some(value) => match value.into_value()? {
+            Value::Number(axis) => Some(
+                usize::try_from(super::schema::dimension(axis)?).map_err(TCError::bad_request)?,
+            ),
+            _ => return Err(TCError::bad_request("expected a numeric sparse axis")),
+        },
     };
-    Ok(value as usize)
-}
-fn tensor_truthy_state<S: CollectionState>(tensor: &Tensor, all: bool) -> TCResult<S> {
-    let values = tensor.values_f64().map_err(TCError::bad_request)?;
-    Ok(S::from(Value::Number(Number::Bool(
-        (if all {
-            values.iter().all(|value| *value != 0.0)
+
+    let mut fields = fields.into_iter();
+    let schema = TensorSchema::new(
+        dtype(fields.next().expect("literal arity"))?,
+        shape(fields.next().expect("literal arity"))?,
+        sparse_axis,
+    )?;
+
+    let sparse = schema.is_sparse();
+    let values = values.into_tuple()?;
+    if !sparse && values.len() as u64 != schema.native().shape().iter().product::<u64>() {
+        return Err(TCError::bad_request(
+            "Tensor literal value count differs from shape",
+        ));
+    }
+
+    let capacity = fensor::MAX_BLOCK_CAPACITY;
+    let dir = txn.subcontext_unique().context().await?;
+    let data = dtype_factory!(schema.dtype(), T => {
+        if sparse {
+            let entries = futures::stream::iter(values.into_iter().map(|value| {
+                let fields = value.into_tuple()?;
+                if fields.len() != 2 { return Err(TCError::bad_request("expected sparse [coordinate, value]")); }
+                let mut fields = fields.into_iter();
+                let coord = shape(fields.next().expect("sparse entry arity"))?;
+                let Value::Number(number) = fields.next().expect("sparse entry arity").into_value()? else {
+                    return Err(TCError::bad_request("expected numeric Tensor value"));
+                };
+                if number == Number::from(0u8) { return Err(TCError::bad_request("sparse values must be nonzero")); }
+                Ok((coord.into_vec(), number.cast_into()))
+            }));
+            fensor::Tensor::<_, T>::from_sparse_elements(dir, schema.native().clone(), schema.layout(), capacity, entries).await?
         } else {
-            values.iter().any(|value| *value != 0.0)
-        })
-        .into(),
-    ))))
-}
+            let values = futures::stream::iter(values.into_iter().map(|value| {
+                let Value::Number(number) = value.into_value()? else {
+                    return Err(TCError::bad_request("expected numeric Tensor value"));
+                };
+                Ok::<T, TCError>(number.cast_into())
+            }));
+            fensor::Tensor::<_, T>::from_values(dir, schema.native().clone(), capacity, values).await?
+        }
+    }, dtype => return Err(TCError::bad_request(format!("unsupported Tensor dtype {dtype}"))));
 
-impl<'a, S: CollectionState> tc_ir::Handler<'a, S> for GetTensor<'a, S> {
-    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, S>>
-    where
-        'txn: 'a,
-    {
-        Some(Box::new(move |_txn, key| {
-            Box::pin(async move { (self.operation)(self.tensor, S::from(key)) })
-        }))
-    }
-}
-
-impl<'a, S: CollectionState> tc_ir::Handler<'a, S> for PostTensor<'a, S> {
-    fn post<'txn>(self: Box<Self>) -> Option<tc_ir::PostHandler<'a, 'txn, S>>
-    where
-        'txn: 'a,
-    {
-        Some(Box::new(move |_txn, params| {
-            Box::pin(async move { (self.operation)(self.tensor, params) })
-        }))
-    }
-}
-
-impl<'a, S: CollectionState> tc_ir::Handler<'a, S> for Transpose<'a, S> {
-    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, S>>
-    where
-        'txn: 'a,
-    {
-        Some(Box::new(move |_txn, key| {
-            Box::pin(async move { tensor_transpose_get(self.tensor, S::from(key)) })
-        }))
-    }
-
-    fn post<'txn>(self: Box<Self>) -> Option<tc_ir::PostHandler<'a, 'txn, S>>
-    where
-        'txn: 'a,
-    {
-        Some(Box::new(move |_txn, params| {
-            Box::pin(async move { tensor_transpose_post(self.tensor, params) })
-        }))
-    }
+    Ok(Tensor { data })
 }

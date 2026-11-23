@@ -1,12 +1,11 @@
 use destream::{de, en};
 use number_general::Number;
-use safecast::TryCastFrom;
-use tc_value::class::NativeClass;
-use tc_value::{Value, ValueType};
+use safecast::{CastFrom, TryCastFrom};
 
 use super::{BTree, BTreeSchema};
+use tc_value::{Value, ValueType};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BTreeColumnSchema {
     pub name: String,
     pub dtype: ValueType,
@@ -15,10 +14,8 @@ pub struct BTreeColumnSchema {
 
 impl From<BTreeColumnSchema> for Value {
     fn from(column: BTreeColumnSchema) -> Self {
-        let mut fields = vec![
-            Value::from(column.name),
-            Value::from(column.dtype.path().to_string()),
-        ];
+        let mut fields = vec![Value::from(column.name), Value::cast_from(column.dtype)];
+
         if let Some(size) = column.max_size {
             fields.push(Value::Number(size));
         }
@@ -29,13 +26,21 @@ impl From<BTreeColumnSchema> for Value {
 
 impl TryCastFrom<Value> for BTreeColumnSchema {
     fn can_cast_from(value: &Value) -> bool {
-        Self::opt_cast_from(value.clone()).is_some()
+        let Value::Tuple(fields) = value else {
+            return false;
+        };
+
+        (2..=3).contains(&fields.len())
+            && matches!(&fields[0], Value::String(_))
+            && ValueType::can_cast_from(&fields[1])
+            && fields.get(2).is_none_or(Number::can_cast_from)
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
         let Value::Tuple(fields) = value else {
             return None;
         };
+
         if !(2..=3).contains(&fields.len()) {
             return None;
         }
@@ -44,10 +49,8 @@ impl TryCastFrom<Value> for BTreeColumnSchema {
         let Value::String(name) = fields.next()? else {
             return None;
         };
-        let Value::String(dtype) = fields.next()? else {
-            return None;
-        };
-        let path = dtype.as_str().parse::<pathlink::PathBuf>().ok()?;
+
+        let dtype = ValueType::opt_cast_from(fields.next()?)?;
         let max_size = match fields.next() {
             Some(Value::Number(size)) => Some(size),
             None => None,
@@ -55,8 +58,8 @@ impl TryCastFrom<Value> for BTreeColumnSchema {
         };
 
         Some(Self {
-            name: name.to_string(),
-            dtype: ValueType::from_path(&path)?,
+            name,
+            dtype,
             max_size,
         })
     }
@@ -78,19 +81,11 @@ impl de::FromStream for BTreeColumnSchema {
     }
 }
 
-impl TryCastFrom<Vec<BTreeColumnSchema>> for BTreeSchema {
-    fn can_cast_from(columns: &Vec<BTreeColumnSchema>) -> bool {
-        !columns.is_empty()
-    }
+impl TryFrom<&[BTreeColumnSchema]> for BTreeSchema {
+    type Error = tc_error::TCError;
 
-    fn opt_cast_from(columns: Vec<BTreeColumnSchema>) -> Option<Self> {
-        if columns.is_empty() {
-            return None;
-        }
-
-        Some(Self::from_key_types(
-            columns.into_iter().map(|column| column.dtype).collect(),
-        ))
+    fn try_from(columns: &[BTreeColumnSchema]) -> Result<Self, Self::Error> {
+        Self::from_key_types(columns.iter().map(|column| column.dtype.clone()).collect())
     }
 }
 
@@ -186,10 +181,13 @@ impl<Txn: crate::StorageContext> de::FromStream for DecodedBTreePayload<Txn> {
                     .await?
                     .ok_or_else(|| de::Error::custom("missing BTree schema"))?;
 
-                let btree_schema = BTreeSchema::try_cast_from(schema.clone(), |schema| {
-                    de::Error::custom(format!("invalid BTree schema: {schema:?}"))
-                })?;
-                let btree = BTree::with_schema(self.persistent_dir, btree_schema);
+                let btree_schema =
+                    BTreeSchema::try_from(schema.as_slice()).map_err(de::Error::custom)?;
+
+                let btree = BTree::try_with_schema(self.persistent_dir, btree_schema)
+                    .await
+                    .map_err(de::Error::custom)?;
+
                 seq.next_element::<BTreeRows<Txn>>(BTreeRowsContext {
                     btree: btree.clone(),
                 })

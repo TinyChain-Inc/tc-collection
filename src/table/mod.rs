@@ -12,19 +12,19 @@ mod schema;
 mod stream;
 mod view;
 
+pub use b_table::{ColumnRange, Range, Row};
+use collate::CollateRef;
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
+
 pub use codec::DecodedTablePayload;
 pub use file::PersistentTable;
 pub use schema::{Column, TableIndexSchema, TableSchema};
 pub use stream::Rows;
-pub use view::{Limited, Selection, TableSlice};
-
-pub use b_table::{ColumnRange, Range, Row};
-use futures::TryStreamExt;
-use futures::{StreamExt, stream::BoxStream};
 use tc_error::{TCError, TCResult};
-use tc_ir::TxnId;
-use tc_ir::{Id, Map};
+use tc_ir::{Id, Map, Transact, TxnId};
 use tc_value::Value;
+pub use view::{Limited, Selection, TableSlice};
 
 /// A relational database table, or a view of one.
 ///
@@ -78,25 +78,84 @@ impl<Txn: crate::StorageContext> From<Selection<Txn>> for Table<Txn> {
 }
 
 impl<Txn: crate::StorageContext> Table<Txn> {
-    /// Copy the visible rows into unpublished caller-delegated storage.
-    pub async fn copy_into(
+    pub(crate) async fn hash_contents(&self, id: TxnId) -> TCResult<tc_ir::Sha256Hash> {
+        Ok(async_hash::hash_try_stream::<async_hash::Sha256, _, _, _>(
+            Box::pin(self.row_stream(id))
+                .await?
+                .map_ok(|row| row.into_vec()),
+        )
+        .await?)
+    }
+
+    /// Materialize a view whose order can be represented by canonical storage.
+    pub async fn materialize(
         &self,
         txn: &Txn,
         dir: freqfs::DirLock<Txn::File>,
     ) -> TCResult<PersistentTable<Txn>> {
-        let target = PersistentTable::try_new(dir, self.schema().clone())?;
+        match self {
+            Self::File(_) | Self::Local(_) => {}
+            Self::Slice(view) => view.validate_materialization()?,
+            Self::Limited(view) => view.validate_materialization()?,
+            Self::Selection(view) => view.validate_materialization()?,
+        }
+
+        let target = PersistentTable::try_new(dir, self.schema().clone()).await?;
 
         let mut rows = self.row_stream(txn.id()).await?;
-        while let Some(row) = rows.try_next().await? {
-            target.load_literal_row(row.into_vec()).await?;
+        let collator = crate::persistence::value_order();
+        let key_len = self.schema().key().len();
+        if let Some(mut previous) = rows.try_next().await? {
+            while let Some(row) = rows.try_next().await? {
+                let previous_key = &previous[..key_len];
+                let key = &row[..key_len];
+                let tied = collator.range_collator().cmp_ref(previous_key, key).is_eq();
+                if previous_key == key || (tied && target.contains_literal_key(key).await?) {
+                    return Err(freqfs::IntegrityError::invalid_data(
+                        "ambiguous Table primary key during copying",
+                    )
+                    .into());
+                }
+
+                if collator.key_collator().cmp(&previous, &row).is_gt() {
+                    return Err(TCError::bad_request(
+                        "cannot materialize Table rows outside canonical key order",
+                    ));
+                }
+
+                let completed = std::mem::replace(&mut previous, row);
+                target.load_literal_row(completed.into_vec()).await?;
+            }
+
+            target.load_literal_row(previous.into_vec()).await?;
         }
 
         target.sync().await?;
         Ok(target)
     }
 
+    pub(crate) async fn restore_from(&self, txn: &Txn, source: &Self) -> TCResult<()> {
+        self.persistent()?
+            .restore_from(txn, source.persistent()?)
+            .await
+    }
+
     pub fn is_persistent(&self) -> bool {
         matches!(self, Self::File(_))
+    }
+
+    /// Return an alias with read access only, including for a full-table read.
+    pub(crate) fn read_view(&self) -> Self {
+        match self {
+            Self::File(table) => Self::Slice(table.slice(Range::default(), &[], false)),
+            Self::Local(table) => Self::Slice(TableSlice::local(
+                table.clone(),
+                Range::default(),
+                Vec::new(),
+                false,
+            )),
+            _ => self.clone(),
+        }
     }
 
     pub(crate) fn persistent(&self) -> TCResult<&PersistentTable<Txn>> {
@@ -108,18 +167,12 @@ impl<Txn: crate::StorageContext> Table<Txn> {
 
     /// Synchronize canonical storage of a persistent owner.
     pub async fn sync(&self) -> TCResult<()> {
-        match self {
-            Self::File(table) => table.sync().await.map_err(Into::into),
-            _ => Err(TCError::bad_request("expected a persistent Table owner")),
-        }
+        self.persistent()?.sync().await.map_err(Into::into)
     }
 
     /// Explicitly make canonical storage durable without publishing pending versions.
     pub async fn sync_all(&self) -> TCResult<()> {
-        match self {
-            Self::File(table) => table.sync_all().await.map_err(Into::into),
-            _ => Err(TCError::bad_request("expected a persistent Table owner")),
-        }
+        self.persistent()?.sync_all().await.map_err(Into::into)
     }
 
     pub fn schema(&self) -> &TableSchema {
@@ -165,6 +218,14 @@ impl<Txn: crate::StorageContext> Table<Txn> {
                 order.to_vec(),
                 reverse,
             )),
+            Self::Slice(table) => {
+                let slice = table.slice(range)?;
+                Ok(if order.is_empty() && !reverse {
+                    slice
+                } else {
+                    slice.order_by(order, reverse)
+                })
+            }
             _ => Err(TCError::bad_request(
                 "cannot slice an already transformed Table view",
             )),
@@ -181,8 +242,12 @@ impl<Txn: crate::StorageContext> Table<Txn> {
     }
 
     pub(crate) fn select(&self, columns: &[Id]) -> TCResult<Selection<Txn>> {
-        self.slice(Range::default(), &[], false)
-            .and_then(|slice| slice.select(columns.to_vec()))
+        match self {
+            Self::Limited(table) => table.select(columns.to_vec()),
+            _ => self
+                .slice(Range::default(), &[], false)
+                .and_then(|slice| slice.select(columns.to_vec())),
+        }
     }
 
     pub(crate) async fn read_row(
@@ -191,8 +256,9 @@ impl<Txn: crate::StorageContext> Table<Txn> {
         key: &[Value],
     ) -> TCResult<Option<Row<Value>>> {
         match self {
-            Self::File(table) => Ok(table.read_row(txn_id, key).await),
-            Self::Local(table) => file::get_row(table, key).await.map_err(TCError::from),
+            Self::File(table) => table.read_row(txn_id, key).await,
+            Self::Local(table) => table.get_row(key).await.map_err(TCError::from),
+            Self::Slice(table) => table.read_row(txn_id, key).await,
             _ => Err(TCError::bad_request(
                 "cannot read a row from this Table view",
             )),
@@ -201,11 +267,9 @@ impl<Txn: crate::StorageContext> Table<Txn> {
 
     pub(crate) async fn contains_row(&self, txn_id: TxnId, key: &[Value]) -> TCResult<bool> {
         match self {
-            Self::File(table) => Ok(table.contains_row(txn_id, key).await),
-            Self::Local(table) => file::get_row(table, key)
-                .await
-                .map(|row| row.is_some())
-                .map_err(TCError::from),
+            Self::File(table) => table.contains_row(txn_id, key).await,
+            Self::Local(table) => table.contains(key).await.map_err(TCError::from),
+            Self::Slice(table) => table.read_row(txn_id, key).await.map(|row| row.is_some()),
             _ => Err(TCError::bad_request(
                 "cannot test membership of this Table view",
             )),
@@ -214,8 +278,11 @@ impl<Txn: crate::StorageContext> Table<Txn> {
 
     pub(crate) async fn count(&self, txn_id: TxnId) -> TCResult<u64> {
         match self {
-            Self::File(table) => Ok(table.count(txn_id).await),
-            Self::Local(table) => file::count(table, Range::default())
+            Self::File(table) => table.count(txn_id).await,
+            Self::Local(table) => table
+                .read()
+                .await
+                .count(Range::default())
                 .await
                 .map_err(TCError::from),
             Self::Slice(table) => table.count(txn_id).await,
@@ -226,8 +293,11 @@ impl<Txn: crate::StorageContext> Table<Txn> {
 
     pub(crate) async fn is_empty(&self, txn_id: TxnId) -> TCResult<bool> {
         match self {
-            Self::File(table) => Ok(table.is_empty(txn_id).await),
-            Self::Local(table) => file::is_empty(table, Range::default())
+            Self::File(table) => table.is_empty(txn_id).await,
+            Self::Local(table) => table
+                .read()
+                .await
+                .is_empty(Range::default())
                 .await
                 .map_err(TCError::from),
             Self::Slice(table) => table.is_empty(txn_id).await,
@@ -246,17 +316,11 @@ impl<Txn: crate::StorageContext> Table<Txn> {
         Txn: crate::StorageContext,
     {
         match self {
-            Self::File(table) => table
-                .upsert_row(txn, key, values)
+            Self::File(table) => table.upsert_row(txn, key, values).await,
+            Self::Local(table) => file::upsert(table, key, values)
                 .await
                 .map_err(TCError::from),
-            Self::Local(table) => {
-                file::delete_row(table, &key).await.map_err(TCError::from)?;
-                file::upsert(table, key, values)
-                    .await
-                    .map_err(TCError::from)
-            }
-            _ => Err(TCError::bad_request("cannot mutate a Table view")),
+            _ => Err(TCError::bad_request("cannot mutate a read-only Table view")),
         }
     }
 
@@ -272,20 +336,19 @@ impl<Txn: crate::StorageContext> Table<Txn> {
         match self {
             Self::File(table) => table.insert_row(txn, key, values).await,
             Self::Local(table) => {
-                if file::get_row(table, &key)
-                    .await
-                    .map_err(TCError::from)?
-                    .is_some()
-                {
+                if table.contains(&key).await.map_err(TCError::from)? {
                     return Err(TCError::bad_request(format!(
                         "cannot insert Table row: key {key:?} already exists"
                     )));
                 }
+
                 file::upsert(table, key, values)
                     .await
                     .map_err(TCError::from)
             }
-            _ => Err(TCError::bad_request("cannot insert into a Table view")),
+            _ => Err(TCError::bad_request(
+                "cannot insert into a read-only Table view",
+            )),
         }
     }
 
@@ -294,13 +357,13 @@ impl<Txn: crate::StorageContext> Table<Txn> {
         Txn: crate::StorageContext,
     {
         match self {
-            Self::File(table) => table.delete_row(txn, key).await.map_err(TCError::from),
+            Self::File(table) => table.delete_row(txn, key).await,
             Self::Local(table) => file::delete_row(table, &key)
                 .await
                 .map(|_| ())
                 .map_err(TCError::from),
             _ => Err(TCError::bad_request(
-                "cannot delete a row from a Table view",
+                "cannot delete a row from a read-only Table view",
             )),
         }
     }
@@ -310,10 +373,11 @@ impl<Txn: crate::StorageContext> Table<Txn> {
         Txn: crate::StorageContext,
     {
         match self {
-            Self::File(table) => table.truncate(txn, range).await.map_err(TCError::from),
+            Self::File(table) => table.truncate(txn, range).await,
             Self::Local(table) => view::truncate_local(table, txn, range).await,
-            Self::Slice(table) => table.truncate(txn, range).await,
-            _ => Err(TCError::bad_request("cannot truncate this Table view")),
+            _ => Err(TCError::bad_request(
+                "cannot truncate a read-only Table view",
+            )),
         }
     }
 
@@ -327,16 +391,42 @@ impl<Txn: crate::StorageContext> Table<Txn> {
         Txn: crate::StorageContext,
     {
         match self {
-            Self::File(table) => table
-                .update(txn, range, values)
-                .await
-                .map_err(TCError::from),
+            Self::File(table) => table.update(txn, range, values).await,
             Self::Local(table) => view::update_local(table, txn, range, values).await,
-            Self::Slice(table) => table.update(txn, range, values).await,
-            _ => Err(TCError::bad_request("cannot update this Table view")),
+            _ => Err(TCError::bad_request("cannot update a read-only Table view")),
+        }
+    }
+}
+
+impl<Txn: crate::StorageContext> Transact for Table<Txn> {
+    async fn commit(&self, txn_id: TxnId) -> TCResult<()> {
+        match self {
+            Self::Local(_) => Ok(()),
+            _ => Transact::commit(self.persistent()?, txn_id).await,
+        }
+    }
+
+    fn rollback(&self, txn_id: &TxnId) -> impl std::future::Future<Output = TCResult<()>> + Send {
+        let txn_id = *txn_id;
+        async move {
+            match self {
+                Self::Local(_) => Ok(()),
+                _ => Transact::rollback(self.persistent()?, &txn_id).await,
+            }
+        }
+    }
+
+    fn finalize(&self, txn_id: &TxnId) -> impl std::future::Future<Output = TCResult<()>> + Send {
+        let txn_id = *txn_id;
+        async move {
+            match self {
+                Self::Local(_) => Ok(()),
+                _ => Transact::finalize(self.persistent()?, &txn_id).await,
+            }
         }
     }
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/table/tests.rs"]
 mod tests;

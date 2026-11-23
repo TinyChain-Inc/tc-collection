@@ -1,30 +1,22 @@
 use destream::en::{self, EncodeMap};
 use futures::StreamExt;
 use safecast::CastFrom;
-use tc_error::TCError;
-use tc_value::Value;
-use tc_value::class::NativeClass;
 
 use crate::view::{BTreeView, CollectionView, TableView};
 use crate::{BTreeType, TableType, TensorType};
+use tc_value::Value;
+use tc_value::class::NativeClass;
 
 impl<'en> en::IntoStream<'en> for BTreeView {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        let arity = self.arity;
+        let arity = self.schema.len();
         let keys = self.keys.map(move |row| {
-            row.and_then(|row| {
-                if row.len() != arity {
-                    return Err(TCError::internal(format!(
-                        "BTree row arity {} does not match schema arity {arity}",
-                        row.len()
-                    )));
-                }
-
-                Ok(if arity == 1 {
-                    row.into_iter().next().expect("unary BTree row")
+            row.map(|row| {
+                if arity == 1 {
+                    row.into_iter().next().expect("validated unary BTree row")
                 } else {
                     Value::Tuple(row)
-                })
+                }
             })
         });
 
@@ -50,6 +42,7 @@ impl<'en> en::IntoStream<'en> for CollectionView {
             Self::Table(view) => map.encode_entry(TableType.path().to_string(), view)?,
             Self::Tensor(tensor) => map.encode_entry(TensorType.path().to_string(), tensor)?,
         }
+
         map.end()
     }
 }

@@ -2,83 +2,18 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use b_table::{Range, Row, TableLock};
-use collate::{Collate, try_diff, try_merge};
+use b_table::{IndexSchema, Range, Row, TableLock};
 use freqfs::DirLock;
+use futures::TryStreamExt;
 use futures::stream::BoxStream;
-use futures::{StreamExt, TryStreamExt};
-use tc_ir::{Id, Transact, TxnId};
-use tc_value::{Value, ValueCollator};
-
-use crate::persistence::{CollectionOwner, PersistentDelta, VisibleSnapshot, background_error};
 
 use super::schema::{TableIndexSchema, TableSchema};
 use super::stream::Rows;
 use super::view::{Limited, Selection, TableSlice};
-
-/// Collator for merging row streams that are ordered by specific column indices.
-///
-/// When `order` is empty (natural primary-key order), `indices` is set to
-/// `[0, 1, ..., key_len-1]` so the collator compares the primary-key prefix.
-/// When `order` is non-empty, `indices` holds the positions of the order
-/// columns within the row (which is always in primary-column order: key
-/// columns followed by value columns).
-#[derive(Clone, Eq, PartialEq)]
-struct RowCollator {
-    indices: Vec<usize>,
-    reverse: bool,
-    values: ValueCollator,
-}
-
-impl RowCollator {
-    /// Build a collator for the given schema and order specification.
-    ///
-    /// If `order` is empty, the collator compares by the primary key columns
-    /// (indices `0..key_len`). Otherwise, it compares by the positions of the
-    /// named order columns within the full row (key + value columns).
-    fn for_order(schema: &TableSchema, order: &[Id], reverse: bool) -> Self {
-        let key = schema.key();
-        let values = schema.values();
-        let all: Vec<&Id> = key.iter().chain(values.iter()).collect();
-
-        let indices: Vec<usize> = if order.is_empty() {
-            (0..key.len()).collect()
-        } else {
-            order
-                .iter()
-                .filter_map(|col| all.iter().position(|name| *name == col))
-                .collect()
-        };
-
-        Self {
-            indices,
-            reverse,
-            values: ValueCollator::default(),
-        }
-    }
-}
-
-impl Collate for RowCollator {
-    type Value = Vec<Value>;
-
-    fn cmp(&self, left: &Self::Value, right: &Self::Value) -> std::cmp::Ordering {
-        let mut ord = std::cmp::Ordering::Equal;
-        for &i in &self.indices {
-            let l = left.get(i);
-            let r = right.get(i);
-            ord = match (l, r) {
-                (Some(l), Some(r)) => self.values.cmp(l, r),
-                (Some(_), None) => std::cmp::Ordering::Greater,
-                (None, Some(_)) => std::cmp::Ordering::Less,
-                (None, None) => std::cmp::Ordering::Equal,
-            };
-            if ord != std::cmp::Ordering::Equal {
-                break;
-            }
-        }
-        if self.reverse { ord.reverse() } else { ord }
-    }
-}
+use crate::persistence::{CollectionOwner, KeyOwner, PersistentDelta, PointRead, VisibleSnapshot};
+use tc_error::{TCError, TCResult};
+use tc_ir::{Id, Transact, TxnId};
+use tc_value::{Value, ValueCollator};
 
 type RowsResult = std::io::Result<BoxStream<'static, Result<Row<Value>, std::io::Error>>>;
 pub(crate) type TableFile<F> = TableLock<TableSchema, TableIndexSchema, ValueCollator, F>;
@@ -90,26 +25,9 @@ pub(crate) async fn row_stream<F: crate::CollectionFile>(
     reverse: bool,
 ) -> RowsResult {
     let view = table.read().await;
-    view.rows(range, order, reverse, None)
-        .await
-        .map(|rows| Box::pin(rows) as _)
-}
-
-pub(crate) async fn get_row<F: crate::CollectionFile>(
-    table: &TableFile<F>,
-    key: &[Value],
-) -> std::io::Result<Option<Row<Value>>> {
-    let range = table
-        .schema()
-        .range_from_key(key)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    table
-        .read()
-        .await
-        .rows(range, &[], false, None)
-        .await?
-        .try_next()
-        .await
+    // Keep native scan setup out of enclosing mutation futures. Its inline
+    // frame otherwise overflows normal worker stacks through Service and Chain.
+    Box::pin(view.select(range, order, reverse, table.schema().primary().columns())).await
 }
 
 pub(crate) async fn upsert<F: crate::CollectionFile>(
@@ -123,7 +41,13 @@ pub(crate) async fn upsert<F: crate::CollectionFile>(
         .upsert(key, values)
         .await
         .map(|_| ())
-        .map_err(std::io::Error::other)
+        .map_err(|error| {
+            if error.requires_recovery() {
+                freqfs::IntegrityError::mark(std::io::Error::other(error))
+            } else {
+                std::io::Error::other(error)
+            }
+        })
 }
 
 pub(crate) async fn delete_row<F: crate::CollectionFile>(
@@ -133,98 +57,78 @@ pub(crate) async fn delete_row<F: crate::CollectionFile>(
     table.write().await.delete_row(key).await.map(|_| ())
 }
 
-pub(crate) async fn count<F: crate::CollectionFile>(
-    table: &TableFile<F>,
-    range: Range<Id, Value>,
-) -> std::io::Result<u64> {
-    table.read().await.count(range).await
-}
-
-pub(crate) async fn is_empty<F: crate::CollectionFile>(
-    table: &TableFile<F>,
-    range: Range<Id, Value>,
-) -> std::io::Result<bool> {
-    table.read().await.is_empty(range).await
-}
-
-#[derive(Clone)]
 struct Delta<F: crate::CollectionFile> {
     inserts: TableFile<F>,
     deletes: TableFile<F>,
 }
 
 impl<F: crate::CollectionFile> Delta<F> {
-    /// Start an ordinary delta with empty insert and delete storage.
-    async fn create(schema: TableSchema, dir: DirLock<F>) -> std::io::Result<Self> {
-        let (inserts, deletes) = crate::persistence::create_delta_dirs(&dir).await?;
-        Ok(Self {
-            inserts: TableLock::create(schema.clone(), ValueCollator::default(), inserts)?,
-            deletes: TableLock::create(schema, ValueCollator::default(), deletes)?,
-        })
+    async fn lookup(&self, key: &[Value]) -> std::io::Result<Option<Option<Row<Value>>>> {
+        if let Some(row) = self.inserts.get_row(key).await? {
+            return Ok(Some(Some(row)));
+        }
+
+        if self.deletes.contains(key).await? {
+            return Ok(Some(None));
+        }
+
+        Ok(None)
     }
 
-    /// Seed a restoration delta in a separate workspace: empty inserts and
-    /// canonical contents in deletes, so keys absent from the snapshot are removed.
-    /// The caller applies visible committed deltas to deletes, inserts the snapshot,
-    /// and installs the pending replacement only after construction succeeds.
-    /// Failure or cancellation leaves the existing pending delta untouched.
-    async fn for_restore(canonical: &TableFile<F>, dir: DirLock<F>) -> std::io::Result<Self> {
+    /// Start an ordinary delta with empty insert and delete storage.
+    async fn create(schema: TableSchema, dir: DirLock<F>) -> std::io::Result<Arc<Self>> {
         let (inserts, deletes) = crate::persistence::create_delta_dirs(&dir).await?;
-        Ok(Self {
-            inserts: TableLock::create(
-                canonical.schema().clone(),
-                ValueCollator::default(),
-                inserts,
-            )?,
-            deletes: canonical.copy_into(deletes).await?,
-        })
+        Ok(Arc::new(Self {
+            inserts: TableLock::create(schema.clone(), crate::persistence::value_order(), inserts)
+                .await?,
+            deletes: TableLock::create(schema, crate::persistence::value_order(), deletes).await?,
+        }))
     }
 
     async fn upsert(&self, key: Vec<Value>, values: Vec<Value>) -> std::io::Result<()> {
-        delete_row(&self.deletes, &key).await?;
-        delete_row(&self.inserts, &key).await?;
-        upsert(&self.inserts, key, values).await
+        upsert(&self.inserts, key, values).await?;
+        Ok(())
+    }
+
+    async fn is_changed(&self, key: &[Value]) -> std::io::Result<bool> {
+        Ok(self.inserts.contains(key).await? || self.already_deleted(key).await?)
     }
 
     async fn delete_from_inserts(&self, key: &[Value]) -> std::io::Result<()> {
         delete_row(&self.inserts, key).await
     }
 
-    async fn add_to_deletes(&self, key: &[Value], values: Vec<Value>) -> std::io::Result<()> {
-        upsert(&self.deletes, key.to_vec(), values).await
-    }
-
-    async fn get_inserted_row(&self, key: &[Value]) -> std::io::Result<Option<Row<Value>>> {
-        get_row(&self.inserts, key).await
+    async fn add_to_deletes(&self, key: Vec<Value>, values: Vec<Value>) -> std::io::Result<()> {
+        upsert(&self.deletes, key, values).await
     }
 
     async fn already_deleted(&self, key: &[Value]) -> std::io::Result<bool> {
-        get_row(&self.deletes, key).await.map(|row| row.is_some())
+        self.deletes.contains(key).await
     }
 
-    async fn merge_into<'a>(
-        &self,
-        rows: BoxStream<'a, Result<Vec<Value>, std::io::Error>>,
-        range: Range<tc_ir::Id, Value>,
-        order: &[tc_ir::Id],
-        reverse: bool,
-        collator: RowCollator,
-    ) -> BoxStream<'a, Result<Vec<Value>, std::io::Error>> {
-        let inserted = row_stream(&self.inserts, range.clone(), order, reverse)
-            .await
-            .expect("stream insert delta rows")
-            .map_ok(|row| row.to_vec())
-            .boxed();
+    // Consume staged changes only after the input snapshot releases its guards.
+    async fn apply_to_pending(&self, pending: &Self) -> std::io::Result<()> {
+        let key_len = self.inserts.schema().key().len();
+        let mut deletes = row_stream(&self.deletes, Range::default(), &[], false).await?;
+        while let Some(row) = deletes.try_next().await? {
+            let mut key = row.into_vec();
+            let values = key.split_off(key_len);
+            if !pending.is_changed(&key).await? {
+                pending.add_to_deletes(key.clone(), values).await?;
+            }
 
-        let merged = try_merge(collator.clone(), inserted, rows).boxed();
+            pending.delete_from_inserts(&key).await?;
+        }
 
-        let deleted = row_stream(&self.deletes, range, order, reverse)
-            .await
-            .expect("stream delete delta rows")
-            .map_ok(|row| row.to_vec())
-            .boxed();
+        drop(deletes);
+        let mut inserts = row_stream(&self.inserts, Range::default(), &[], false).await?;
+        while let Some(row) = inserts.try_next().await? {
+            let mut key = row.into_vec();
+            let values = key.split_off(key_len);
+            pending.upsert(key, values).await?;
+        }
 
-        try_diff(collator, merged, deleted).boxed()
+        Ok(())
     }
 }
 
@@ -233,14 +137,17 @@ impl<F: crate::CollectionFile> PersistentDelta for Delta<F> {
 
     async fn apply_to(&self, persistent: &TableFile<F>) -> std::io::Result<()> {
         let key_len = persistent.schema().key().len();
-        let mut inserts = row_stream(&self.inserts, Range::default(), &[], false).await?;
-        while let Some(row) = inserts.try_next().await? {
-            upsert(persistent, row[..key_len].to_vec(), row[key_len..].to_vec()).await?;
-        }
-
         let mut deletes = row_stream(&self.deletes, Range::default(), &[], false).await?;
         while let Some(row) = deletes.try_next().await? {
             delete_row(persistent, &row[..key_len]).await?;
+        }
+
+        drop(deletes);
+        let mut inserts = row_stream(&self.inserts, Range::default(), &[], false).await?;
+        while let Some(row) = inserts.try_next().await? {
+            let mut key = row.into_vec();
+            let values = key.split_off(key_len);
+            upsert(persistent, key, values).await?;
         }
 
         Ok(())
@@ -248,7 +155,7 @@ impl<F: crate::CollectionFile> PersistentDelta for Delta<F> {
 }
 
 pub struct PersistentTable<Txn: crate::StorageContext> {
-    owner: Arc<CollectionOwner<Delta<Txn::File>>>,
+    owner: Arc<KeyOwner<Delta<Txn::File>>>,
     schema: TableSchema,
     txn: PhantomData<fn() -> Txn>,
 }
@@ -265,7 +172,8 @@ impl<Txn: crate::StorageContext> Clone for PersistentTable<Txn> {
 
 impl<Txn: crate::StorageContext> fmt::Debug for PersistentTable<Txn> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state = self.owner.state.read().expect("state read lock");
+        let state = self.owner.read_state();
+
         f.debug_struct("PersistentTable")
             .field("committed_len", &state.committed.len())
             .field("pending_len", &state.pending.len())
@@ -275,17 +183,18 @@ impl<Txn: crate::StorageContext> fmt::Debug for PersistentTable<Txn> {
 }
 
 impl<Txn: crate::StorageContext> PersistentTable<Txn> {
-    pub fn new(persistent_dir: DirLock<Txn::File>, schema: TableSchema) -> Self {
-        Self::try_new(persistent_dir, schema).expect("create persistent Table store")
-    }
-
     /// Create in empty caller-delegated storage.
-    pub fn try_new(
+    pub async fn try_new(
         persistent_dir: DirLock<Txn::File>,
         schema: TableSchema,
     ) -> std::io::Result<Self> {
-        let persistent =
-            TableLock::create(schema.clone(), ValueCollator::default(), persistent_dir)?;
+        let persistent = TableLock::create(
+            schema.clone(),
+            crate::persistence::value_order(),
+            persistent_dir,
+        )
+        .await?;
+
         Ok(Self::from_store(schema, persistent))
     }
 
@@ -293,14 +202,20 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         persistent_dir: DirLock<Txn::File>,
         schema: TableSchema,
     ) -> std::io::Result<Self> {
-        let persistent = TableLock::load(schema.clone(), ValueCollator::default(), persistent_dir)?;
+        let persistent = TableLock::load(
+            schema.clone(),
+            crate::persistence::value_order(),
+            persistent_dir,
+        )?;
+
         persistent.validate().await?;
         Ok(Self::from_store(schema, persistent))
     }
 
     fn from_store(schema: TableSchema, persistent: TableFile<Txn::File>) -> Self {
+        let ranges = *persistent.ordering().range_collator();
         Self {
-            owner: Arc::new(CollectionOwner::new(persistent)),
+            owner: Arc::new(CollectionOwner::new(persistent, ranges)),
             schema,
             txn: PhantomData,
         }
@@ -319,19 +234,18 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         }
 
         let values = row.split_off(self.schema.key().len());
-        let persistent = {
-            self.owner
-                .state
-                .read()
-                .expect("state read lock")
-                .persistent
-                .clone()
-        };
+        let persistent = { self.owner.read_state().persistent.clone() };
 
         upsert(&persistent, row, values).await
     }
 
-    pub fn finalized(&self) -> Option<TxnId> {
+    /// Inspect an unpublished copy target without registering transaction reads.
+    pub(super) async fn contains_literal_key(&self, key: &[Value]) -> std::io::Result<bool> {
+        let persistent = self.owner.read_state().persistent.clone();
+        persistent.contains(key).await
+    }
+
+    pub fn finalized(&self) -> TCResult<Option<TxnId>> {
         self.owner.finalized()
     }
 
@@ -340,97 +254,91 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
     /// Buffered writeback does not acknowledge durability. Pending workspace
     /// and committed workspace deltas are not included.
     pub async fn sync(&self) -> std::io::Result<()> {
-        let persistent = self
-            .owner
-            .state
-            .read()
-            .expect("state read lock")
-            .persistent
-            .clone();
-        persistent.sync().await
+        let persistent = self.owner.read_state().persistent.clone();
+        persistent.sync().await?;
+        Ok(())
     }
 
     /// Durably synchronize materialized canonical storage; pending deltas are excluded.
     pub async fn sync_all(&self) -> std::io::Result<()> {
-        let persistent = self
-            .owner
-            .state
-            .read()
-            .expect("state read lock")
-            .persistent
-            .clone();
-        persistent.sync_all().await
+        let persistent = self.owner.read_state().persistent.clone();
+        persistent.sync_all().await?;
+        Ok(())
     }
 
-    /// Stage a native replacement without changing the existing pending delta on failure.
+    /// Stage a native replacement without changing the pending delta on failure.
+    /// Self-restoration is a no-op; conflicting source admission returns without waiting.
     pub async fn restore_from(&self, txn: &Txn, source: &Self) -> tc_error::TCResult<()> {
         let id = txn.id();
-        let _permit = self
-            .owner
-            .semaphore
-            .try_write(id, txn_lock::set::Range::All)?;
-        let (canonical, committed) = {
-            let state = self.owner.state.read().expect("state read lock");
-            state.assert_writable(id)?;
-            (
-                state.persistent.clone(),
-                state
-                    .committed
-                    .range(..=id)
-                    .filter_map(|(_, delta)| delta.clone())
-                    .collect::<Vec<_>>(),
-            )
-        };
-        let schema = self.schema.clone();
-        if <Value as safecast::CastFrom<TableSchema>>::cast_from(schema.clone())
-            != <Value as safecast::CastFrom<TableSchema>>::cast_from(source.schema.clone())
-        {
+        self.owner.read_state().assert_writable(id)?;
+        if Arc::ptr_eq(&self.owner, &source.owner) {
+            return Ok(());
+        }
+
+        if !self.schema.same_semantics(&source.schema) {
             return Err(tc_error::TCError::bad_request(
                 "Table restoration schema mismatch",
             ));
         }
+
+        let _permit = self
+            .owner
+            .try_acquire_write_permit(id, txn_lock::set::Range::All)?;
+
+        let base = self.owner.committed_snapshot(id)?;
+
+        let source_permit = source
+            .owner
+            .try_acquire_read_permit(id, txn_lock::set::Range::All)?;
+
+        let source_snapshot = source.owner.visible_snapshot(id)?;
+        let stream = source
+            .visible_rows(source_snapshot, Range::default(), &[], false)
+            .await?;
+
+        let mut rows = Rows::new(stream, source_permit);
         let workspace = txn.subcontext_unique().context().await?;
-        let delta = Delta::for_restore(&canonical, workspace).await?;
-        for committed in committed {
-            committed.apply_to(&delta.deletes).await?;
-        }
+        let delta = Delta::create(self.schema.clone(), workspace).await?;
         let key_len = self.schema.key().len();
-        let mut rows = source.rows(id, Range::default(), vec![], false).await?;
-        while let Some(row) = rows.try_next().await? {
-            delta
-                .upsert(row[..key_len].to_vec(), row[key_len..].to_vec())
-                .await?;
+        let mut baseline = self
+            .visible_rows(base, Range::default(), &[], false)
+            .await?;
+
+        while let Some(row) = baseline.try_next().await? {
+            let mut key = row.into_vec();
+            let values = key.split_off(key_len);
+            delta.add_to_deletes(key, values).await?;
         }
-        let mut state = self.owner.state.write().expect("state write lock");
+
+        drop(baseline);
+
+        while let Some(row) = rows.try_next().await? {
+            let mut key = row.into_vec();
+            let values = key.split_off(key_len);
+            delta.upsert(key, values).await?;
+        }
+
+        drop(rows);
+        let mut state = self.owner.write_state();
         state.assert_writable(id)?;
         state.pending.insert(id, delta);
         Ok(())
     }
 
-    pub async fn upsert_row(
-        &self,
-        txn: &Txn,
-        key: Vec<Value>,
-        values: Vec<Value>,
-    ) -> Result<(), txn_lock::Error>
+    pub async fn upsert_row(&self, txn: &Txn, key: Vec<Value>, values: Vec<Value>) -> TCResult<()>
     where
         Txn: crate::StorageContext,
     {
         let txn_id = txn.id();
-        let key = b_table::Schema::validate_key(&self.schema, key).map_err(background_error)?;
-        let values =
-            b_table::Schema::validate_values(&self.schema, values).map_err(background_error)?;
+        let key = b_table::Schema::validate_key(&self.schema, key)?;
+        let values = b_table::Schema::validate_values(&self.schema, values)?;
 
         let _permit = self
             .owner
-            .semaphore
-            .try_write(txn_id, txn_lock::set::Range::One(Arc::new(key.clone())))?;
+            .try_acquire_write_permit(txn_id, txn_lock::set::Range::One(Arc::new(key.clone())))?;
 
-        let pending = self.pending_delta_for_txn(txn).await?;
-        pending
-            .upsert(key, values)
-            .await
-            .map_err(background_error)?;
+        let pending = self.pending_for_key(txn, &key).await?;
+        pending.upsert(key, values).await?;
 
         Ok(())
     }
@@ -450,13 +358,10 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
 
         let _permit = self
             .owner
-            .semaphore
-            .try_write(txn_id, txn_lock::set::Range::One(Arc::new(key.clone())))
-            .map_err(tc_error::TCError::from)?;
+            .try_acquire_write_permit(txn_id, txn_lock::set::Range::One(Arc::new(key.clone())))?;
 
-        if self
-            .resolve_row(&self.owner.visible_snapshot(txn_id), &key)
-            .await
+        if Self::resolve_row(self.owner.point_read(txn_id)?, &key)
+            .await?
             .is_some()
         {
             return Err(tc_error::TCError::bad_request(format!(
@@ -465,172 +370,108 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         }
 
         self.pending_delta_for_txn(txn)
-            .await
-            .map_err(tc_error::TCError::from)?
+            .await?
             .upsert(key, values)
-            .await
-            .map_err(tc_error::TCError::from)?;
+            .await?;
 
         Ok(())
     }
 
-    pub async fn delete_row(&self, txn: &Txn, key: Vec<Value>) -> Result<(), txn_lock::Error>
+    pub async fn delete_row(&self, txn: &Txn, key: Vec<Value>) -> TCResult<()>
     where
         Txn: crate::StorageContext,
     {
         let txn_id = txn.id();
-        let key = b_table::Schema::validate_key(&self.schema, key).map_err(background_error)?;
+        let key = b_table::Schema::validate_key(&self.schema, key)?;
 
         let _permit = self
             .owner
-            .semaphore
-            .try_write(txn_id, txn_lock::set::Range::One(Arc::new(key.clone())))?;
+            .try_acquire_write_permit(txn_id, txn_lock::set::Range::One(Arc::new(key.clone())))?;
 
-        let pending = self.pending_delta_for_txn(txn).await?;
-
-        if pending
-            .already_deleted(&key)
-            .await
-            .map_err(background_error)?
-        {
-            return Ok(());
-        }
-
-        let mut row = pending
-            .get_inserted_row(&key)
-            .await
-            .map_err(background_error)?;
-
-        if row.is_none() {
-            let snapshot = self.owner.visible_snapshot(txn_id);
-            row = self.resolve_row(&snapshot, &key).await;
-        }
-
-        pending
-            .delete_from_inserts(&key)
-            .await
-            .map_err(background_error)?;
-
-        if let Some(mut row) = row {
-            let key_len = self.schema.key().len();
-            let values: Vec<Value> = row.drain(key_len..).collect();
-            pending
-                .add_to_deletes(&key, values)
-                .await
-                .map_err(background_error)?;
-        }
+        let pending = self.pending_for_key(txn, &key).await?;
+        pending.delete_from_inserts(&key).await?;
 
         Ok(())
     }
 
-    pub async fn read_row(&self, txn_id: TxnId, key: &[Value]) -> Option<Row<Value>> {
+    pub async fn read_row(&self, txn_id: TxnId, key: &[Value]) -> TCResult<Option<Row<Value>>> {
         let _permit = self
             .owner
             .acquire_read_permit(txn_id, txn_lock::set::Range::One(Arc::new(key.to_vec())))
-            .await;
+            .await?;
 
-        let snapshot = self.owner.visible_snapshot(txn_id);
-        self.resolve_row(&snapshot, key).await
+        Self::resolve_row(self.owner.point_read(txn_id)?, key).await
     }
 
-    pub async fn contains_row(&self, txn_id: TxnId, key: &[Value]) -> bool {
-        let _permit = self
-            .owner
-            .acquire_read_permit(txn_id, txn_lock::set::Range::One(Arc::new(key.to_vec())))
-            .await;
-
-        let snapshot = self.owner.visible_snapshot(txn_id);
-        self.is_row_visible(&snapshot, key).await
+    pub async fn contains_row(&self, txn_id: TxnId, key: &[Value]) -> TCResult<bool> {
+        Ok(self.read_row(txn_id, key).await?.is_some())
     }
 
-    pub async fn count(&self, txn_id: TxnId) -> u64 {
-        let mut count = 0_u64;
-        self.for_each_row_in_order(txn_id, Range::default(), &[], false, |_| {
-            count += 1;
-        })
-        .await;
-        count
+    pub async fn count(&self, txn_id: TxnId) -> TCResult<u64> {
+        self.count_in(txn_id, Range::default()).await
     }
 
-    pub async fn is_empty(&self, txn_id: TxnId) -> bool {
-        !self.any_row_in(txn_id, Range::default(), &[], false).await
+    pub async fn is_empty(&self, txn_id: TxnId) -> TCResult<bool> {
+        self.is_empty_in(txn_id, Range::default()).await
     }
 
     pub async fn for_each_row_in_order<F>(
         &self,
         txn_id: TxnId,
-        range: Range<tc_ir::Id, Value>,
-        order: &[tc_ir::Id],
+        range: Range<Id, Value>,
+        order: &[Id],
         reverse: bool,
         mut on_row: F,
-    ) where
+    ) -> TCResult<()>
+    where
         F: FnMut(Row<Value>),
     {
-        let _permit = self
-            .owner
-            .acquire_read_permit(txn_id, txn_lock::set::Range::All)
-            .await;
-
-        let collator = RowCollator::for_order(&self.schema, order, reverse);
-
-        self.for_each_visible_row_until(txn_id, range, order, reverse, collator, |row| {
+        let mut rows = self.rows(txn_id, range, order.to_vec(), reverse).await?;
+        while let Some(row) = rows.try_next().await? {
             on_row(row);
-            true
-        })
-        .await;
+        }
+
+        Ok(())
     }
 
-    pub async fn count_in(&self, txn_id: TxnId, range: Range<tc_ir::Id, Value>) -> u64 {
-        let mut count = 0_u64;
-        self.for_each_row_in_order(txn_id, range, &[], false, |_| {
-            count += 1;
-        })
-        .await;
-        count
+    pub async fn count_in(&self, txn_id: TxnId, range: Range<Id, Value>) -> TCResult<u64> {
+        Ok(self
+            .rows(txn_id, range, Vec::new(), false)
+            .await?
+            .try_count()
+            .await?)
     }
 
-    /// Return `true` if there are no visible rows in `range` at `txn_id`.
-    pub async fn is_empty_in(&self, txn_id: TxnId, range: Range<tc_ir::Id, Value>) -> bool {
-        !self.any_row_in(txn_id, range, &[], false).await
+    pub async fn is_empty_in(&self, txn_id: TxnId, range: Range<Id, Value>) -> TCResult<bool> {
+        Ok(self
+            .rows(txn_id, range, Vec::new(), false)
+            .await?
+            .try_is_empty()
+            .await?)
     }
 
     /// Construct a permit-bound row stream over the visible state at `txn_id`.
     ///
-    /// The stream is fully lazy — rows are produced on demand by polling the
-    /// returned [`Rows`]. The read permit is held for the lifetime of the
-    /// stream so the transactional snapshot stays coherent.
+    /// Asynchronous setup acquires the read permit, snapshot, and native streams.
+    /// Subsequent rows are produced on demand by polling the returned [`Rows`].
+    /// The permit is released on EOF, the first error, or drop.
     ///
-    /// If the given `range` is not supported by any index, this returns an
-    /// `Unsupported` I/O error wrapped in a background transactional error.
+    /// If no index supports `range`, the native I/O error is converted to `TCError`.
     pub async fn rows(
         &self,
         txn_id: TxnId,
         range: Range<Id, Value>,
         order: Vec<Id>,
         reverse: bool,
-    ) -> Result<Rows, txn_lock::Error> {
+    ) -> TCResult<Rows> {
         let permit = self
             .owner
             .acquire_read_permit(txn_id, txn_lock::set::Range::All)
-            .await;
+            .await?;
 
-        let snapshot = self.owner.visible_snapshot(txn_id);
-        let collator = RowCollator::for_order(&self.schema, &order, reverse);
+        let snapshot = self.owner.visible_snapshot(txn_id)?;
+        let stream = self.visible_rows(snapshot, range, &order, reverse).await?;
 
-        let mut visible: BoxStream<'static, Result<Vec<Value>, std::io::Error>> =
-            row_stream(&snapshot.persistent, range.clone(), &order, reverse)
-                .await
-                .map_err(background_error)?
-                .map_ok(|row| row.to_vec())
-                .boxed();
-
-        for delta in snapshot.deltas.into_iter() {
-            visible = delta
-                .merge_into(visible, range.clone(), &order, reverse, collator.clone())
-                .await;
-        }
-
-        let stream = visible.map_ok(Row::from_vec).boxed();
         Ok(Rows::new(stream, permit))
     }
 
@@ -663,264 +504,208 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
     /// Update all visible rows in `range` at `txn_id` with the given column
     /// `values`.
     ///
-    /// Only value columns (not key columns) may be updated.  Rows are streamed
-    /// from the visible snapshot, updated in-place, and upserted into the
-    /// pending delta — the full affected set is never buffered in a `Vec`
-    /// (v1 no-materialization invariant).  A single `Range::All` write permit
-    /// is acquired upfront so no per-key semaphore re-acquisition is needed
-    /// during the streamed update loop.
-    ///
-    /// Ported from v1 `TableFile::update`.
+    /// Only value columns may be updated. Changes stream into delegated staging
+    /// storage and are applied after the input guards are released. A single
+    /// whole-table write permit covers the operation; rows are not collected
+    /// in memory.
     pub async fn update(
         &self,
         txn: &Txn,
         range: Range<Id, Value>,
         values: tc_ir::Map<Value>,
-    ) -> Result<(), txn_lock::Error>
+    ) -> TCResult<()>
     where
         Txn: crate::StorageContext,
     {
         let txn_id = txn.id();
         let value_columns = self.schema.values();
-        for name in values.keys() {
-            if !value_columns.contains(name) {
-                return Err(background_error(format!("cannot update key column {name}")));
+        for (name, value) in &values {
+            let position = value_columns
+                .iter()
+                .position(|column| column == name)
+                .ok_or_else(|| TCError::bad_request(format!("cannot update key column {name}")))?;
+
+            let expected = &b_table::Schema::primary(&self.schema).column_types()
+                [self.schema.key().len() + position];
+
+            if !expected.accepts(&value.class()) {
+                return Err(TCError::bad_request(format!(
+                    "value column {name} expected {expected:?}"
+                )));
             }
         }
 
         let key_len = self.schema.key().len();
-        let collator = RowCollator::for_order(&self.schema, &[], false);
 
         let _permit = self
             .owner
-            .semaphore
-            .try_write(txn_id, txn_lock::set::Range::All)?;
+            .try_acquire_write_permit(txn_id, txn_lock::set::Range::All)?;
 
-        let pending = self.pending_delta_for_txn(txn).await?;
+        let snapshot = self.owner.visible_snapshot(txn_id)?;
+        let staged = Box::pin(Delta::create(
+            self.schema.clone(),
+            txn.subcontext_unique().context().await?,
+        ))
+        .await?;
 
-        let snapshot = self.owner.visible_snapshot(txn_id);
+        let mut visible = self.visible_rows(snapshot, range, &[], false).await?;
 
-        let mut visible: BoxStream<'_, Result<Vec<Value>, std::io::Error>> =
-            row_stream(&snapshot.persistent, range.clone(), &[], false)
-                .await
-                .map_err(background_error)?
-                .map_ok(|row| row.to_vec())
-                .boxed();
+        while let Some(mut row) = visible.try_next().await? {
+            staged
+                .add_to_deletes(row[..key_len].to_vec(), row[key_len..].to_vec())
+                .await?;
 
-        for delta in &snapshot.deltas {
-            visible = delta
-                .merge_into(visible, range.clone(), &[], false, collator.clone())
-                .await;
-        }
-
-        while let Some(mut row) = visible.try_next().await.map_err(background_error)? {
             for (i, name) in value_columns.iter().enumerate() {
                 if let Some(value) = values.get(name) {
                     row[key_len + i] = value.clone();
                 }
             }
 
-            let key: Vec<Value> = row[..key_len].to_vec();
-            let updated_values: Vec<Value> = row[key_len..].to_vec();
+            let mut key = row.into_vec();
+            let updated_values = key.split_off(key_len);
 
-            pending
-                .upsert(key, updated_values)
-                .await
-                .map_err(background_error)?;
+            staged.upsert(key, updated_values).await?;
         }
 
+        drop(visible);
+        let pending = self.pending_delta_for_txn(txn).await?;
+        Box::pin(staged.apply_to_pending(&pending)).await?;
         Ok(())
     }
 
     /// Delete all visible rows in `range` at `txn_id`.
     ///
-    /// Rows are streamed and deleted one-by-one into the pending delta — the
-    /// full affected set is never buffered in a `Vec` (v1 no-materialization
-    /// invariant). A single `Range::All` write permit is acquired upfront so
-    /// no per-key semaphore re-acquisition is needed during the streamed
-    /// delete loop.
-    pub async fn truncate(&self, txn: &Txn, range: Range<Id, Value>) -> Result<(), txn_lock::Error>
+    /// Rows stream into delegated staging storage before removal from pending
+    /// state, so the input guards are released before publication. A single
+    /// whole-table write permit covers the operation without collecting rows
+    /// in memory.
+    pub async fn truncate(&self, txn: &Txn, range: Range<Id, Value>) -> TCResult<()>
     where
         Txn: crate::StorageContext,
     {
         let txn_id = txn.id();
         let key_len = self.schema.key().len();
-        let collator = RowCollator::for_order(&self.schema, &[], false);
 
         let _permit = self
             .owner
-            .semaphore
-            .try_write(txn_id, txn_lock::set::Range::All)?;
+            .try_acquire_write_permit(txn_id, txn_lock::set::Range::All)?;
 
+        let snapshot = self.owner.visible_snapshot(txn_id)?;
+        let staged = Box::pin(Delta::create(
+            self.schema.clone(),
+            txn.subcontext_unique().context().await?,
+        ))
+        .await?;
+
+        let mut visible = self.visible_rows(snapshot, range, &[], false).await?;
+
+        while let Some(row) = visible.try_next().await? {
+            let mut key = row.into_vec();
+            let values = key.split_off(key_len);
+
+            staged.add_to_deletes(key, values).await?;
+        }
+
+        drop(visible);
         let pending = self.pending_delta_for_txn(txn).await?;
-
-        let snapshot = self.owner.visible_snapshot(txn_id);
-
-        let mut visible: BoxStream<'_, Result<Vec<Value>, std::io::Error>> =
-            row_stream(&snapshot.persistent, range.clone(), &[], false)
-                .await
-                .expect("stream persistent rows for truncate")
-                .map_ok(|row| row.to_vec())
-                .boxed();
-
-        for delta in &snapshot.deltas {
-            visible = delta
-                .merge_into(visible, range.clone(), &[], false, collator.clone())
-                .await;
-        }
-
-        while let Some(row) = visible.try_next().await.expect("read truncate stream") {
-            let key: Vec<Value> = row[..key_len].to_vec();
-            let values: Vec<Value> = row[key_len..].to_vec();
-
-            pending
-                .delete_from_inserts(&key)
-                .await
-                .map_err(background_error)?;
-            pending
-                .add_to_deletes(&key, values)
-                .await
-                .map_err(background_error)?;
-        }
-
+        Box::pin(staged.apply_to_pending(&pending)).await?;
         Ok(())
     }
 
-    async fn any_row_in(
+    async fn visible_rows(
         &self,
-        txn_id: TxnId,
-        range: Range<tc_ir::Id, Value>,
-        order: &[tc_ir::Id],
+        snapshot: VisibleSnapshot<Delta<Txn::File>>,
+        range: Range<Id, Value>,
+        order: &[Id],
         reverse: bool,
-    ) -> bool {
-        let collator = RowCollator::for_order(&self.schema, order, reverse);
+    ) -> RowsResult {
+        let (base, collator) = {
+            let native = snapshot.persistent.read().await;
+            Box::pin(native.rows(range.clone(), order, reverse)).await?
+        };
 
-        let mut found = false;
-        self.for_each_visible_row_until(txn_id, range, order, reverse, collator, |_| {
-            found = true;
-            false
-        })
-        .await;
+        let mut visible = crate::stream::Overlay::new(collator, base, |current, incoming, _| {
+            *current = incoming;
+        });
 
-        found
-    }
+        for (id, delta) in snapshot.deltas {
+            if snapshot.visibility.retired(id) {
+                continue;
+            }
 
-    async fn for_each_visible_row_until<F>(
-        &self,
-        txn_id: TxnId,
-        range: Range<tc_ir::Id, Value>,
-        order: &[tc_ir::Id],
-        reverse: bool,
-        collator: RowCollator,
-        mut on_row: F,
-    ) where
-        F: FnMut(Row<Value>) -> bool,
-    {
-        let snapshot = self.owner.visible_snapshot(txn_id);
+            let sources = async {
+                let deletes = row_stream(&delta.deletes, range.clone(), order, reverse).await?;
+                let inserts = row_stream(&delta.inserts, range.clone(), order, reverse).await?;
+                Ok::<_, std::io::Error>((deletes, inserts))
+            }
+            .await;
 
-        let mut visible: BoxStream<'_, Result<Vec<Value>, std::io::Error>> =
-            row_stream(&snapshot.persistent, range.clone(), order, reverse)
-                .await
-                .expect("stream persistent rows")
-                .map_ok(|row| row.to_vec())
-                .boxed();
-
-        for delta in &snapshot.deltas {
-            visible = delta
-                .merge_into(visible, range.clone(), order, reverse, collator.clone())
-                .await;
-        }
-
-        while let Some(row) = visible.try_next().await.expect("read visible row stream") {
-            let row = Row::from_vec(row);
-            if !on_row(row) {
-                break;
+            if !snapshot.visibility.retired(id) {
+                let (deletes, inserts) = sources?;
+                visible.difference(deletes);
+                visible.merge(inserts);
             }
         }
+
+        Ok(visible.into_stream())
+    }
+
+    /// Preserve the pre-transaction row once, using the ordinary visibility owner.
+    /// An absent baseline needs no marker: a pending insertion identifies later writes.
+    async fn pending_for_key(&self, txn: &Txn, key: &[Value]) -> TCResult<Arc<Delta<Txn::File>>> {
+        let pending = self.pending_delta_for_txn(txn).await?;
+        if pending.is_changed(key).await? {
+            return Ok(pending);
+        }
+
+        if let Some(mut row) =
+            Self::resolve_row(self.owner.point_read(txn.id())?.committed(), key).await?
+        {
+            let values = row.drain(self.schema.key().len()..).collect();
+            pending.add_to_deletes(row.into_vec(), values).await?;
+        }
+
+        Ok(pending)
     }
 
     async fn resolve_row(
-        &self,
-        snapshot: &VisibleSnapshot<Delta<Txn::File>>,
+        mut read: PointRead<Delta<Txn::File>>,
         key: &[Value],
-    ) -> Option<Row<Value>> {
-        let mut row = get_row(&snapshot.persistent, key)
-            .await
-            .expect("check persistent visibility");
-
-        for delta in &snapshot.deltas {
-            if get_row(&delta.deletes, key)
-                .await
-                .expect("check delete delta")
-                .is_some()
-            {
-                row = None;
-            }
-
-            if let Some(inserted) = get_row(&delta.inserts, key)
-                .await
-                .expect("check insert delta")
-            {
-                row = Some(inserted);
-            }
+    ) -> TCResult<Option<Row<Value>>> {
+        if let Some(row) = read
+            .resolve(|delta| async move { delta.lookup(key).await })
+            .await?
+        {
+            return Ok(row);
         }
 
-        row
+        Ok(read.canonical()?.get_row(key).await?)
     }
 
-    async fn is_row_visible(
-        &self,
-        snapshot: &VisibleSnapshot<Delta<Txn::File>>,
-        key: &[Value],
-    ) -> bool {
-        self.resolve_row(snapshot, key).await.is_some()
-    }
-
-    async fn pending_delta_for_txn(&self, txn: &Txn) -> Result<Delta<Txn::File>, txn_lock::Error> {
-        let txn_id = txn.id();
-        let schema = {
-            let state = self.owner.state.write().expect("state write lock");
-            state.assert_writable(txn_id)?;
-
-            if let Some(pending) = state.pending.get(&txn_id).cloned() {
-                return Ok(pending);
-            }
-
-            state.persistent.schema().clone()
-        };
-
-        let txn_dir = txn
-            .subcontext_unique()
-            .context()
+    async fn pending_delta_for_txn(&self, txn: &Txn) -> TCResult<Arc<Delta<Txn::File>>> {
+        self.owner
+            .pending(txn.id(), |native| {
+                let schema = native.schema().clone();
+                async move {
+                    let dir = txn.subcontext_unique().context().await?;
+                    Ok(Delta::create(schema, dir).await?)
+                }
+            })
             .await
-            .map_err(background_error)?;
-
-        let delta = Delta::create(schema, txn_dir)
-            .await
-            .map_err(background_error)?;
-
-        let mut state = self.owner.state.write().expect("state write lock");
-        state.assert_writable(txn_id)?;
-
-        if let Some(existing) = state.pending.get(&txn_id).cloned() {
-            return Ok(existing);
-        }
-
-        state.pending.insert(txn_id, delta.clone());
-        Ok(delta)
     }
 }
 
 impl<Txn: crate::StorageContext> PersistentTable<Txn> {
     /// Commit the pending delta at `txn_id`.
     ///
-    /// The caller must finish this transaction's operations and release its streams first.
+    /// The caller must finish this transaction's mutations first. Immutable result
+    /// streams may retain their snapshots across visibility publication.
     /// Returns `Outdated` at or before the finalized frontier.
-    pub async fn commit(&self, txn_id: TxnId) -> Result<(), txn_lock::Error> {
+    pub async fn commit(&self, txn_id: TxnId) -> TCResult<()> {
         self.owner.commit(txn_id)
     }
 
-    pub fn rollback(&self, txn_id: TxnId) -> Result<(), txn_lock::Error> {
+    pub fn rollback(&self, txn_id: TxnId) -> TCResult<()> {
         self.owner.rollback(txn_id)
     }
 
@@ -931,16 +716,14 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
     /// The caller serializes lifecycle decisions and finishes operations through the
     /// cutoff first. Later transactions may retain read permits; merging uses native
     /// storage locks without acquiring a new semaphore write reservation.
-    pub async fn finalize(&self, txn_id: TxnId) -> Result<(), txn_lock::Error> {
+    pub async fn finalize(&self, txn_id: TxnId) -> TCResult<()> {
         self.owner.finalize(txn_id).await
     }
 }
 
 impl<Txn: crate::StorageContext> Transact for PersistentTable<Txn> {
     async fn commit(&self, txn_id: TxnId) -> tc_error::TCResult<()> {
-        PersistentTable::commit(self, txn_id)
-            .await
-            .map_err(Into::into)
+        PersistentTable::commit(self, txn_id).await
     }
 
     fn rollback(
@@ -948,7 +731,7 @@ impl<Txn: crate::StorageContext> Transact for PersistentTable<Txn> {
         txn_id: &TxnId,
     ) -> impl std::future::Future<Output = tc_error::TCResult<()>> + Send {
         let txn_id = *txn_id;
-        async move { PersistentTable::rollback(self, txn_id).map_err(Into::into) }
+        async move { PersistentTable::rollback(self, txn_id) }
     }
 
     fn finalize(
@@ -956,10 +739,10 @@ impl<Txn: crate::StorageContext> Transact for PersistentTable<Txn> {
         txn_id: &TxnId,
     ) -> impl std::future::Future<Output = tc_error::TCResult<()>> + Send {
         let txn_id = *txn_id;
-        async move {
-            PersistentTable::finalize(self, txn_id)
-                .await
-                .map_err(Into::into)
-        }
+        async move { PersistentTable::finalize(self, txn_id).await }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/table/failure.rs"]
+mod failure_tests;
