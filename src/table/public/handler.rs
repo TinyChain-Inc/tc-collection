@@ -1,29 +1,30 @@
 //! Individual route handler structs.
 //!
-//! The route enum delegates each verb to these table-owned operations. This
+//! Table delegates each verb to these table-owned operations. This
 //! module has no transport or serialization responsibilities.
 
 use b_table::Range;
+use number_general::{Number, NumberClass, UIntType};
 use safecast::{CastFrom, Match, TryCastInto};
 use tc_error::{TCResult, bad_request};
 use tc_ir::{Id, Map, Scalar};
 use tc_value::Value;
 
-use super::selector::{KeyOrRange, cast_into_range};
 use crate::CollectionState;
 use crate::table::Table;
+use super::selector::{KeyOrRange, cast_into_range};
 
 /// Handler for schema and column-name routes.
 ///
 /// Holds a function pointer that extracts the schema `Value` from the table.
 /// Ported from v1 `SchemaHandler<'a, T>`.
-pub struct SchemaHandler<Txn: crate::StorageContext> {
-    table: Table<Txn>,
+pub struct SchemaHandler<'a, Txn: crate::StorageContext> {
+    table: &'a Table<Txn>,
     schema_fn: fn(&Table<Txn>) -> Value,
 }
 
-impl<Txn: crate::StorageContext> SchemaHandler<Txn> {
-    pub fn new(table: Table<Txn>, schema_fn: fn(&Table<Txn>) -> Value) -> Self {
+impl<'a, Txn: crate::StorageContext> SchemaHandler<'a, Txn> {
+    pub fn new(table: &'a Table<Txn>, schema_fn: fn(&Table<Txn>) -> Value) -> Self {
         Self { table, schema_fn }
     }
 }
@@ -35,6 +36,7 @@ pub fn column_schema<Txn: crate::StorageContext>(table: &Table<Txn>) -> Value {
         .column_schema()
         .map(Value::cast_from)
         .collect();
+
     Value::Tuple(columns)
 }
 
@@ -60,12 +62,12 @@ pub fn key_names<Txn: crate::StorageContext>(table: &Table<Txn>) -> Value {
 ///
 /// Ported from v1 `ContainsHandler<Txn, FE>`.
 #[derive(Clone)]
-pub struct ContainsHandler<Txn: crate::StorageContext> {
-    table: Table<Txn>,
+pub struct ContainsHandler<'a, Txn: crate::StorageContext> {
+    table: &'a Table<Txn>,
 }
 
-impl<Txn: crate::StorageContext> From<Table<Txn>> for ContainsHandler<Txn> {
-    fn from(table: Table<Txn>) -> Self {
+impl<'a, Txn: crate::StorageContext> From<&'a Table<Txn>> for ContainsHandler<'a, Txn> {
+    fn from(table: &'a Table<Txn>) -> Self {
         Self { table }
     }
 }
@@ -74,34 +76,34 @@ impl<Txn: crate::StorageContext> From<Table<Txn>> for ContainsHandler<Txn> {
 ///
 /// Ported from v1 `CountHandler<T>`.
 #[derive(Clone)]
-pub struct CountHandler<Txn: crate::StorageContext> {
-    table: Table<Txn>,
+pub struct CountHandler<'a, Txn: crate::StorageContext> {
+    table: &'a Table<Txn>,
 }
 
 #[derive(Clone)]
-pub struct IsEmptyHandler<Txn: crate::StorageContext> {
-    table: Table<Txn>,
+pub struct IsEmptyHandler<'a, Txn: crate::StorageContext> {
+    table: &'a Table<Txn>,
 }
 
-impl<Txn: crate::StorageContext> From<Table<Txn>> for IsEmptyHandler<Txn> {
-    fn from(table: Table<Txn>) -> Self {
+impl<'a, Txn: crate::StorageContext> From<&'a Table<Txn>> for IsEmptyHandler<'a, Txn> {
+    fn from(table: &'a Table<Txn>) -> Self {
         Self { table }
     }
 }
 
 #[derive(Clone)]
-pub struct InsertHandler<Txn: crate::StorageContext> {
-    table: Table<Txn>,
+pub struct InsertHandler<'a, Txn: crate::StorageContext> {
+    table: &'a Table<Txn>,
 }
 
-impl<Txn: crate::StorageContext> From<Table<Txn>> for InsertHandler<Txn> {
-    fn from(table: Table<Txn>) -> Self {
+impl<'a, Txn: crate::StorageContext> From<&'a Table<Txn>> for InsertHandler<'a, Txn> {
+    fn from(table: &'a Table<Txn>) -> Self {
         Self { table }
     }
 }
 
-impl<Txn: crate::StorageContext> From<Table<Txn>> for CountHandler<Txn> {
-    fn from(table: Table<Txn>) -> Self {
+impl<'a, Txn: crate::StorageContext> From<&'a Table<Txn>> for CountHandler<'a, Txn> {
+    fn from(table: &'a Table<Txn>) -> Self {
         Self { table }
     }
 }
@@ -110,12 +112,12 @@ impl<Txn: crate::StorageContext> From<Table<Txn>> for CountHandler<Txn> {
 ///
 /// Ported from v1 `LimitHandler<T>`.
 #[derive(Clone)]
-pub struct LimitHandler<Txn: crate::StorageContext> {
-    table: Table<Txn>,
+pub struct LimitHandler<'a, Txn: crate::StorageContext> {
+    table: &'a Table<Txn>,
 }
 
-impl<Txn: crate::StorageContext> From<Table<Txn>> for LimitHandler<Txn> {
-    fn from(table: Table<Txn>) -> Self {
+impl<'a, Txn: crate::StorageContext> From<&'a Table<Txn>> for LimitHandler<'a, Txn> {
+    fn from(table: &'a Table<Txn>) -> Self {
         Self { table }
     }
 }
@@ -124,12 +126,12 @@ impl<Txn: crate::StorageContext> From<Table<Txn>> for LimitHandler<Txn> {
 ///
 /// Ported from v1 `OrderHandler<T>`.
 #[derive(Clone)]
-pub struct OrderHandler<Txn: crate::StorageContext> {
-    table: Table<Txn>,
+pub struct OrderHandler<'a, Txn: crate::StorageContext> {
+    table: &'a Table<Txn>,
 }
 
-impl<Txn: crate::StorageContext> From<Table<Txn>> for OrderHandler<Txn> {
-    fn from(table: Table<Txn>) -> Self {
+impl<'a, Txn: crate::StorageContext> From<&'a Table<Txn>> for OrderHandler<'a, Txn> {
+    fn from(table: &'a Table<Txn>) -> Self {
         Self { table }
     }
 }
@@ -138,12 +140,12 @@ impl<Txn: crate::StorageContext> From<Table<Txn>> for OrderHandler<Txn> {
 ///
 /// Ported from v1 `SelectHandler<T>`.
 #[derive(Clone)]
-pub struct SelectHandler<Txn: crate::StorageContext> {
-    table: Table<Txn>,
+pub struct SelectHandler<'a, Txn: crate::StorageContext> {
+    table: &'a Table<Txn>,
 }
 
-impl<Txn: crate::StorageContext> From<Table<Txn>> for SelectHandler<Txn> {
-    fn from(table: Table<Txn>) -> Self {
+impl<'a, Txn: crate::StorageContext> From<&'a Table<Txn>> for SelectHandler<'a, Txn> {
+    fn from(table: &'a Table<Txn>) -> Self {
         Self { table }
     }
 }
@@ -152,12 +154,12 @@ impl<Txn: crate::StorageContext> From<Table<Txn>> for SelectHandler<Txn> {
 ///
 /// Ported from v1 `TableHandler<Txn, FE>`.
 #[derive(Clone)]
-pub struct TableHandler<Txn: crate::StorageContext> {
-    table: Table<Txn>,
+pub struct TableHandler<'a, Txn: crate::StorageContext> {
+    table: &'a Table<Txn>,
 }
 
-impl<Txn: crate::StorageContext> From<Table<Txn>> for TableHandler<Txn> {
-    fn from(table: Table<Txn>) -> Self {
+impl<'a, Txn: crate::StorageContext> From<&'a Table<Txn>> for TableHandler<'a, Txn> {
+    fn from(table: &'a Table<Txn>) -> Self {
         Self { table }
     }
 }
@@ -183,7 +185,7 @@ fn value_from_state<State: CollectionState>(state: State, expected: &str) -> TCR
         .try_cast_into(|state| bad_request!("expected {expected}, not {state:?}"))
 }
 
-impl<'a, State, Txn> tc_ir::Handler<'a, State> for TableHandler<Txn>
+impl<'a, State, Txn> tc_ir::Handler<'a, State> for TableHandler<'a, Txn>
 where
     State: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
@@ -195,14 +197,15 @@ where
         Some(Box::new(move |txn, request| {
             Box::pin(async move {
                 let txn_id = txn.id();
-                let table = self.table.clone();
+                let table = self.table;
                 let value: Value =
                     request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+
                 match KeyOrRange::try_from_value(table.schema(), value)? {
-                    KeyOrRange::All => Ok(State::from(table)),
+                    KeyOrRange::All => Ok(State::from(table.read_view())),
                     KeyOrRange::Range(range) => {
                         let slice = table.slice(range, &[], false)?;
-                        Ok(State::from(Table::from(slice)))
+                        Ok(State::from(slice))
                     }
                     KeyOrRange::Key(key) => match table.read_row(txn_id, &key).await? {
                         Some(row) => Ok(State::from(Value::Tuple(row.into_vec()))),
@@ -219,9 +222,10 @@ where
     {
         Some(Box::new(move |txn, key, value| {
             Box::pin(async move {
-                let table = self.table.clone();
+                let table = self.table;
                 let key: Value =
                     key.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+
                 let value = value.into_scalar()?;
                 match KeyOrRange::try_from_value(table.schema(), key)? {
                     KeyOrRange::All => {
@@ -235,10 +239,12 @@ where
                     KeyOrRange::Key(key) => {
                         let value: Value =
                             value.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+
                         let values = match value {
                             Value::Tuple(values) => values,
                             value => vec![value],
                         };
+
                         table.upsert_row(txn, key, values).await
                     }
                 }
@@ -252,7 +258,7 @@ where
     {
         Some(Box::new(move |_txn, request| {
             Box::pin(async move {
-                let table = self.table.clone();
+                let table = self.table;
                 let value = Value::Tuple(
                     request
                         .into_iter()
@@ -263,9 +269,10 @@ where
                         })
                         .collect::<TCResult<_>>()?,
                 );
+
                 let range = cast_into_range(table.schema(), value)?;
                 let slice = table.slice(range, &[], false)?;
-                Ok(State::from(Table::from(slice)))
+                Ok(State::from(slice))
             })
         }))
     }
@@ -276,9 +283,10 @@ where
     {
         Some(Box::new(move |txn, request| {
             Box::pin(async move {
-                let table = self.table.clone();
+                let table = self.table;
                 let value: Value =
                     request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+
                 match KeyOrRange::try_from_value(table.schema(), value)? {
                     KeyOrRange::All => table.truncate(txn, Range::default()).await,
                     KeyOrRange::Key(key) => table.delete_row(txn, key).await,
@@ -289,7 +297,7 @@ where
     }
 }
 
-impl<'a, State, Txn> tc_ir::Handler<'a, State> for ContainsHandler<Txn>
+impl<'a, State, Txn> tc_ir::Handler<'a, State> for ContainsHandler<'a, Txn>
 where
     State: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
@@ -301,9 +309,10 @@ where
         Some(Box::new(move |txn, request| {
             Box::pin(async move {
                 let txn_id = txn.id();
-                let table = self.table.clone();
+                let table = self.table;
                 let value: Value =
                     request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+
                 let filled = match KeyOrRange::try_from_value(table.schema(), value)? {
                     KeyOrRange::All => !table.is_empty(txn_id).await?,
                     KeyOrRange::Key(key) => table.contains_row(txn_id, &key).await?,
@@ -312,13 +321,14 @@ where
                         !slice.is_empty(txn_id).await?
                     }
                 };
+
                 Ok(State::from(Value::from(filled)))
             })
         }))
     }
 }
 
-impl<'a, State, Txn> tc_ir::Handler<'a, State> for CountHandler<Txn>
+impl<'a, State, Txn> tc_ir::Handler<'a, State> for CountHandler<'a, Txn>
 where
     State: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
@@ -330,9 +340,10 @@ where
         Some(Box::new(move |txn, request| {
             Box::pin(async move {
                 let txn_id = txn.id();
-                let table = self.table.clone();
+                let table = self.table;
                 let value: Value =
                     request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+
                 let count: u64 = match KeyOrRange::try_from_value(table.schema(), value)? {
                     KeyOrRange::All => table.count(txn_id).await?,
                     KeyOrRange::Key(key) => u64::from(table.contains_row(txn_id, &key).await?),
@@ -341,13 +352,14 @@ where
                         slice.count(txn_id).await?
                     }
                 };
+
                 Ok(State::from(count))
             })
         }))
     }
 }
 
-impl<'a, State, Txn> tc_ir::Handler<'a, State> for IsEmptyHandler<Txn>
+impl<'a, State, Txn> tc_ir::Handler<'a, State> for IsEmptyHandler<'a, Txn>
 where
     State: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
@@ -359,9 +371,10 @@ where
         Some(Box::new(move |txn, request| {
             Box::pin(async move {
                 let txn_id = txn.id();
-                let table = self.table.clone();
+                let table = self.table;
                 let value: Value =
                     request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+
                 let empty = match KeyOrRange::try_from_value(table.schema(), value)? {
                     KeyOrRange::All => table.is_empty(txn_id).await?,
                     KeyOrRange::Key(key) => !table.contains_row(txn_id, &key).await?,
@@ -369,13 +382,14 @@ where
                         table.slice(range, &[], false)?.is_empty(txn_id).await?
                     }
                 };
+
                 Ok(State::from(Value::from(empty)))
             })
         }))
     }
 }
 
-impl<'a, State, Txn> tc_ir::Handler<'a, State> for InsertHandler<Txn>
+impl<'a, State, Txn> tc_ir::Handler<'a, State> for InsertHandler<'a, Txn>
 where
     State: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
@@ -386,20 +400,22 @@ where
     {
         Some(Box::new(move |txn, key, values| {
             Box::pin(async move {
-                let table = self.table.clone();
+                let table = self.table;
                 let key = value_from_state(State::from(key), "a Table key")?;
                 let key: Vec<Value> =
                     key.try_cast_into(|value| bad_request!("expected a Table key, not {value:?}"))?;
+
                 let values = value_from_state(values, "Table values")?;
                 let values: Vec<Value> = values
                     .try_cast_into(|value| bad_request!("expected Table values, not {value:?}"))?;
+
                 table.insert_row(txn, key, values).await
             })
         }))
     }
 }
 
-impl<'a, State, Txn> tc_ir::Handler<'a, State> for LimitHandler<Txn>
+impl<'a, State, Txn> tc_ir::Handler<'a, State> for LimitHandler<'a, Txn>
 where
     State: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
@@ -410,23 +426,27 @@ where
     {
         Some(Box::new(move |_txn, request| {
             Box::pin(async move {
-                let table = self.table.clone();
+                let table = self.table;
                 let value: Value =
                     request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
-                let Value::Number(limit) = value else {
-                    return Err(bad_request!(
-                        "limit must be a positive integer, not {value:?}"
-                    ));
+
+                let Value::Number(limit @ (Number::UInt(_) | Number::Int(_) | Number::Float(_))) =
+                    value
+                else {
+                    return Err(bad_request!("limit must be a nonnegative integer"));
                 };
-                Ok(State::from(Table::from(
-                    table.limit(u64::cast_from(limit))?,
-                )))
+
+                let limit = UIntType::U64.try_cast(limit).map_err(|error| {
+                    bad_request!("limit must be a nonnegative integer").consume(error)
+                })?;
+
+                Ok(State::from(table.limit(u64::from(limit))))
             })
         }))
     }
 }
 
-impl<'a, State, Txn> tc_ir::Handler<'a, State> for OrderHandler<Txn>
+impl<'a, State, Txn> tc_ir::Handler<'a, State> for OrderHandler<'a, Txn>
 where
     State: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
@@ -437,23 +457,26 @@ where
     {
         Some(Box::new(move |_txn, request| {
             Box::pin(async move {
-                let table = self.table.clone();
+                let table = self.table;
                 let value: Value =
                     request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+
                 let (columns, reverse): (Vec<Id>, bool) = if value.matches::<(Vec<Id>, bool)>() {
                     value.try_cast_into(|v| bad_request!("invalid order request: {v:?}"))?
                 } else {
                     let columns =
                         value.try_cast_into(|v| bad_request!("invalid column list: {v:?}"))?;
+
                     (columns, false)
                 };
-                Ok(State::from(Table::from(table.order_by(&columns, reverse)?)))
+
+                Ok(State::from(table.order_by(&columns, reverse)?))
             })
         }))
     }
 }
 
-impl<'a, State, Txn> tc_ir::Handler<'a, State> for SelectHandler<Txn>
+impl<'a, State, Txn> tc_ir::Handler<'a, State> for SelectHandler<'a, Txn>
 where
     State: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
@@ -464,18 +487,20 @@ where
     {
         Some(Box::new(move |_txn, request| {
             Box::pin(async move {
-                let table = self.table.clone();
+                let table = self.table;
                 let value: Value =
                     request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+
                 let columns: Vec<Id> =
                     value.try_cast_into(|v| bad_request!("invalid column list: {v:?}"))?;
-                Ok(State::from(Table::from(table.select(&columns)?)))
+
+                Ok(State::from(table.select(&columns)?))
             })
         }))
     }
 }
 
-impl<'a, State, Txn> tc_ir::Handler<'a, State> for SchemaHandler<Txn>
+impl<'a, State, Txn> tc_ir::Handler<'a, State> for SchemaHandler<'a, Txn>
 where
     State: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
@@ -488,10 +513,12 @@ where
             Box::pin(async move {
                 let value: Value =
                     request.try_cast_into(|s| bad_request!("expected a value, not {s:?}"))?;
+
                 if value != Value::None {
                     return Err(bad_request!("this route takes no parameters"));
                 }
-                Ok(State::from((self.schema_fn)(&self.table)))
+
+                Ok(State::from((self.schema_fn)(self.table)))
             })
         }))
     }

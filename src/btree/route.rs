@@ -7,19 +7,20 @@ use tc_ir::{Id, Map};
 use tc_value::Value;
 
 use crate::Collection;
-use crate::collection::BTreeView;
 use crate::route::CollectionState;
+use super::BTree;
 
 type BTreeBounds = (Bound<Value>, Bound<Value>);
-struct BTreeHandler<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
-struct Contains<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
-struct Count<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
-struct IsEmpty<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
-struct Slice<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
-struct Insert<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
-struct Delete<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
 
-impl<S, Txn> tc_ir::Route<S> for BTreeView<Txn>
+struct BTreeHandler<'a, Txn: crate::StorageContext>(&'a BTree<Txn>);
+struct Contains<'a, Txn: crate::StorageContext>(&'a BTree<Txn>);
+struct Count<'a, Txn: crate::StorageContext>(&'a BTree<Txn>);
+struct IsEmpty<'a, Txn: crate::StorageContext>(&'a BTree<Txn>);
+struct Slice<'a, Txn: crate::StorageContext>(&'a BTree<Txn>);
+struct Insert<'a, Txn: crate::StorageContext>(&'a BTree<Txn>);
+struct Delete<'a, Txn: crate::StorageContext>(&'a BTree<Txn>);
+
+impl<S, Txn> tc_ir::Route<S> for BTree<Txn>
 where
     S: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
@@ -41,10 +42,14 @@ where
     }
 }
 
-impl<Txn: crate::StorageContext> BTreeView<Txn> {
+impl<Txn: crate::StorageContext> BTree<Txn> {
     fn slice_from_key<S: CollectionState>(&self, key: S) -> TCResult<Self> {
         if key.is_none() {
-            Ok(self.clone())
+            Ok(if self.is_persistent() {
+                self.slice((Bound::Unbounded, Bound::Unbounded), false)
+            } else {
+                self.clone()
+            })
         } else {
             let (bounds, reverse) = slice_bounds_from_state(key)?;
             Ok(self.slice(bounds, reverse))
@@ -56,6 +61,7 @@ fn row_from_state<S: CollectionState>(state: S, context: &str) -> TCResult<Vec<V
     let value = Value::try_cast_from(state.into_scalar()?, |_| {
         TCError::bad_request(format!("expected {context} values"))
     })?;
+
     match value {
         Value::Tuple(row) => Ok(row),
         _ => Err(TCError::bad_request(format!("expected {context} tuple"))),
@@ -80,6 +86,7 @@ fn slice_bounds_from_state<S: CollectionState>(key: S) -> TCResult<(BTreeBounds,
         })
         .transpose()?
         .unwrap_or(false);
+
     Ok(((start, end), reverse))
 }
 
@@ -120,10 +127,17 @@ where
         Some(Box::new(move |txn, key| {
             Box::pin(async move {
                 self.0
-                    .btree
+                    .persistent()?
                     .delete_row(txn, row_from_state(S::from(key), "BTree row")?)
                     .await
-                    .map_err(|err| TCError::bad_request(err.to_string()))
+                    .map_err(|error| {
+                        let error = txn.storage_error(error);
+                        if error.requires_recovery() {
+                            error
+                        } else {
+                            TCError::bad_request(error)
+                        }
+                    })
             })
         }))
     }
@@ -142,9 +156,8 @@ where
             Box::pin(async move {
                 Ok(S::from(Value::from(
                     self.0
-                        .btree
                         .contains_row(txn.id(), &row_from_state(S::from(key), "BTree row")?)
-                        .await,
+                        .await?,
                 )))
             })
         }))
@@ -163,12 +176,7 @@ where
         Some(Box::new(move |txn, key| {
             Box::pin(async move {
                 let view = self.0.slice_from_key(S::from(key))?;
-                Ok(S::from(Value::from(
-                    view.btree
-                        .slice(view.bounds.clone(), view.reverse)
-                        .count(txn.id())
-                        .await,
-                )))
+                Ok(S::from(Value::from(view.count(txn.id()).await?)))
             })
         }))
     }
@@ -186,12 +194,7 @@ where
         Some(Box::new(move |txn, key| {
             Box::pin(async move {
                 let view = self.0.slice_from_key(S::from(key))?;
-                Ok(S::from(Value::from(
-                    view.btree
-                        .slice(view.bounds.clone(), view.reverse)
-                        .is_empty(txn.id())
-                        .await,
-                )))
+                Ok(S::from(Value::from(view.is_empty(txn.id()).await?)))
             })
         }))
     }
@@ -231,11 +234,19 @@ where
                 if !S::from(key).is_none() {
                     return Err(TCError::bad_request("BTree insert expects a null key"));
                 }
+
                 self.0
-                    .btree
+                    .persistent()?
                     .insert_row(txn, row_from_state(row, "BTree row")?)
                     .await
-                    .map_err(|err| TCError::bad_request(err.to_string()))
+                    .map_err(|error| {
+                        let error = txn.storage_error(error);
+                        if error.requires_recovery() {
+                            error
+                        } else {
+                            TCError::bad_request(error)
+                        }
+                    })
             })
         }))
     }
@@ -253,10 +264,17 @@ where
         Some(Box::new(move |txn, key| {
             Box::pin(async move {
                 self.0
-                    .btree
+                    .persistent()?
                     .delete_row(txn, row_from_state(S::from(key), "BTree row")?)
                     .await
-                    .map_err(|err| TCError::bad_request(err.to_string()))
+                    .map_err(|error| {
+                        let error = txn.storage_error(error);
+                        if error.requires_recovery() {
+                            error
+                        } else {
+                            TCError::bad_request(error)
+                        }
+                    })
             })
         }))
     }

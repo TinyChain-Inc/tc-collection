@@ -2,17 +2,14 @@
 
 The repository-local
 [`TRANSACTIONAL_COLLECTION_CONTRACT.md`](TRANSACTIONAL_COLLECTION_CONTRACT.md)
-is the canonical behavioral contract. The parent
-[workspace invariants](https://github.com/TinyChain-Inc/tcv2/blob/main/AGENTS.md)
-are non-normative integration context when this repository is used as a submodule.
+is the canonical behavioral contract.
 
 - Own BTree, Table, Tensor, and Collection values, local operations, routes,
   views, codecs, and deterministic transaction behavior.
 - Implement `Route` directly on each concrete collection and delegate the
   `Collection` enum to it. Select each operation once, retain no unresolved
-  path, and do not repeat traversal in a terminal handler. The parent workspace's
-  [native-routing contract](https://github.com/TinyChain-Inc/tcv2/blob/main/tc-ir/IR_INTERFACE_GUIDELINES.md#native-routing)
-  is non-normative integration context for these shared interfaces.
+  path, and do not repeat traversal in a terminal handler. See the shared
+  [native-routing contract](https://github.com/TinyChain-Inc/tc-ir/blob/main/IR_INTERFACE_GUIDELINES.md#native-routing).
 - Represent each selected operation with a small terminal handler borrowing its
   collection receiver. Do not clone the receiver into every handler or replace
   the terminal types with an operation tag, aggregate method switch, adapter
@@ -22,18 +19,22 @@ are non-normative integration context when this repository is used as a submodul
   duplicating universal State matching.
 - Keep routes, views, and codecs separate: routes know behavior, views acquire
   consistent streams and guards, and codecs know wire structure.
+- Construct Table schemas from Value through `TryFrom<Value, Error = TCError>`.
+  Keep semantic construction fallible instead of maintaining a separate
+  castability predicate which can disagree with the constructor.
 - Stream large scans and keysets. Do not collect unknown-length keys or rows into
   an intermediate vector, map, or set.
 - Receive bootstrap- or transaction-delegated storage/allocation handles. Never
   construct a cache, derive a transaction workspace path, or choose caller storage
-  policy. Allocate transaction-local deltas from the delegated `StorageContext`;
+  policy. Stage deltas beneath the delegated collection owner; fresh literals
+  receive roots from `StorageContext`;
   store `BTreeLock` and `TableLock` with `StorageContext::File` directly; do not
   add storage-mode enums, erased store traits, forwarding wrappers, erased
   directory handles, or runtime downcasts.
 - Standalone named persistent collections are unsupported. Literal and
   transaction-local collections are owned by their enclosing request. Public
   hosting is outside this crate. Persistent owners provide transactional visibility
-  and native materialization; the caller owns durable requests and recovery.
+  and durable native publication; the caller owns durable requests and replay.
 - Callers own durable history, replay, canonical-state selection, and
   reconciliation. Collections own local state transitions and fail closed on
   ambiguity; they do not maintain a WAL, select canonical history, or repair
@@ -43,6 +44,6 @@ are non-normative integration context when this repository is used as a submodul
   or adapter path.
 - Every `Transact` method is fallible and idempotent. Preserve one documented
   lock order, release guards before cross-domain operations, and test conflicts,
-  wait-until-finalize, restart, and finalize/sync deadlocks.
+  wait-until-finalize, restart, and publication lock-order deadlocks.
 - Use the shared guard-owning stream for values that retain permits or read
   guards. Cancellation and drop release all owned capacity.

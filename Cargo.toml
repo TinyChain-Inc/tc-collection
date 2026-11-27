@@ -3,6 +3,17 @@ name = "tc-collection"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+benchmarks = []
+complex = ["fensor/complex"]
+
+# Optional optimized iteration with development assertions and overflow checks.
+[profile.dev-opt]
+inherits = "dev"
+opt-level = 1
+debug = 0
+lto = "off"
+
 [dependencies]
 async-hash = { path = "../deps/async-hash" }
 b-table = { path = "../deps/b-table", features = ["stream"] }
@@ -10,13 +21,13 @@ b-tree = { path = "../deps/b-tree", features = ["stream"] }
 collate = { path = "../deps/collate", features = ["stream"] }
 destream = { path = "../deps/destream", version = "0.10.1" }
 freqfs = { path = "../deps/freqfs", version = "0.13" }
-ha-ndarray = { path = "../deps/ha-ndarray" }
+fensor = { path = "../deps/fensor" }
 futures = "0.3"
 get-size = "0.1"
 number-general = { path = "../deps/number-general" }
 safecast = "0.2"
 tc-ir = { path = "../tc-ir" }
-tc-error = { path = "../tc-error", features = ["txn_lock"] }
+tc-error = { path = "../tc-error", features = ["txn_lock", "fensor"] }
 tc-value = { path = "../tc-value" }
 pathlink = { path = "../deps/pathlink" }
 tbon = { path = "../deps/tbon", version = "0.9", features = ["tokio-io"] }
@@ -26,3 +37,13 @@ txn_lock = { path = "../deps/txn_lock" }
 [dev-dependencies]
 destream_json = { path = "../deps/destream_json", version = "0.15", default-features = false }
 umask = "2.1"
+
+[[test]]
+name = "tensor_benchmark"
+path = "tests/tensor_benchmark.rs"
+required-features = ["benchmarks"]
+
+[[test]]
+name = "persistence_benchmark"
+path = "tests/persistence_benchmark.rs"
+required-features = ["benchmarks"]

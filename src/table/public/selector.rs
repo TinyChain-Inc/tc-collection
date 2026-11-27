@@ -43,7 +43,7 @@ impl KeyOrRange {
             Value::None => Ok(Self::All),
             Value::Tuple(ref tuple) if tuple.is_empty() => Ok(Self::All),
             Value::Tuple(tuple)
-                if tuple.iter().all(|v| match v {
+                if tuple.iter().all(|v| match &v {
                     Value::Tuple(pair) if pair.len() == 2 => match &pair[0] {
                         Value::String(name) => columns.iter().any(|c| c.as_str() == name.as_str()),
                         _ => false,
@@ -98,9 +98,11 @@ pub(crate) fn cast_into_range(schema: &TableSchema, value: Value) -> TCResult<Ra
                 let lower: Bound<Value> = bounds[0]
                     .clone()
                     .try_cast_into(|bound| bad_request!("invalid lower bound: {bound:?}"))?;
+
                 let upper: Bound<Value> = bounds[1]
                     .clone()
                     .try_cast_into(|bound| bad_request!("invalid upper bound: {bound:?}"))?;
+
                 ColumnRange::In((lower, upper))
             }
             _ => ColumnRange::Eq(pair[1].clone()),

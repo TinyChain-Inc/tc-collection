@@ -1,13 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use b_table::{ColumnRange, IndexSchema, Range, Schema};
+use b_table::{IndexSchema, Schema};
 use b_tree::Schema as BTreeSchema;
 use safecast::{CastFrom, TryCastFrom};
 use tc_error::TCError;
 use tc_ir::Id;
 use tc_value::{Value, ValueType};
 
+use super::stream::Projection;
 use crate::btree::StorageConfig;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,13 +55,6 @@ impl TableIndexSchema {
     pub fn storage(&self) -> &StorageConfig {
         &self.storage
     }
-
-    pub fn into_columns(self) -> impl Iterator<Item = Column> {
-        self.column_names
-            .into_iter()
-            .zip(self.column_types)
-            .map(|(name, dtype)| Column { name, dtype })
-    }
 }
 
 impl b_tree::Schema for TableIndexSchema {
@@ -79,18 +73,17 @@ impl b_tree::Schema for TableIndexSchema {
         self.storage.order
     }
 
-    fn validate_key(&self, key: Vec<Value>) -> Result<Vec<Value>, Self::Error> {
-        if key.len() != self.column_names.len() {
+    fn validate_prefix(&self, prefix: &[Value]) -> Result<(), Self::Error> {
+        if prefix.is_empty() || prefix.len() > self.column_names.len() {
             return Err(tc_error::bad_request!(
-                "key arity {} does not match index column count {}",
-                key.len(),
+                "index separator must contain 1..={} columns",
                 self.column_names.len()
             ));
         }
 
-        for (i, (value, expected)) in key.iter().zip(self.column_types.iter()).enumerate() {
+        for (i, (value, expected)) in prefix.iter().zip(self.column_types.iter()).enumerate() {
             let actual = value.class();
-            if &actual != expected {
+            if !expected.accepts(&actual) {
                 return Err(tc_error::bad_request!(
                     "column {i} expected {:?} but got {:?}",
                     expected,
@@ -99,7 +92,19 @@ impl b_tree::Schema for TableIndexSchema {
             }
         }
 
-        Ok(key)
+        Ok(())
+    }
+
+    fn validate_key(&self, key: &[Value]) -> Result<(), Self::Error> {
+        if key.len() != self.column_names.len() {
+            return Err(tc_error::bad_request!(
+                "key arity {} does not match index column count {}",
+                key.len(),
+                self.column_names.len()
+            ));
+        }
+
+        self.validate_prefix(key)
     }
 }
 
@@ -137,6 +142,7 @@ impl TableSchema {
 
         let mut column_map: HashMap<&Id, &Column> =
             HashMap::with_capacity(key.len() + values.len());
+
         for col in key.iter().chain(values.iter()) {
             column_map.insert(&col.name, col);
         }
@@ -148,6 +154,12 @@ impl TableSchema {
 
         let mut aux_indices = Vec::with_capacity(indices.len());
         for (index_name, column_names) in indices {
+            if column_names.is_empty() || column_names.iter().any(|name| key_names.contains(name)) {
+                return Err(tc_error::bad_request!(
+                    "index {index_name} must declare nonempty value columns; primary keys are appended automatically"
+                ));
+            }
+
             let mut index_columns = Vec::with_capacity(column_names.len() + key.len());
             for name in &column_names {
                 let col = column_map.get(name).copied().ok_or_else(|| {
@@ -155,21 +167,27 @@ impl TableSchema {
                         "index {index_name} references nonexistent column {name}"
                     )
                 })?;
+
                 index_columns.push(col.clone());
             }
+
             for col in &key {
                 index_columns.push(col.clone());
             }
+
             let index_schema = TableIndexSchema::new(index_columns, storage)?;
             aux_indices.push((index_name, index_schema));
         }
 
-        Ok(Self {
+        let schema = Self {
             key: key_names,
             values: value_names,
             primary,
             indices: aux_indices,
-        })
+        };
+
+        Schema::validate(&schema).map_err(TCError::bad_request)?;
+        Ok(schema)
     }
 
     pub fn key(&self) -> &[Id] {
@@ -192,33 +210,33 @@ impl TableSchema {
         self.key.len() + self.values.len()
     }
 
-    pub fn range_from_key(&self, key: &[Value]) -> Result<Range<Id, Value>, TCError> {
-        if key.len() != self.key.len() {
-            return Err(tc_error::bad_request!(
-                "key arity {} does not match schema key arity {}",
-                key.len(),
-                self.key.len()
-            ));
-        }
-
-        let mut range = HashMap::with_capacity(key.len());
-        for (name, val) in self.key.iter().zip(key) {
-            range.insert(name.clone(), ColumnRange::Eq(val.clone()));
-        }
-
-        Ok(range.into())
-    }
-
     pub fn storage(&self) -> &StorageConfig {
         self.primary.storage()
     }
 
-    pub(crate) fn project(&self, columns: &[Id]) -> Result<(Self, Vec<Id>), TCError> {
-        for column in columns {
+    pub(super) fn same_semantics(&self, other: &Self) -> bool {
+        let same_columns = |left: &TableIndexSchema, right: &TableIndexSchema| {
+            left.column_names == right.column_names && left.column_types == right.column_types
+        };
+
+        self.key == other.key
+            && self.values == other.values
+            && same_columns(&self.primary, &other.primary)
+            && self.indices.len() == other.indices.len()
+            && self.indices.iter().zip(&other.indices).all(
+                |((name, index), (other_name, other_index))| {
+                    name == other_name && same_columns(index, other_index)
+                },
+            )
+    }
+
+    pub(super) fn project(&self, columns: Vec<Id>) -> Result<(Self, Projection), TCError> {
+        for column in &columns {
             if !self.columns().any(|name| name == column) {
                 return Err(tc_error::not_found!("column not found: {column}"));
             }
         }
+
         for key in &self.key {
             if !columns.contains(key) {
                 return Err(tc_error::bad_request!(
@@ -227,14 +245,35 @@ impl TableSchema {
             }
         }
 
-        let mut selected: Vec<Column> = self
-            .column_schema()
-            .filter(|column| columns.contains(&column.name))
+        if !columns.starts_with(&self.key) {
+            return Err(TCError::bad_request(
+                "Table selection must retain the original key prefix",
+            ));
+        }
+
+        let mut unique = HashSet::with_capacity(columns.len());
+        for column in &columns {
+            if !unique.insert(column) {
+                return Err(tc_error::bad_request!(
+                    "duplicate Table selection column {column}"
+                ));
+            }
+        }
+
+        drop(unique);
+        let projection = Projection::new(self, &columns);
+        let mut selected: Vec<Column> = columns
+            .into_iter()
+            .zip(projection.indices())
+            .map(|(name, index)| Column {
+                name,
+                dtype: self.primary.column_types[index].clone(),
+            })
             .collect();
-        let columns = selected.iter().map(|column| column.name.clone()).collect();
+
         let values = selected.split_off(self.key.len());
         let schema = Self::new(selected, values, Vec::new(), *self.storage())?;
-        Ok((schema, columns))
+        Ok((schema, projection))
     }
 }
 
@@ -272,7 +311,7 @@ impl Schema for TableSchema {
         let key_types = &self.primary.column_types[..self.key.len()];
         for (i, (value, expected)) in key.iter().zip(key_types.iter()).enumerate() {
             let actual = value.class();
-            if &actual != expected {
+            if !expected.accepts(&actual) {
                 return Err(tc_error::bad_request!(
                     "key column {i} expected {:?} but got {:?}",
                     expected,
@@ -296,7 +335,7 @@ impl Schema for TableSchema {
         let value_types = &self.primary.column_types[self.key.len()..];
         for (i, (value, expected)) in values.iter().zip(value_types.iter()).enumerate() {
             let actual = value.class();
-            if &actual != expected {
+            if !expected.accepts(&actual) {
                 return Err(tc_error::bad_request!(
                     "value column {i} expected {:?} but got {:?}",
                     expected,
@@ -331,77 +370,66 @@ impl TableSchema {
     }
 }
 
-impl TryCastFrom<Value> for TableSchema {
-    fn can_cast_from(value: &Value) -> bool {
-        let Value::Tuple(outer) = value else {
-            return false;
-        };
-        if outer.len() != 2 {
-            return false;
-        }
-        let Value::Tuple(inner) = &outer[0] else {
-            return false;
-        };
-        inner.len() == 2
-            && is_column_list(&inner[0])
-            && is_column_list(&inner[1])
-            && is_index_list(&outer[1])
-    }
+impl TryFrom<Value> for TableSchema {
+    type Error = TCError;
 
-    fn opt_cast_from(value: Value) -> Option<Self> {
-        let Value::Tuple(outer) = &value else {
-            return None;
-        };
-        if outer.len() != 2 {
-            return None;
-        }
-        let Value::Tuple(inner) = &outer[0] else {
-            return None;
-        };
-        if inner.len() != 2 {
-            return None;
-        }
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        let (columns, indices) = <(Value, Value)>::try_cast_from(value, |_| {
+            tc_error::bad_request!("expected Table schema [[key, values], indices]")
+        })?;
 
-        let key = cast_column_list(&inner[0])?;
-        let values = cast_column_list(&inner[1])?;
-        let indices = cast_index_list(&outer[1])?;
+        let (key, values) = <(Value, Value)>::try_cast_from(columns, |_| {
+            tc_error::bad_request!("expected Table schema columns [key, values]")
+        })?;
 
-        Self::new(key, values, indices, StorageConfig::default()).ok()
+        let key = cast_column_list(key, "key")?;
+        let values = cast_column_list(values, "value")?;
+        let indices = cast_index_list(indices)?;
+
+        Self::new(key, values, indices, StorageConfig::default())
     }
 }
 
-fn is_column_list(value: &Value) -> bool {
-    let Value::Tuple(tuple) = value else {
-        return false;
+fn cast_column_list(value: Value, kind: &str) -> Result<Vec<Column>, TCError> {
+    let Value::Tuple(columns) = value else {
+        return Err(tc_error::bad_request!("expected Table {kind} column list"));
     };
-    tuple.iter().all(Column::can_cast_from)
+
+    columns
+        .into_iter()
+        .map(|column| {
+            Column::try_cast_from(column, |column| {
+                tc_error::bad_request!("invalid Table {kind} column: {column:?}")
+            })
+        })
+        .collect()
 }
 
-fn is_index_list(value: &Value) -> bool {
-    match value {
-        Value::None => true,
-        Value::Tuple(tuple) => tuple.iter().all(<(String, Vec<Id>)>::can_cast_from),
-        _ => false,
-    }
-}
-
-fn cast_column_list(value: &Value) -> Option<Vec<Column>> {
-    let Value::Tuple(tuple) = value else {
-        return None;
+fn cast_index_list(value: Value) -> Result<Vec<(String, Vec<Id>)>, TCError> {
+    let indices = match value {
+        Value::None => return Ok(Vec::new()),
+        Value::Tuple(indices) => indices,
+        _ => return Err(tc_error::bad_request!("expected Table index list")),
     };
-    tuple.iter().cloned().map(Column::opt_cast_from).collect()
-}
 
-fn cast_index_list(value: &Value) -> Option<Vec<(String, Vec<Id>)>> {
-    match value {
-        Value::None => Some(Vec::new()),
-        Value::Tuple(tuple) => tuple
-            .iter()
-            .cloned()
-            .map(<(String, Vec<Id>)>::opt_cast_from)
-            .collect(),
-        _ => None,
-    }
+    indices
+        .into_iter()
+        .map(|index| {
+            let (name, columns) = <(Value, Value)>::try_cast_from(index, |_| {
+                tc_error::bad_request!("expected Table index [name, columns]")
+            })?;
+
+            let Value::String(name) = name else {
+                return Err(tc_error::bad_request!("Table index name must be a string"));
+            };
+
+            let columns = Vec::<Id>::try_cast_from(columns, |_| {
+                tc_error::bad_request!("invalid columns for Table index {name}")
+            })?;
+
+            Ok((name, columns))
+        })
+        .collect()
 }
 
 impl CastFrom<TableSchema> for Value {
@@ -417,6 +445,7 @@ impl CastFrom<TableSchema> for Value {
                 ])
             })
             .collect::<Vec<_>>();
+
         let key = Value::Tuple(key);
 
         let values = schema
@@ -430,6 +459,7 @@ impl CastFrom<TableSchema> for Value {
                 ])
             })
             .collect::<Vec<_>>();
+
         let values = Value::Tuple(values);
 
         let indices = schema
@@ -443,9 +473,11 @@ impl CastFrom<TableSchema> for Value {
                     .take(col_count)
                     .map(|c| Value::String(c.to_string()))
                     .collect::<Vec<_>>();
+
                 Value::Tuple(vec![Value::String(name.clone()), Value::Tuple(cols)])
             })
             .collect::<Vec<_>>();
+
         let indices = Value::Tuple(indices);
 
         Value::Tuple(vec![Value::Tuple(vec![key, values]), indices])
@@ -454,26 +486,11 @@ impl CastFrom<TableSchema> for Value {
 
 impl TryCastFrom<Value> for Column {
     fn can_cast_from(value: &Value) -> bool {
-        let Value::Tuple(pair) = value else {
-            return false;
-        };
-        pair.len() == 2
-            && matches!(&pair[0], Value::String(_))
-            && ValueType::can_cast_from(&pair[1])
+        <(Id, ValueType)>::can_cast_from(value)
     }
 
     fn opt_cast_from(value: Value) -> Option<Self> {
-        let Value::Tuple(pair) = &value else {
-            return None;
-        };
-        if pair.len() != 2 {
-            return None;
-        }
-        let Value::String(name_str) = &pair[0] else {
-            return None;
-        };
-        let name = name_str.parse::<Id>().ok()?;
-        let dtype = ValueType::opt_cast_from(pair[1].clone())?;
+        let (name, dtype) = <(Id, ValueType)>::opt_cast_from(value)?;
         Some(Column { name, dtype })
     }
 }
@@ -494,6 +511,7 @@ impl fmt::Display for TableSchema {
             "TableSchema(key={:?}, values={:?}",
             self.key, self.values
         )?;
+
         if !self.indices.is_empty() {
             write!(
                 f,
@@ -501,6 +519,7 @@ impl fmt::Display for TableSchema {
                 self.indices.iter().map(|(n, _)| n).collect::<Vec<_>>()
             )?;
         }
+
         write!(f, ")")
     }
 }

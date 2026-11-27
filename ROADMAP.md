@@ -3,17 +3,17 @@
 This file contains only unimplemented collection work. Current behavior is
 specified by the crate README and transactional collection contract.
 
-## Persistent Tensor backend
+## Execution costs
 
-- Replace the private in-memory Tensor backend without changing the public
-  Tensor State variant, codec, route family, or lifecycle.
-- Preserve bounded streaming and device admission through the existing owner
-  contracts.
-- Complete transaction visibility, conflict, finalization, restart
-  materialization, and cancellation tests before removing the old backend.
+Evaluate absent point reads and Table first-write baseline lookups under workloads
+with long retained histories. These searches remain linear in visible layers;
+any additional summary must justify its retained-memory and lifecycle costs with
+measurements. Do not hide eager query materialization or truncate visible history.
 
-## Parity verification
+Logical-length hashing remains linear with the existing digest definition, even
+after batching and exact zero-digest reuse. A retained-content sparse digest would
+require an explicit semantic change; it is not an implementation optimization.
 
-- Finish any open BTree and Table cases in the transactional contract.
-- Apply the same contract to persistent Tensor before declaring the migration
-  complete.
+Further sparse traversal optimizations belong to fensor's owning interfaces.
+Reordered mappings and aggregate output traversal remain bounded but may visit
+logical cardinality; they introduce no hidden sorting or materialization.

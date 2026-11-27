@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: "1"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+defaults:
+  run:
+    working-directory: tc-collection
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: tc-collection
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Fetch pinned dependencies
+        env:
+          GH_TOKEN: ${{ secrets.DEPENDENCY_READ_TOKEN || github.token }}
+        run: |
+          gh auth setup-git
+          python3 ci/bootstrap.py
+      - run: cargo fmt -- --check
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            features: benchmarks
+            test-args: ""
+          - name: complex
+            features: benchmarks,complex
+            test-args: --features complex
+    name: test (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: tc-collection
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Fetch pinned dependencies
+        env:
+          GH_TOKEN: ${{ secrets.DEPENDENCY_READ_TOKEN || github.token }}
+        run: |
+          gh auth setup-git
+          python3 ci/bootstrap.py
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tc-collection
+          key: ${{ matrix.name }}-${{ hashFiles('tc-collection/ci/dependencies.json') }}
+      - run: cargo clippy --locked --all-targets --features ${{ matrix.features }} -- -D warnings
+      - run: cargo test --locked --lib ${{ matrix.test-args }}
+      - if: matrix.name == 'complex'
+        run: cargo test --locked --doc --features complex
