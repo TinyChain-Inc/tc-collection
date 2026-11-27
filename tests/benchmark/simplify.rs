@@ -72,7 +72,7 @@ async fn primary_reads() {
 
         let native = b_table::TableLock::create(
             schema,
-            b_tree::IndexOrder::new(ValueCollator::default()),
+            ValueCollator::default(),
             txn.context().await.unwrap(),
         )
         .await
@@ -161,11 +161,18 @@ async fn tied_keys() {
 
         let count = Arc::new(AtomicUsize::new(0));
         let native = b_tree::BTreeLock::create(
-            tc_collection::btree::BTreeSchema::new(StorageConfig::default(), 1, None).unwrap(),
-            b_tree::IndexOrder::new(Counted {
+            tc_collection::btree::BTreeSchema::try_from(vec![
+                tc_collection::btree::BTreeColumnSchema {
+                    name: "key".into(),
+                    dtype: tc_value::ValueType::Number(tc_value::NumberType::Number),
+                    max_size: None,
+                },
+            ])
+            .unwrap(),
+            Counted {
                 inner: ValueCollator::default(),
                 comparisons: count.clone(),
-            }),
+            },
             txn.context().await.unwrap(),
         )
         .await

@@ -1,7 +1,8 @@
 //! Transaction-consistent Tensor streams prepared for encoding.
 
-use futures::stream::BoxStream;
+use destream::en;
 use futures::{StreamExt, TryStreamExt};
+use futures::stream::BoxStream;
 use number_general::Number;
 use tc_error::TCResult;
 use tc_ir::IntoView;
@@ -10,11 +11,11 @@ use super::{Tensor, TensorSchema};
 use crate::StorageContext;
 
 pub struct TensorView {
-    pub(crate) schema: TensorSchema,
-    pub(crate) contents: Contents,
+    schema: TensorSchema,
+    contents: Contents,
 }
 
-pub(crate) enum Contents {
+enum Contents {
     Dense(BoxStream<'static, TCResult<Number>>),
     Sparse(super::SparseElements),
 }
@@ -45,5 +46,17 @@ impl<Txn: StorageContext> IntoView for Tensor<Txn> {
         };
 
         Ok(TensorView { schema, contents })
+    }
+}
+
+impl<'en> en::IntoStream<'en> for TensorView {
+    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
+        let schema = self.schema.logical_value();
+        match self.contents {
+            Contents::Sparse(entries) => {
+                (schema, en::SeqStream::from(entries)).into_stream(encoder)
+            }
+            Contents::Dense(values) => (schema, en::SeqStream::from(values)).into_stream(encoder),
+        }
     }
 }

@@ -83,7 +83,7 @@ where
                 .await
                 .unwrap();
 
-                let geometry = native.storage_geometry();
+                let geometry = native.storage_geometry().clone();
                 assert_eq!(geometry.block_capacity(), capacity);
                 native.sync_all().await.unwrap();
                 drop(native);
@@ -208,7 +208,6 @@ where
 
                 let start = Instant::now();
                 tensor.finalize(&id(44)).boxed().await.unwrap();
-                tensor.sync_all().await.unwrap();
                 record(&workload, "finalize_sync", "mixed", start.elapsed());
                 scan(&tensor, &expected, 50).await;
             }

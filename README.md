@@ -14,10 +14,10 @@ allocation, durable history, or reconciliation. Literal and transaction-local
 values receive a delegated transaction and allocation context. Long-lived
 public hosting is outside this crate.
 
-Persistent BTree, Table, and Tensor owners provide in-memory transactional visibility and
-in-place canonical materialization. `PersistentFile` stores tagged native nodes, typed Tensor blocks, and metadata.
-Commit is not independently crash-durable. Native restoration, strict loading,
-and caller-owned recovery are described by the
+Persistent BTree, Table, and Tensor owners provide durable transactional commit
+and immutable native version compaction. `PersistentFile` stores tagged native
+nodes, typed Tensor blocks, and publication metadata. Native restoration,
+strict loading, and the Chain recovery handoff are described by the
 [transactional collection contract](TRANSACTIONAL_COLLECTION_CONTRACT.md).
 
 `TableSchema::try_from(value)` consumes Value-backed schema fields and returns
@@ -31,6 +31,9 @@ Native BTree schema preparation
 borrows columns through `BTreeSchema::try_from(columns.as_slice())`; it does not
 consume or clone their names and size metadata.
 
+Create a native BTree with `BTree::try_with_schema(dir, schema)`; construction
+requires an explicit schema.
+
 Every application mutation of a persistent mutable collection must pass through
 its owning Chain. Returned views grant read access, not mutation authority,
 including full reads and identity transforms. Selection-write conveniences
@@ -38,10 +41,9 @@ address the original owner with explicit bounds. Trusted native callers handing
 an unpublished collection to Chain relinquish mutable aliases and must not reopen
 the same storage independently.
 
-`collection::BTreeView::new(columns, owner)` returns `TCResult` and requires
-matching typed backing storage. Views have private representation and immutable
-schema metadata shared by their clones and slices; use `schema()` and `persistent()`
-for inspection. Raw untyped BTree operations remain supported directly.
+`btree::BTree` represents an owner or a read-only slice, with one validated native
+schema shared by clones and slices. See the [collection contract](TRANSACTIONAL_COLLECTION_CONTRACT.md)
+for construction, view composition, and transaction behavior.
 
 ## Tensor
 
@@ -51,12 +53,11 @@ point access, assignment, `CopyFrom`, and terminal consumption are asynchronous
 and use a delegated transaction or directory. Geometric views are lazy and
 read-only.
 
-Use `Tensor::copy_values` or the `copy_values` route for an explicit copy of every
-logical value when indexed copying is unsupported. This includes implicit sparse
-zeros and can be expensive. Use `as_dense` for a lazy dense view.
+Use `CopyFrom` to materialize a Tensor and `as_dense` for a lazy dense view.
 
 Caller file compositions use
-`delegate_tensor_files!(ApplicationBlock, Collection)` alongside `CollectionNode`.
+`delegate_collection_files!(ApplicationBlock, Collection)` to delegate every
+required native payload, including nodes and publication metadata.
 See the contract for [Tensor representation and numerical behavior](TRANSACTIONAL_COLLECTION_CONTRACT.md#tensor-values-and-numerical-execution),
 [visibility](TRANSACTIONAL_COLLECTION_CONTRACT.md#visibility-and-ordering),
 [locking and resource bounds](TRANSACTIONAL_COLLECTION_CONTRACT.md#locking-and-backpressure),

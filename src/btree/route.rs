@@ -7,20 +7,20 @@ use tc_ir::{Id, Map};
 use tc_value::Value;
 
 use crate::Collection;
-use crate::collection::BTreeView;
 use crate::route::CollectionState;
+use super::BTree;
 
 type BTreeBounds = (Bound<Value>, Bound<Value>);
 
-struct BTreeHandler<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
-struct Contains<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
-struct Count<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
-struct IsEmpty<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
-struct Slice<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
-struct Insert<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
-struct Delete<'a, Txn: crate::StorageContext>(&'a BTreeView<Txn>);
+struct BTreeHandler<'a, Txn: crate::StorageContext>(&'a BTree<Txn>);
+struct Contains<'a, Txn: crate::StorageContext>(&'a BTree<Txn>);
+struct Count<'a, Txn: crate::StorageContext>(&'a BTree<Txn>);
+struct IsEmpty<'a, Txn: crate::StorageContext>(&'a BTree<Txn>);
+struct Slice<'a, Txn: crate::StorageContext>(&'a BTree<Txn>);
+struct Insert<'a, Txn: crate::StorageContext>(&'a BTree<Txn>);
+struct Delete<'a, Txn: crate::StorageContext>(&'a BTree<Txn>);
 
-impl<S, Txn> tc_ir::Route<S> for BTreeView<Txn>
+impl<S, Txn> tc_ir::Route<S> for BTree<Txn>
 where
     S: CollectionState<Txn = Txn>,
     Txn: crate::StorageContext,
@@ -42,7 +42,7 @@ where
     }
 }
 
-impl<Txn: crate::StorageContext> BTreeView<Txn> {
+impl<Txn: crate::StorageContext> BTree<Txn> {
     fn slice_from_key<S: CollectionState>(&self, key: S) -> TCResult<Self> {
         if key.is_none() {
             Ok(if self.is_persistent() {

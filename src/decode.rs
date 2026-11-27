@@ -1,8 +1,7 @@
 use destream::de::{self, FromStream};
 
-use crate::btree::DecodedBTreePayload;
-use crate::collection::BTreeView;
-use crate::table::DecodedTablePayload;
+use crate::btree::BTree;
+use crate::table::Table;
 use crate::tensor::Tensor;
 use crate::{Collection, CollectionType};
 
@@ -17,16 +16,12 @@ where
     D: de::Decoder,
 {
     match class {
-        CollectionType::BTree(_) => {
-            let payload = DecodedBTreePayload::<Txn>::from_stream(txn, decoder).await?;
-            Ok(Collection::BTree(Box::new(
-                BTreeView::new(payload.schema, payload.btree).map_err(de::Error::custom)?,
-            )))
-        }
-        CollectionType::Table(_) => {
-            let payload = DecodedTablePayload::<Txn>::from_stream(txn, decoder).await?;
-            Ok(Collection::from(payload.table))
-        }
+        CollectionType::BTree(_) => BTree::<Txn>::from_stream(txn, decoder)
+            .await
+            .map(|view| Collection::BTree(Box::new(view))),
+        CollectionType::Table(_) => Table::<Txn>::from_stream(txn, decoder)
+            .await
+            .map(Collection::from),
         CollectionType::Tensor(_) => Tensor::<Txn>::from_stream(txn, decoder)
             .await
             .map(Collection::Tensor),

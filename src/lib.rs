@@ -3,13 +3,11 @@
 
 mod class;
 mod decode;
-mod encode;
 mod persistence;
 mod persistent_file;
 mod stream;
 mod txn;
 mod view;
-
 pub mod btree;
 pub mod collection;
 pub mod route;
@@ -23,13 +21,16 @@ pub use fensor::complex::{Complex32 as TensorComplex32, Complex64 as TensorCompl
 pub use class::{BTreeType, CollectionType, TableType, TensorType};
 pub use collection::Collection;
 pub use decode::decode_collection;
+pub use persistence::storage::CollectionMetadata;
 pub use persistent_file::{CollectionFile, CollectionNode, PersistentFile};
 pub use route::CollectionState;
 pub use table::Table;
 pub use txn::{CopyFrom, Restore, StorageContext};
 pub use view::CollectionView;
 
-pub type TensorSparseNode<T> = fensor::SparseNode<T>;
+/// Native BTree access for file delegation. Persist nodes through `fensor::SparseNode`.
+pub type TensorSparseNode<T> = b_tree::Node<Vec<Vec<fensor::SparseCell<T>>>>;
+
 pub type TensorIndexNode = b_table::Node<u64>;
 
 #[cfg(test)]

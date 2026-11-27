@@ -1,77 +1,100 @@
 //! Format-neutral Tensor payloads.
 
-use destream::{de, en};
-use futures::{StreamExt, TryStreamExt};
+use destream::de;
 use number_general::Number;
-use safecast::CastInto;
+use tc_error::TCError;
 use tc_value::Value;
 
-use super::{Data, NumberType, Tensor, TensorSchema, TensorView, Typed};
+use super::{NumberType, Tensor, TensorAccess, TensorBase, TensorSchema, checked_value};
 use crate::StorageContext;
-
-impl<'en> en::IntoStream<'en> for TensorView {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        match self.contents {
-            super::view::Contents::Sparse(entries) => {
-                let entries = entries.map_ok(|(coord, number)| {
-                    Value::Tuple(vec![
-                        Value::Tuple(coord.into_iter().map(Value::from).collect()),
-                        Value::Number(number),
-                    ])
-                });
-
-                (
-                    Value::from(self.schema),
-                    en::SeqStream::from(entries.boxed()),
-                )
-                    .into_stream(encoder)
-            }
-            super::view::Contents::Dense(values) => {
-                (Value::from(self.schema), en::SeqStream::from(values)).into_stream(encoder)
-            }
-        }
-    }
-}
 
 impl<Txn: StorageContext> de::FromStream for Tensor<Txn> {
     type Context = Txn;
 
     async fn from_stream<D: de::Decoder>(txn: Txn, decoder: &mut D) -> Result<Self, D::Error> {
-        struct Visitor<Txn>(Txn);
+        let mut payload = decoder.open_container(de::Kind::Seq, None).await?;
+        require_field::<D::Error>(&payload)?;
+        let mut schema = TensorSchema::from_stream((), decoder).await?;
+        decoder.finish_child(&mut payload).await?;
+        require_field::<D::Error>(&payload)?;
+        let mut rows = decoder.open_container(de::Kind::Seq, None).await?;
+        let mut first_pair =
+            if rows.slot() != de::Slot::End && decoder.peek_kind().await? == de::Kind::Seq {
+                Some(decoder.open_container(de::Kind::Seq, Some(2)).await?)
+            } else {
+                None
+            };
 
-        impl<Txn: StorageContext> de::Visitor for Visitor<Txn> {
-            type Value = Tensor<Txn>;
+        // A sparse pair starts with a coordinate sequence. A complex number
+        // starts with a real component. Only sparse contents may be empty.
+        let sparse = rows.slot() == de::Slot::End
+            || (first_pair
+                .as_ref()
+                .is_some_and(|pair| pair.slot() != de::Slot::End)
+                && decoder.peek_kind().await? == de::Kind::Seq);
+        let first_value = if sparse {
+            schema = schema.into_default_sparse();
+            None
+        } else if let Some(pair) = first_pair.take() {
+            let value = decode_complex(pair, decoder).await?;
+            decoder.finish_child(&mut rows).await?;
+            Some(value)
+        } else {
+            None
+        };
 
-            fn expecting() -> &'static str {
-                "a Tensor [schema, values] payload"
-            }
+        Ok(dtype_factory!(schema.dtype(), T => {
+            let native = if schema.is_sparse() {
+                let rank = schema.shape().len();
+                let entries = futures::stream::try_unfold(
+                    (payload, rows, &mut *decoder, first_pair),
+                    move |(payload, mut rows, decoder, first_pair)| async move {
+                        if rows.slot() == de::Slot::End {
+                            finish_payload(payload, decoder).await.map_err(InputError::Decode)?;
+                            return Ok(None);
+                        }
 
-            async fn visit_seq<A: de::SeqAccess>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                let schema = seq.expect_next::<TensorSchema>(()).await?;
-                let dir = self
-                    .0
-                    .subcontext_unique()
-                    .context()
-                    .await
-                    .map_err(de::Error::custom)?;
+                        let pair = match first_pair {
+                            Some(pair) => pair,
+                            None => decoder.open_container(de::Kind::Seq, Some(2)).await.map_err(InputError::Decode)?,
+                        };
+                        let (coord, number) = decode_entry(rank, pair, decoder)
+                            .await
+                            .map_err(InputError::Decode)?;
 
-                let capacity = fensor::MAX_BLOCK_CAPACITY;
-                let Values(tensor) = seq
-                    .expect_next::<Values<Txn>>((dir, schema, capacity))
-                    .await?;
+                        decoder.finish_child(&mut rows).await.map_err(InputError::Decode)?;
+                        Ok(Some(((coord, checked_value::<T>(number)?), (payload, rows, decoder, None))))
+                    }
+                );
 
-                if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
-                    return Err(de::Error::custom("unexpected Tensor payload field"));
-                }
+                TensorBase::<Txn, T>::from_sparse_entries(&txn, schema, entries).await
+            } else {
+                let values = futures::stream::try_unfold(
+                    (payload, rows, &mut *decoder, first_value),
+                    |(payload, mut rows, decoder, first_value)| async move {
+                        if let Some(number) = first_value {
+                            return Ok(Some((checked_value::<T>(number)?, (payload, rows, decoder, None))));
+                        }
 
-                Ok(tensor)
-            }
-        }
+                        if rows.slot() == de::Slot::End {
+                            finish_payload(payload, decoder).await.map_err(InputError::Decode)?;
+                            return Ok(None);
+                        }
 
-        decoder.decode_seq(Visitor(txn)).await
+                        let number = decode_number(decoder)
+                            .await
+                            .map_err(InputError::Decode)?;
+
+                        decoder.finish_child(&mut rows).await.map_err(InputError::Decode)?;
+                        Ok(Some((checked_value::<T>(number)?, (payload, rows, decoder, None))))
+                    }
+                );
+
+                TensorBase::<Txn, T>::from_values(&txn, schema, values).await
+            };
+
+            native.map_err(InputError::decode)?
+        }, dtype => return Err(de::Error::custom(format!("unsupported Tensor dtype {dtype}")))))
     }
 }
 
@@ -80,6 +103,13 @@ impl<Txn: StorageContext> de::FromStream for Tensor<Txn> {
 enum InputError<E> {
     Decode(E),
     Native(fensor::Error),
+    Collection(TCError),
+}
+
+impl<E> From<TCError> for InputError<E> {
+    fn from(error: TCError) -> Self {
+        Self::Collection(error)
+    }
 }
 
 impl<E> From<fensor::Error> for InputError<E> {
@@ -93,65 +123,20 @@ impl<E: de::Error> InputError<E> {
         match self {
             Self::Decode(error) => error,
             Self::Native(error) => E::custom(error),
+            Self::Collection(error) => E::custom(error),
         }
     }
 }
 
-struct Values<Txn: StorageContext>(Tensor<Txn>);
-
-impl<Txn: StorageContext> de::FromStream for Values<Txn> {
-    type Context = (freqfs::DirLock<Txn::File>, TensorSchema, usize);
-
-    async fn from_stream<D: de::Decoder>(
-        context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct Visitor<Txn: StorageContext>(<Values<Txn> as de::FromStream>::Context);
-
-        impl<Txn: StorageContext> de::Visitor for Visitor<Txn> {
-            type Value = Values<Txn>;
-
-            fn expecting() -> &'static str {
-                "streamed Tensor values"
-            }
-
-            async fn visit_seq<A: de::SeqAccess>(self, seq: A) -> Result<Self::Value, A::Error> {
-                let (dir, schema, capacity) = self.0;
-                let data = dtype_factory!(schema.dtype(), T => {
-                    let native = if schema.is_sparse() {
-                        let rank = schema.native().shape().len();
-                        let entries = futures::stream::try_unfold(seq, move |mut seq| async move {
-                            let entry = seq.next_element::<Entry>(rank).await.map_err(InputError::Decode)?;
-                            match entry {
-                                Some(Entry(coord, number)) => {
-                                    if number == Number::from(0u8) {
-                                        return Err(InputError::Decode(de::Error::custom("sparse Tensor entries must be nonzero")));
-                                    }
-                                    Ok(Some(((coord, number.cast_into()), seq)))
-                                }
-                                None => Ok(None),
-                            }
-                        });
-                        fensor::Tensor::<Txn::File, T>::from_sparse_elements(
-                            dir, schema.native().clone(), schema.layout(), capacity, entries
-                        ).await
-                    } else {
-                        let values = futures::stream::try_unfold(seq, |mut seq| async move {
-                            let value = seq.next_element::<Number>(()).await.map_err(InputError::Decode)?;
-                            Ok(value.map(|value| (value.cast_into(), seq)))
-                        });
-                        fensor::Tensor::<Txn::File, T>::from_values(
-                            dir, schema.native().clone(), capacity, values
-                        ).await
-                    };
-                    native.map_err(InputError::decode)?
-                }, dtype => return Err(de::Error::custom(format!("unsupported Tensor dtype {dtype}"))));
-
-                Ok(Values(Tensor { data }))
-            }
-        }
-
-        decoder.decode_seq(Visitor::<Txn>(context)).await
+async fn finish_payload<D: de::Decoder>(
+    mut payload: de::Container,
+    decoder: &mut D,
+) -> Result<(), D::Error> {
+    decoder.finish_child(&mut payload).await?;
+    if payload.slot() == de::Slot::End {
+        Ok(())
+    } else {
+        Err(de::Error::custom("unexpected Tensor payload field"))
     }
 }
 
@@ -164,7 +149,8 @@ async fn decode_dimensions<D: de::Decoder>(
     let mut sequence = decoder.open_container(de::Kind::Seq, None).await?;
     let mut dims = Vec::new();
     while sequence.slot() != de::Slot::End {
-        let dim = <u64 as de::FromStream>::from_stream((), decoder).await?;
+        let dim = super::schema::dimension(decoder.decode_any(NumericLeaf).await?)
+            .map_err(de::Error::custom)?;
         decoder.finish_child(&mut sequence).await?;
         if dims.len() == limit {
             return Err(de::Error::custom("too many Tensor dimensions"));
@@ -184,6 +170,7 @@ fn require_field<E: de::Error>(sequence: &de::Container) -> Result<(), E> {
     }
 }
 
+/// Read the shared logical wire schema before inspecting the contents.
 impl de::FromStream for TensorSchema {
     type Context = ();
 
@@ -192,58 +179,98 @@ impl de::FromStream for TensorSchema {
         require_field::<D::Error>(&sequence)?;
         let dtype = String::from_stream((), decoder).await?;
         decoder.finish_child(&mut sequence).await?;
-        let path = dtype
-            .parse::<pathlink::PathBuf>()
-            .map_err(de::Error::custom)?;
-
-        let dtype = tc_value::number_type_from_path(&path)
-            .ok_or_else(|| de::Error::custom("invalid Tensor dtype"))?;
+        let dtype = super::schema::dtype(Value::from(dtype)).map_err(de::Error::custom)?;
 
         require_field::<D::Error>(&sequence)?;
         let shape = decode_dimensions(super::MAX_TENSOR_METADATA_RANK, decoder).await?;
         decoder.finish_child(&mut sequence).await?;
-        let sparse_axis = if sequence.slot() == de::Slot::End {
-            None
-        } else {
-            let axis = Number::from_stream((), decoder).await?;
-            decoder.finish_child(&mut sequence).await?;
-            let axis = super::schema::dimension(axis).map_err(de::Error::custom)?;
-            Some(usize::try_from(axis).map_err(de::Error::custom)?)
-        };
-
         if sequence.slot() != de::Slot::End {
             de::IgnoredAny::from_stream((), decoder).await?;
             decoder.finish_child(&mut sequence).await?;
             return Err(de::Error::custom("unexpected Tensor schema field"));
         }
 
-        TensorSchema::new(dtype, shape.into(), sparse_axis).map_err(de::Error::custom)
+        TensorSchema::logical(dtype, shape.into(), false).map_err(de::Error::custom)
     }
 }
 
-struct Entry(Vec<u64>, Number);
+async fn decode_entry<D: de::Decoder>(
+    rank: usize,
+    mut sequence: de::Container,
+    decoder: &mut D,
+) -> Result<(Vec<u64>, Number), D::Error> {
+    require_field::<D::Error>(&sequence)?;
+    let coord = decode_dimensions(rank, decoder).await?;
+    decoder.finish_child(&mut sequence).await?;
+    if coord.len() != rank {
+        return Err(de::Error::custom("sparse coordinate rank mismatch"));
+    }
 
-impl de::FromStream for Entry {
-    type Context = usize;
+    require_field::<D::Error>(&sequence)?;
+    let value = decode_number(decoder).await?;
+    decoder.finish_child(&mut sequence).await?;
+    require_pair_end::<D::Error>(&sequence)?;
 
-    async fn from_stream<D: de::Decoder>(rank: usize, decoder: &mut D) -> Result<Self, D::Error> {
-        let mut sequence = decoder.open_container(de::Kind::Seq, None).await?;
-        require_field::<D::Error>(&sequence)?;
-        let coord = decode_dimensions(rank, decoder).await?;
-        decoder.finish_child(&mut sequence).await?;
-        if coord.len() != rank {
-            return Err(de::Error::custom("sparse coordinate rank mismatch"));
+    Ok((coord, value))
+}
+
+async fn decode_number<D: de::Decoder>(decoder: &mut D) -> Result<Number, D::Error> {
+    match decoder.peek_kind().await? {
+        de::Kind::Seq => {
+            let pair = decoder.open_container(de::Kind::Seq, Some(2)).await?;
+            decode_complex(pair, decoder).await
         }
+        de::Kind::Leaf => decoder.decode_any(NumericLeaf).await,
+        de::Kind::Map => Err(de::Error::custom("expected numeric Tensor value")),
+    }
+}
 
-        require_field::<D::Error>(&sequence)?;
-        let value = Number::from_stream((), decoder).await?;
-        decoder.finish_child(&mut sequence).await?;
-        if sequence.slot() != de::Slot::End {
-            de::IgnoredAny::from_stream((), decoder).await?;
-            decoder.finish_child(&mut sequence).await?;
-            return Err(de::Error::custom("unexpected sparse entry field"));
-        }
+async fn decode_complex<D: de::Decoder>(
+    mut pair: de::Container,
+    decoder: &mut D,
+) -> Result<Number, D::Error> {
+    require_field::<D::Error>(&pair)?;
+    let re = decoder.decode_any(NumericLeaf).await?;
+    decoder.finish_child(&mut pair).await?;
+    require_field::<D::Error>(&pair)?;
+    let im = decoder.decode_any(NumericLeaf).await?;
+    decoder.finish_child(&mut pair).await?;
+    require_pair_end::<D::Error>(&pair)?;
+    super::complex_value(re, im).map_err(de::Error::custom)
+}
 
-        Ok(Entry(coord, value))
+// The decoder widens smaller real primitives losslessly through the visitor
+// defaults. Keep typed conversion separate from recognition of a numeric token.
+struct NumericLeaf;
+
+impl de::Visitor for NumericLeaf {
+    type Value = Number;
+
+    fn expecting() -> &'static str {
+        "a numeric Tensor value"
+    }
+
+    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Number, E> {
+        Ok(value.into())
+    }
+
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Number, E> {
+        Ok(value.into())
+    }
+
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Number, E> {
+        Ok(value.into())
+    }
+
+    fn visit_f64<E: de::Error>(self, value: f64) -> Result<Number, E> {
+        Ok(value.into())
+    }
+}
+
+fn require_pair_end<E: de::Error>(pair: &de::Container) -> Result<(), E> {
+    if pair.slot() == de::Slot::End {
+        Ok(())
+    } else {
+        Err(E::custom("unexpected Tensor pair field"))
     }
 }

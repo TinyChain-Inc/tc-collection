@@ -223,36 +223,22 @@ async fn make_table_with_data() -> (Arc<TempRoot>, Table<MockTxn>) {
         .expect("upsert 3");
 
     table.commit(tx(10)).await.expect("commit");
-    table.finalize(tx(10)).await.expect("finalize");
+    table.finalize(&tx(10)).await.expect("finalize");
     (root, Table::from(table))
 }
 
-async fn make_local_table_with_data(txn: &MockTxn) -> Table<MockTxn> {
-    use tc_value::Value;
+async fn make_literal_table_with_data(txn: &MockTxn) -> Table<MockTxn> {
+    let payload = (
+        Value::cast_from(simple_schema()),
+        vec![
+            Value::Tuple(vec![1_u64.into(), "alpha".into()]),
+            Value::Tuple(vec![2_u64.into(), "beta".into()]),
+        ],
+    );
 
-    let dir = crate::StorageContext::subcontext_unique(txn)
-        .context()
+    destream_json::try_decode(txn.clone(), destream_json::encode(payload).unwrap())
         .await
-        .expect("local table directory");
-
-    let table = b_table::TableLock::create(simple_schema(), crate::persistence::value_order(), dir)
-        .await
-        .expect("create local table");
-
-    {
-        let mut table = table.write().await;
-        table
-            .upsert(vec![Value::from(1_u64)], vec![Value::from("alpha")])
-            .await
-            .expect("upsert local row");
-
-        table
-            .upsert(vec![Value::from(2_u64)], vec![Value::from("beta")])
-            .await
-            .expect("upsert local row");
-    }
-
-    Table::Local(table)
+        .unwrap()
 }
 
 // ── Route resolution ──────────────────────────────────────────
@@ -497,13 +483,25 @@ fn schema_conversion_preserves_index_shapes_and_moves_names() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn malformed_schema_decoding_precedes_native_table_creation() {
+async fn malformed_table_decoding_precedes_native_table_creation() {
     Box::pin(async {
         for binary in [false, true] {
-            for schema in malformed_table_schemas() {
+            let payloads = malformed_table_schemas()
+                .into_iter()
+                .map(|schema| {
+                    Value::Tuple(vec![
+                        schema,
+                        Value::Tuple(vec![Value::Tuple(vec![7_u64.into(), "row".into()])]),
+                    ])
+                })
+                .chain([
+                    Value::Tuple(Vec::new()),
+                    Value::Tuple(vec![Value::cast_from(simple_schema())]),
+                ]);
+
+            for payload in payloads {
                 let txn = MockTxn::fresh(23);
-                let payload = (schema, vec![vec![Value::from(7_u64), Value::from("row")]]);
-                let result: Result<crate::table::DecodedTablePayload<MockTxn>, _> = if binary {
+                let result: Result<crate::table::Table<MockTxn>, _> = if binary {
                     tbon::de::try_decode(txn.clone(), tbon::en::encode(payload).unwrap())
                         .await
                         .map_err(|error| error.to_string())
@@ -515,13 +513,7 @@ async fn malformed_schema_decoding_precedes_native_table_creation() {
 
                 assert!(result.is_err());
                 let owner = txn.context().await.unwrap();
-                let workspace = {
-                    let owner = owner.read().await;
-                    assert_eq!(owner.iter().count(), 1);
-                    owner.iter().next().unwrap().1.as_dir().unwrap().clone()
-                };
-
-                assert!(workspace.read().await.is_empty());
+                assert!(owner.read().await.is_empty());
             }
         }
     })
@@ -557,7 +549,7 @@ async fn get_table_all() {
                 .is_some()
         );
 
-        assert_eq!(view.limit(1).unwrap().count(txn.id()).await.unwrap(), 1);
+        assert_eq!(view.limit(1).count(txn.id()).await.unwrap(), 1);
 
         let before = table.read_row(txn.id(), &[1_u64.into()]).await.unwrap();
         assert!(
@@ -585,8 +577,6 @@ async fn get_table_all() {
 
         let collection = crate::Collection::Table(view);
         let owner = crate::Collection::from(table);
-        assert!(collection.sync().await.is_err());
-        assert!(collection.sync_all().await.is_err());
         assert!(collection.restore(&txn, &owner).await.is_err());
         assert!(owner.restore(&txn, &collection).await.is_err());
         assert!(collection.commit(txn.id()).await.is_err());
@@ -597,28 +587,14 @@ async fn get_table_all() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn local_table_uses_native_routes_without_transaction_deltas() {
+async fn literal_table_routes_use_transactional_mutations() {
     Box::pin(async {
         use tc_value::Value;
 
         let txn = MockTxn::fresh(21);
-        let table = make_local_table_with_data(&txn).await;
+        let table = make_literal_table_with_data(&txn).await;
+        assert!(table.is_persistent());
         let collection = crate::Collection::from(table.clone());
-        collection
-            .commit(txn.id())
-            .await
-            .expect("local commit is a no-op");
-
-        collection
-            .rollback(&txn.id())
-            .await
-            .expect("local rollback is a no-op");
-
-        collection
-            .finalize(&txn.id())
-            .await
-            .expect("local finalize is a no-op");
-
         let count = tc_ir::Route::<State>::route(&table, &[segment("count")]).expect("count route");
         assert_eq!(
             count.get().expect("GET handler")(&txn, Scalar::Value(Value::None))
@@ -648,34 +624,19 @@ async fn local_table_uses_native_routes_without_transaction_deltas() {
             row,
             State::Value(Value::Tuple(vec![Value::from(3_u64), Value::from("gamma")]))
         );
-    })
-    .await;
-}
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn decoded_table_is_local_not_persistent() {
-    Box::pin(async {
-        use safecast::CastFrom;
-        use tc_value::Value;
-
-        let schema = simple_schema();
-        let payload = (
-            Value::cast_from(schema),
-            vec![
-                Value::Tuple(vec![Value::from(1_u64), Value::from("alpha")]),
-                Value::Tuple(vec![Value::from(2_u64), Value::from("beta")]),
-            ],
+        collection.rollback(&txn.id()).await.unwrap();
+        assert_eq!(table.count(tx(22)).await.unwrap(), 2);
+        assert!(
+            table
+                .read_row(tx(22), &[3_u64.into()])
+                .await
+                .unwrap()
+                .is_none()
         );
 
-        let stream = destream_json::encode(payload).expect("encode Table payload");
-        let txn = MockTxn::fresh(22);
-        let decoded: crate::table::DecodedTablePayload<MockTxn> =
-            destream_json::try_decode(txn.clone(), stream)
-                .await
-                .expect("decode Table payload");
-
-        assert!(matches!(decoded.table, Table::Local(_)));
-        assert_eq!(decoded.table.count(tx(22)).await.expect("count rows"), 2);
+        collection.finalize(&txn.id()).await.unwrap();
+        assert_eq!(table.count(tx(22)).await.unwrap(), 2);
     })
     .await;
 }
@@ -919,7 +880,7 @@ async fn get_limit() {
         assert!(matches!(resp, State::Collection(_)));
         use futures::FutureExt;
 
-        for (table, source_count) in [(table, 3), (make_local_table_with_data(&txn).await, 2)] {
+        for (table, source_count) in [(table, 3), (make_literal_table_with_data(&txn).await, 2)] {
             for (limit, expected) in [
                 (Value::from(0_u64), 0),
                 (Value::from(1_i8), 1),
@@ -1010,11 +971,11 @@ async fn get_select() {
         use futures::TryStreamExt;
 
         let columns = vec!["id".parse().unwrap(), "label".parse().unwrap()];
-        for (table, source_count) in [(table, 3), (make_local_table_with_data(&txn).await, 2)] {
+        for (table, source_count) in [(table, 3), (make_literal_table_with_data(&txn).await, 2)] {
             for limit in [0, 2, 10] {
-                let limited = table.limit(limit).unwrap();
-                let direct = limited.select(columns.clone()).unwrap();
-                let intermediate = Table::from(limited);
+                let limited = table.limit(limit);
+                let direct = limited.select(&columns).unwrap();
+                let intermediate = limited;
                 let delegated = intermediate.select(&columns).unwrap();
                 let collection = crate::Collection::from(intermediate);
                 let handler = tc_ir::Route::<State>::route(&collection, &[segment("select")])
@@ -1050,7 +1011,7 @@ async fn get_select() {
                     .unwrap();
 
                 let actual: Vec<_> = routed
-                    .row_stream(txn.id())
+                    .rows(txn.id())
                     .await
                     .unwrap()
                     .try_collect()
@@ -1079,9 +1040,8 @@ async fn get_select() {
                     vec!["label".parse().unwrap()],
                     vec!["id".parse().unwrap(), "id".parse().unwrap()],
                 ] {
-                    let limited = table.limit(limit).unwrap();
-                    assert!(limited.select(selected.clone()).is_err());
-                    assert!(Table::from(limited).select(&selected).is_err());
+                    let limited = table.limit(limit);
+                    assert!(limited.select(&selected).is_err());
                 }
             }
 
@@ -1451,12 +1411,12 @@ async fn insert_is_strict_and_is_empty_is_direct() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn local_slice_update_and_truncate_stream_through_delegated_storage() {
+async fn literal_slice_update_and_truncate_stream_through_delegated_storage() {
     Box::pin(async {
         use std::ops::Bound;
 
         let txn = MockTxn::fresh(40);
-        let table = make_local_table_with_data(&txn).await;
+        let table = make_literal_table_with_data(&txn).await;
         let range: b_table::Range<tc_ir::Id, Value> = [(
             "id".parse().expect("id"),
             (
@@ -1467,7 +1427,7 @@ async fn local_slice_update_and_truncate_stream_through_delegated_storage() {
         .into_iter()
         .collect();
 
-        let slice = Table::from(table.slice(range.clone(), &[], false).expect("slice"));
+        let slice = table.slice(range.clone(), &[], false).expect("slice");
         let handler = tc_ir::Route::<State>::route(&slice, &[]).expect("slice route");
 
         let rejected = handler.put().expect("PUT handler")(
@@ -1555,7 +1515,7 @@ async fn local_slice_update_and_truncate_stream_through_delegated_storage() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn invalid_local_replacement_preserves_the_row_and_indexes() {
+async fn invalid_literal_replacement_preserves_the_row_and_indexes() {
     Box::pin(async {
         let txn = MockTxn::fresh(25);
         let base = simple_schema();
@@ -1567,24 +1527,19 @@ async fn invalid_local_replacement_preserves_the_row_and_indexes() {
         )
         .unwrap();
 
-        let native = b_table::TableLock::create(
-            schema,
-            crate::persistence::value_order(),
-            txn.subcontext_unique().context().await.unwrap(),
-        )
-        .await
-        .unwrap();
+        let native =
+            PersistentTable::try_new(txn.subcontext_unique().context().await.unwrap(), schema)
+                .await
+                .unwrap();
 
         for (key, value) in [(1_u64, "alpha"), (2, "beta")] {
             native
-                .write()
-                .await
-                .upsert(vec![key.into()], vec![value.into()])
+                .load_literal_row(vec![key.into(), value.into()])
                 .await
                 .unwrap();
         }
 
-        let table = Table::Local(native);
+        let table = Table::File(native);
 
         let before = table.read_row(txn.id(), &[1_u64.into()]).await.unwrap();
         for values in [
@@ -1631,11 +1586,26 @@ async fn invalid_local_replacement_preserves_the_row_and_indexes() {
         );
 
         assert_eq!(table.count(txn.id()).await.unwrap(), 2);
-        let Table::Local(native) = table else {
+        let Table::File(native) = table else {
             panic!("native fixture")
         };
 
-        native.validate().await.unwrap();
+        native.commit(txn.id()).await.unwrap();
+        native.finalize(&txn.id()).await.unwrap();
+        let rows = native
+            .order_by(&["label".parse().unwrap()], false)
+            .rows(tx(26))
+            .await
+            .unwrap();
+
+        let labels: Vec<_> =
+            futures::TryStreamExt::try_collect(futures::TryStreamExt::map_ok(rows, |row| {
+                row[1].clone()
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(labels, vec![Value::from("beta"), Value::from("changed")]);
     })
     .await;
 }
@@ -1649,12 +1619,11 @@ async fn ordered_view_predicates_reject_unsupported_queries() {
             destream_json::encode((Value::cast_from(simple_schema()), Vec::<Value>::new()))
                 .unwrap();
 
-        let local: crate::table::DecodedTablePayload<MockTxn> =
-            destream_json::try_decode(txn.clone(), encoded)
-                .await
-                .unwrap();
+        let local: crate::table::Table<MockTxn> = destream_json::try_decode(txn.clone(), encoded)
+            .await
+            .unwrap();
 
-        for owner in [persistent, local.table] {
+        for owner in [persistent, local] {
             let expected = owner.count(tx(22)).await.unwrap();
             for reverse in [false, true] {
                 let supported = owner.order_by(&["id".parse().unwrap()], reverse).unwrap();
@@ -1670,22 +1639,14 @@ async fn ordered_view_predicates_reject_unsupported_queries() {
                         error.code()
                     );
 
-                    let mut callbacks = 0;
-                    assert!(
-                        slice
-                            .for_each_row_in_order(tx(22), |_| callbacks += 1)
-                            .await
-                            .is_err()
-                    );
-
-                    assert_eq!(callbacks, 0);
+                    assert!(slice.rows(tx(22)).await.is_err());
                     let columns = vec!["id".parse().unwrap()];
                     for view in [
-                        Table::from(slice.clone()),
-                        Table::from(slice.limit(0)),
-                        Table::from(slice.limit(1)),
-                        Table::from(slice.select(columns.clone()).unwrap()),
-                        Table::from(slice.limit(0).select(columns).unwrap()),
+                        slice.clone(),
+                        slice.limit(0),
+                        slice.limit(1),
+                        slice.select(&columns).unwrap(),
+                        slice.limit(0).select(&columns).unwrap(),
                     ] {
                         for route in ["count", "is_empty"] {
                             let handler = tc_ir::Route::<State>::route(&view, &[segment(route)])

@@ -12,6 +12,7 @@ use tc_value::{NumberType, ValueType};
 
 #[path = "common/storage.rs"]
 mod storage;
+
 use storage::TestTxn;
 
 #[path = "benchmark/simplify.rs"]
@@ -55,11 +56,15 @@ async fn create(txn: &TestTxn, table: bool) -> Collection<TestTxn> {
             .unwrap(),
         )
     } else {
-        CollectionSchema::BTree(vec![BTreeColumnSchema {
-            name: "key".into(),
-            dtype,
-            max_size: None,
-        }])
+        CollectionSchema::BTree(
+            vec![BTreeColumnSchema {
+                name: "key".into(),
+                dtype,
+                max_size: None,
+            }]
+            .try_into()
+            .unwrap(),
+        )
     };
 
     Collection::create(txn.subcontext_unique().context().await.unwrap(), schema)
@@ -69,12 +74,7 @@ async fn create(txn: &TestTxn, table: bool) -> Collection<TestTxn> {
 
 async fn insert(collection: &Collection<TestTxn>, txn: &TestTxn, key: u64) {
     match collection {
-        Collection::BTree(tree) => tree
-            .persistent()
-            .unwrap()
-            .insert_row(txn, vec![key.into()])
-            .await
-            .unwrap(),
+        Collection::BTree(tree) => tree.insert_row(txn, vec![key.into()]).await.unwrap(),
         Collection::Table(table) => {
             let Table::File(table) = table.as_ref() else {
                 unreachable!()
@@ -117,7 +117,7 @@ async fn count(collection: &Collection<TestTxn>, txn: &TestTxn) -> usize {
             .await
             .unwrap(),
         Collection::Table(table) => table
-            .row_stream(txn.id())
+            .rows(txn.id())
             .await
             .unwrap()
             .try_fold(0, |count, _| async move { Ok(count + 1) })
@@ -252,7 +252,6 @@ async fn load() {
                 .await
                 .unwrap();
 
-            stored.sync_all().await.unwrap();
             (stored.schema().unwrap(), std::sync::Arc::downgrade(&cache))
         };
 
@@ -312,7 +311,7 @@ async fn slow_reader() {
                         .map_ok(|_| ())
                         .boxed(),
                     Collection::Table(table) => table
-                        .row_stream(txn.at(3).id())
+                        .rows(txn.at(3).id())
                         .await
                         .unwrap()
                         .map_ok(|_| ())

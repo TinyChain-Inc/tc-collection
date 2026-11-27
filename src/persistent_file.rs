@@ -6,8 +6,6 @@ use get_size::GetSize;
 use safecast::AsType;
 use tc_value::Value;
 
-mod sparse_codec;
-
 pub type CollectionNode = b_tree::Node<Vec<Vec<Value>>>;
 
 #[cfg(feature = "complex")]
@@ -36,6 +34,8 @@ pub trait CollectionFile:
     + FileLoad
     + FileSave
     + GetSize
+    + AsType<crate::CollectionMetadata>
+    + From<crate::CollectionMetadata>
     + AsType<b_table::Node<u64>>
     + From<b_table::Node<u64>>
     + AsType<CollectionNode>
@@ -62,6 +62,8 @@ impl<F> CollectionFile for F where
         + FileLoad
         + FileSave
         + GetSize
+        + AsType<crate::CollectionMetadata>
+        + From<crate::CollectionMetadata>
         + AsType<b_table::Node<u64>>
         + From<b_table::Node<u64>>
         + AsType<CollectionNode>
@@ -84,7 +86,7 @@ impl<F> CollectionFile for F where
 }
 
 // One catalog owns native payload variants, conversions, and stable wire tags.
-// Validation remains in the bounded decoders below and in sparse_codec.
+// Local decoders bound adapter payloads; fensor validates sparse rows.
 macro_rules! persistent_files {
     (
         nodes [$($node:ident($node_type:ty) = $node_tag:literal => |$seq:ident| $decode:expr;)*]
@@ -131,7 +133,7 @@ macro_rules! persistent_files {
                         Self::$dense(value) => en::IntoStream::into_stream(($dense_tag as u8, value), encoder),
                         Self::$metadata(value) => en::IntoStream::into_stream(($metadata_tag as u8, value), encoder),
                         Self::$sparse(value) => en::IntoStream::into_stream(
-                            ($sparse_tag as u8, sparse_codec::Encoded(value)), encoder,
+                            ($sparse_tag as u8, value), encoder,
                         ),
                     )*
                     $(
@@ -146,7 +148,7 @@ macro_rules! persistent_files {
                         ),
                         #[cfg(feature = "complex")]
                         Self::$csparse(value) => en::IntoStream::into_stream(
-                            ($csparse_tag as u8, sparse_codec::Encoded(value)), encoder,
+                            ($csparse_tag as u8, value), encoder,
                         ),
                     )*
                 }
@@ -157,56 +159,58 @@ macro_rules! persistent_files {
             type Context = ();
 
             async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
-                struct Visitor;
-
-                impl de::Visitor for Visitor {
-                    type Value = PersistentFile;
-
-                    fn expecting() -> &'static str {
-                        "a tagged native collection file"
-                    }
-
-                    async fn visit_seq<A: de::SeqAccess>(
-                        self,
-                        mut seq: A,
-                    ) -> Result<Self::Value, A::Error> {
-                        let value = match seq.expect_next::<u8>(()).await? {
-                            $($node_tag => {
-                                let $seq = &mut seq;
-                                PersistentFile::$node($decode)
-                            },)*
-                            $(
-                                $dense_tag => PersistentFile::$dense(seq.expect_next::<BlockValues<$dtype>>(()).await?.0),
-                                $metadata_tag => PersistentFile::$metadata(
-                                    seq.expect_next(crate::tensor::MAX_TENSOR_METADATA_RANK).await?,
-                                ),
-                                $sparse_tag => PersistentFile::$sparse(seq.expect_next::<sparse_codec::Decoded<$dtype>>(()).await?.0),
-                            )*
-                            $(
-                                #[cfg(feature = "complex")]
-                                $cdense_tag => PersistentFile::$cdense(
-                                    seq.expect_next::<BlockValues<(_, _)>>(()).await?.0
-                                        .into_iter().map(|(re, im)| <$ctype>::new(re, im)).collect(),
-                                ),
-                                #[cfg(feature = "complex")]
-                                $cmetadata_tag => PersistentFile::$cmetadata(
-                                    seq.expect_next(crate::tensor::MAX_TENSOR_METADATA_RANK).await?,
-                                ),
-                                #[cfg(feature = "complex")]
-                                $csparse_tag => PersistentFile::$csparse(seq.expect_next::<sparse_codec::Decoded<$ctype>>(()).await?.0),
-                            )*
-                            tag => return Err(de::Error::custom(format!("unknown collection file tag {tag}"))),
-                        };
-
-                        if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
-                            return Err(de::Error::custom("unexpected collection file field"));
-                        }
-
-                        Ok(value)
-                    }
+                let mut fields = decoder.open_container(de::Kind::Seq, None).await?;
+                if fields.slot() == de::Slot::End {
+                    return Err(de::Error::custom("missing collection file tag"));
                 }
 
-                decoder.decode_seq(Visitor).await
+                let tag = <u8 as de::FromStream>::from_stream((), decoder).await?;
+                decoder.finish_child(&mut fields).await?;
+                if fields.slot() == de::Slot::End {
+                    return Err(de::Error::custom("missing collection file payload"));
+                }
+
+                let value = match tag {
+                    $($node_tag => {
+                        let $seq = &mut *decoder;
+                        PersistentFile::$node($decode)
+                    },)*
+                    $(
+                        $dense_tag => PersistentFile::$dense(
+                            decode_block_values::<$dtype, _>(decoder).await?,
+                        ),
+                        $metadata_tag => PersistentFile::$metadata(
+                            <fensor::TensorMetadata<$dtype> as de::FromStream>::from_stream(crate::tensor::MAX_TENSOR_METADATA_RANK, decoder).await?,
+                        ),
+                        $sparse_tag => PersistentFile::$sparse(
+                            <fensor::SparseNode<$dtype> as de::FromStream>::from_stream((), decoder).await?,
+                        ),
+                    )*
+                    $(
+                        #[cfg(feature = "complex")]
+                        $cdense_tag => PersistentFile::$cdense(
+                            decode_block_values::<(_, _), _>(decoder).await?
+                                .into_iter().map(|(re, im)| <$ctype>::new(re, im)).collect(),
+                        ),
+                        #[cfg(feature = "complex")]
+                        $cmetadata_tag => PersistentFile::$cmetadata(
+                            <fensor::TensorMetadata<$ctype> as de::FromStream>::from_stream(crate::tensor::MAX_TENSOR_METADATA_RANK, decoder).await?,
+                        ),
+                        #[cfg(feature = "complex")]
+                        $csparse_tag => PersistentFile::$csparse(
+                            <fensor::SparseNode<$ctype> as de::FromStream>::from_stream((), decoder).await?,
+                        ),
+                    )*
+                    tag => return Err(de::Error::custom(format!("unknown collection file tag {tag}"))),
+                };
+
+                decoder.finish_child(&mut fields).await?;
+                if fields.slot() != de::Slot::End {
+                    <de::IgnoredAny as de::FromStream>::from_stream((), decoder).await?;
+                    return Err(de::Error::custom("unexpected collection file field"));
+                }
+
+                Ok(value)
             }
         }
 
@@ -235,142 +239,62 @@ macro_rules! persistent_files {
 
 persistent_files! {
     nodes [
-        Node(CollectionNode) = 0 => |seq| seq.expect_next(()).await?;
-        TensorIndex(b_table::Node<u64>) = 1 => |seq| seq.expect_next::<IndexNode>(()).await?.0;
+        Metadata(crate::CollectionMetadata) = 26 => |decoder| <crate::CollectionMetadata as de::FromStream>::from_stream((), decoder).await?;
+        Node(CollectionNode) = 0 => |decoder| <CollectionNode as de::FromStream>::from_stream((), decoder).await?;
+        TensorIndex(b_table::Node<u64>) = 1 => |decoder| b_tree::Node::decode_bounded::<TensorIndexRows, _>((), decoder, fensor::MAX_BLOCK_CAPACITY).await?;
     ]
     real [
-        U8, MetadataU8, SparseU8: u8 = (2, 3, 30);
-        U16, MetadataU16, SparseU16: u16 = (4, 5, 31);
-        U32, MetadataU32, SparseU32: u32 = (6, 7, 32);
-        U64, MetadataU64, SparseU64: u64 = (8, 9, 33);
-        I8, MetadataI8, SparseI8: i8 = (10, 11, 34);
-        I16, MetadataI16, SparseI16: i16 = (12, 13, 35);
-        I32, MetadataI32, SparseI32: i32 = (14, 15, 36);
-        I64, MetadataI64, SparseI64: i64 = (16, 17, 37);
-        F32, MetadataF32, SparseF32: f32 = (18, 19, 38);
-        F64, MetadataF64, SparseF64: f64 = (20, 21, 39);
+        // Tags 30 through 41 identified the retired packed-byte sparse nodes.
+        U8, MetadataU8, SparseU8: u8 = (2, 3, 42);
+        U16, MetadataU16, SparseU16: u16 = (4, 5, 43);
+        U32, MetadataU32, SparseU32: u32 = (6, 7, 44);
+        U64, MetadataU64, SparseU64: u64 = (8, 9, 45);
+        I8, MetadataI8, SparseI8: i8 = (10, 11, 46);
+        I16, MetadataI16, SparseI16: i16 = (12, 13, 47);
+        I32, MetadataI32, SparseI32: i32 = (14, 15, 48);
+        I64, MetadataI64, SparseI64: i64 = (16, 17, 49);
+        F32, MetadataF32, SparseF32: f32 = (18, 19, 50);
+        F64, MetadataF64, SparseF64: f64 = (20, 21, 51);
     ]
     complex [
-        C32, MetadataC32, SparseC32: fensor::complex::Complex32 = (22, 23, 40);
-        C64, MetadataC64, SparseC64: fensor::complex::Complex64 = (24, 25, 41);
+        C32, MetadataC32, SparseC32: fensor::complex::Complex32 = (22, 23, 52);
+        C64, MetadataC64, SparseC64: fensor::complex::Complex64 = (24, 25, 53);
     ]
 }
 
 /// Reject oversized payloads while decoding, before an untrusted length allocates.
-struct BlockValues<T>(Vec<T>);
-
-impl<T: de::FromStream<Context = ()> + Send> de::FromStream for BlockValues<T> {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
-        struct Visitor<T>(std::marker::PhantomData<T>);
-
-        impl<T: de::FromStream<Context = ()> + Send> de::Visitor for Visitor<T> {
-            type Value = BlockValues<T>;
-
-            fn expecting() -> &'static str {
-                "one bounded tensor block"
-            }
-
-            async fn visit_seq<A: de::SeqAccess>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut values = Vec::new();
-                while let Some(value) = seq.next_element(()).await? {
-                    if values.len() == fensor::MAX_BLOCK_CAPACITY {
-                        return Err(de::Error::custom("tensor block exceeds storage capacity"));
-                    }
-
-                    values.push(value);
-                }
-
-                Ok(BlockValues(values.into_boxed_slice().into_vec()))
-            }
+async fn decode_block_values<T: de::FromStream<Context = ()> + Send, D: de::Decoder>(
+    decoder: &mut D,
+) -> Result<Vec<T>, D::Error> {
+    let mut rows = decoder.open_container(de::Kind::Seq, None).await?;
+    let mut values = Vec::new();
+    while rows.slot() != de::Slot::End {
+        if values.len() == fensor::MAX_BLOCK_CAPACITY {
+            return Err(de::Error::custom("tensor block exceeds storage capacity"));
         }
 
-        decoder.decode_seq(Visitor(std::marker::PhantomData)).await
+        let value = T::from_stream((), decoder).await?;
+        decoder.finish_child(&mut rows).await?;
+        values.push(value);
+    }
+
+    Ok(values.into_boxed_slice().into_vec())
+}
+
+struct TensorIndexRows(Vec<Vec<u64>>);
+
+impl From<TensorIndexRows> for Vec<Vec<u64>> {
+    fn from(rows: TensorIndexRows) -> Self {
+        rows.0
     }
 }
 
-// Tensor touched-block keys contain one logical block ID.
-// Validate the row while decoding instead of trusting an encoded sequence length.
-struct IndexRow(Vec<u64>);
-
-impl de::FromStream for IndexRow {
+impl de::FromStream for TensorIndexRows {
     type Context = ();
 
     async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
-        struct Visitor;
-
-        impl de::Visitor for Visitor {
-            type Value = IndexRow;
-
-            fn expecting() -> &'static str {
-                "a Tensor touched-block key"
-            }
-
-            async fn visit_seq<A: de::SeqAccess>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                let id = seq.expect_next::<u64>(()).await?;
-                if seq.next_element::<u64>(()).await?.is_some() {
-                    return Err(de::Error::custom("invalid Tensor index key width"));
-                }
-
-                Ok(IndexRow(vec![id]))
-            }
-        }
-
-        decoder.decode_seq(Visitor).await
-    }
-}
-
-// Tensor indexes have bounded rows and native node fanout. The
-// decoder never trusts the wire's declared sequence lengths for allocation.
-struct IndexNode(b_table::Node<u64>);
-
-impl de::FromStream for IndexNode {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
-        struct Visitor;
-
-        impl de::Visitor for Visitor {
-            type Value = IndexNode;
-
-            fn expecting() -> &'static str {
-                "a bounded native Tensor index node"
-            }
-
-            async fn visit_seq<A: de::SeqAccess>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                let leaf = seq.expect_next::<bool>(()).await?;
-                let rows = seq.expect_next::<BlockValues<IndexRow>>(()).await?.0;
-                let rows: Vec<_> = rows.into_iter().map(|row| row.0).collect();
-                let node = if leaf {
-                    b_tree::Node::Leaf(rows)
-                } else {
-                    let children = seq.expect_next::<BlockValues<_>>(()).await?.0;
-                    if rows.is_empty() || children.len() != rows.len() + 1 {
-                        return Err(de::Error::custom("invalid Tensor index separator count"));
-                    }
-
-                    b_tree::Node::Index(rows, children)
-                };
-
-                if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
-                    return Err(de::Error::custom("unexpected Tensor index field"));
-                }
-
-                Ok(IndexNode(node))
-            }
-        }
-
-        decoder.decode_seq(Visitor).await
+        let rows = decode_block_values::<[u64; 1], _>(decoder).await?;
+        Ok(Self(rows.into_iter().map(Vec::from).collect()))
     }
 }
 
@@ -440,13 +364,15 @@ macro_rules! delegate_collection_payload {
 }
 
 // Feature selection occurs here, not in a downstream macro expansion.
-macro_rules! tensor_file_delegation {
+macro_rules! collection_file_delegation {
     ($d:tt; $($complex:ident),* $(,)?) => {
         #[macro_export]
-        macro_rules! delegate_tensor_files {
+        macro_rules! delegate_collection_files {
             ($d file:ty, $d variant:ident) => {
+                $d crate::delegate_collection_payload!($d file, $d variant, $d crate::CollectionNode);
+                $d crate::delegate_collection_payload!($d file, $d variant, $d crate::CollectionMetadata);
                 $d crate::delegate_collection_payload!($d file, $d variant, $d crate::TensorIndexNode);
-                $d crate::delegate_tensor_files!(@types $d file, $d variant;
+                $d crate::delegate_collection_files!(@types $d file, $d variant;
                     u8,u16,u32,u64,i8,i16,i32,i64,f32,f64 $(,$d crate::$complex)*);
             };
             (@types $d file:ty, $d variant:ident; $d($d dtype:ty),+) => {
@@ -461,10 +387,41 @@ macro_rules! tensor_file_delegation {
 }
 
 #[cfg(not(feature = "complex"))]
-tensor_file_delegation!($;);
+collection_file_delegation!($;);
+
 #[cfg(feature = "complex")]
-tensor_file_delegation!($; TensorComplex32, TensorComplex64);
+collection_file_delegation!($; TensorComplex32, TensorComplex64);
 
 #[cfg(test)]
 #[path = "../tests/unit/persistent_file/tests.rs"]
 mod tests;
+
+// BTree operates on the native node. Its persisted owner supplies the codec,
+// while these conversions move or borrow that same payload without copying it.
+impl<T: fensor::TensorElement> From<b_tree::Node<Vec<Vec<fensor::SparseCell<T>>>>>
+    for PersistentFile
+where
+    Self: From<fensor::SparseNode<T>>,
+{
+    fn from(node: b_tree::Node<Vec<Vec<fensor::SparseCell<T>>>>) -> Self {
+        Self::from(fensor::SparseNode::from(node))
+    }
+}
+
+impl<T: fensor::TensorElement> AsType<b_tree::Node<Vec<Vec<fensor::SparseCell<T>>>>>
+    for PersistentFile
+where
+    Self: AsType<fensor::SparseNode<T>>,
+{
+    fn as_type(&self) -> Option<&b_tree::Node<Vec<Vec<fensor::SparseCell<T>>>>> {
+        <Self as AsType<fensor::SparseNode<T>>>::as_type(self).map(|node| &node.0)
+    }
+
+    fn as_type_mut(&mut self) -> Option<&mut b_tree::Node<Vec<Vec<fensor::SparseCell<T>>>>> {
+        <Self as AsType<fensor::SparseNode<T>>>::as_type_mut(self).map(|node| &mut node.0)
+    }
+
+    fn into_type(self) -> Option<b_tree::Node<Vec<Vec<fensor::SparseCell<T>>>>> {
+        <Self as AsType<fensor::SparseNode<T>>>::into_type(self).map(|node| node.0)
+    }
+}

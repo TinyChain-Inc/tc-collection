@@ -5,13 +5,25 @@ use std::sync::Arc;
 use freqfs::Cache;
 use futures::TryStreamExt;
 use futures::future::join_all;
+use tc_ir::Transact;
 use tc_value::Value;
 use tokio::sync::Barrier;
 use tokio::time::{Duration, sleep, timeout};
 
-use super::{BTree, BTreeSlice};
 use crate::PersistentFile;
 use crate::test::{TestTxn, init_root, load_roots, tx};
+use super::file::{BTreeBase as BTree, BTreeSlice};
+
+async fn string_tree(persistent: freqfs::DirLock<PersistentFile>) -> BTree<TestTxn> {
+    let schema = super::BTreeSchema::try_from(vec![super::BTreeColumnSchema {
+        name: "key".into(),
+        dtype: tc_value::ValueType::String,
+        max_size: None,
+    }])
+    .unwrap();
+
+    BTree::try_with_schema(persistent, schema).await.unwrap()
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn pending_is_visible_only_to_its_txn() {
@@ -49,7 +61,7 @@ async fn pending_is_visible_only_to_its_txn() {
         );
 
         btree.commit(tx(10)).await.expect("commit 10");
-        btree.finalize(tx(10)).await.expect("finalize 10");
+        btree.finalize(&tx(10)).await.expect("finalize 10");
 
         let visible = timeout(
             Duration::from_secs(1),
@@ -105,7 +117,7 @@ async fn committed_is_visible_in_txn_order() {
                 .unwrap()
         );
 
-        btree.finalize(tx(10)).await.expect("finalize 10");
+        btree.finalize(&tx(10)).await.expect("finalize 10");
         for stale in [tx(9), tx(10)] {
             let error = btree
                 .contains_row(stale, &[1_u64.into()])
@@ -155,18 +167,21 @@ async fn direct_mutation_flow_from_chain_state() {
             .expect("delete 2");
 
         btree.commit(tx(10)).await.expect("commit 10");
-        btree.finalize(tx(10)).await.expect("finalize 10");
+        btree.finalize(&tx(10)).await.expect("finalize 10");
 
         let mut keys = Vec::new();
-        btree
-            .for_each_row_in_order(
+        let mut scan = btree
+            .keys(
                 tx(11),
                 (Bound::<Value>::Unbounded, Bound::<Value>::Unbounded),
                 false,
-                |row| keys.push(row.into_iter().next().expect("expected unary row")),
             )
             .await
             .unwrap();
+
+        while let Some(row) = scan.try_next().await.unwrap() {
+            keys.push(row.into_iter().next().expect("expected unary row"));
+        }
 
         assert_eq!(keys, vec![Value::from(1_u64)]);
     })
@@ -206,7 +221,7 @@ async fn cannot_write_after_commit_or_finalize() {
             .unwrap()
         );
 
-        btree.finalize(tx(10)).await.expect("finalize");
+        btree.finalize(&tx(10)).await.expect("finalize");
         assert_eq!(
             btree
                 .insert_row(&txn.with_id(tx(10)), vec![Value::from(3_u64)])
@@ -261,15 +276,18 @@ async fn streamed_keys_match_materialized_keys() {
             .expect("delete key 3");
 
         let mut streamed = Vec::new();
-        btree
-            .for_each_row_in_order(
+        let mut scan = btree
+            .keys(
                 tx(11),
                 (Bound::<Value>::Unbounded, Bound::<Value>::Unbounded),
                 false,
-                |row| streamed.push(row.into_iter().next().expect("expected unary row")),
             )
             .await
             .unwrap();
+
+        while let Some(row) = scan.try_next().await.unwrap() {
+            streamed.push(row.into_iter().next().expect("expected unary row"));
+        }
 
         assert_eq!(
             streamed,
@@ -301,11 +319,12 @@ async fn slice_keys_match_range_view() {
         btree.commit(tx(40)).await.expect("commit");
 
         let slice = btree.slice(Value::from(3_u64)..=Value::from(8_u64), false);
-        let mut keys = Vec::new();
-        slice
-            .for_each_row_in_order(tx(40), |row| {
-                keys.push(row.into_iter().next().expect("expected unary row"))
-            })
+        let keys: Vec<_> = slice
+            .keys(tx(40))
+            .await
+            .unwrap()
+            .map_ok(|row| row.into_iter().next().expect("expected unary row"))
+            .try_collect()
             .await
             .unwrap();
 
@@ -316,6 +335,23 @@ async fn slice_keys_match_range_view() {
 
         assert_eq!(slice.count(tx(40)).await.unwrap(), 3);
         assert!(!slice.is_empty(tx(40)).await.unwrap());
+
+        // Equivalent integer/float endpoints retain inclusive/exclusive precedence.
+        for (lower, upper, expected) in [
+            (Bound::Included(3.0.into()), Bound::Included(7.0.into()), 3),
+            (Bound::Excluded(3.0.into()), Bound::Included(7.0.into()), 2),
+            (Bound::Included(3.0.into()), Bound::Excluded(7.0.into()), 2),
+            (Bound::Excluded(3.0.into()), Bound::Excluded(7.0.into()), 1),
+        ] {
+            let base = btree.slice(Value::from(3_u64)..=Value::from(7_u64), false);
+            assert_eq!(
+                base.slice((lower, upper), false)
+                    .count(tx(40))
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
     })
     .await;
 }
@@ -337,7 +373,7 @@ async fn overlapping_write_in_past_txn_fails_closed() {
     Box::pin(async {
         let root = init_root("overlapping-write");
         let (persistent, txn) = load_roots(&root);
-        let btree = BTree::<TestTxn>::new(persistent).await.unwrap();
+        let btree = string_tree(persistent).await;
 
         btree
             .insert_row(&txn.with_id(tx(2)), vec![Value::from("k")])
@@ -359,7 +395,7 @@ async fn rollback_unblocks_later_read_and_discards_pending() {
     Box::pin(async {
         let root = init_root("rollback-unblocks-read");
         let (persistent, txn) = load_roots(&root);
-        let btree = BTree::<TestTxn>::new(persistent).await.unwrap();
+        let btree = string_tree(persistent).await;
 
         btree
             .insert_row(&txn.with_id(tx(10)), vec![Value::from("k")])
@@ -376,7 +412,7 @@ async fn rollback_unblocks_later_read_and_discards_pending() {
             "later txn read should block while earlier overlapping write is pending"
         );
 
-        btree.rollback(tx(10)).expect("rollback 10");
+        btree.rollback(&tx(10)).await.expect("rollback 10");
 
         let visible = timeout(
             Duration::from_secs(1),
@@ -408,7 +444,7 @@ async fn duplicate_commit_is_idempotent() {
             .await
             .expect("second commit should be no-op");
 
-        btree.finalize(tx(10)).await.expect("finalize 10");
+        btree.finalize(&tx(10)).await.expect("finalize 10");
 
         let visible = timeout(
             Duration::from_secs(1),
@@ -427,7 +463,7 @@ async fn stale_finalize_is_noop() {
     Box::pin(async {
         let root = init_root("stale-finalize");
         let (persistent, txn) = load_roots(&root);
-        let btree = BTree::<TestTxn>::new(persistent).await.unwrap();
+        let btree = string_tree(persistent).await;
 
         btree
             .insert_row(&txn.with_id(tx(10)), vec![Value::from("x")])
@@ -435,11 +471,11 @@ async fn stale_finalize_is_noop() {
             .expect("insert key");
 
         btree.commit(tx(10)).await.expect("commit 10");
-        btree.finalize(tx(10)).await.expect("finalize 10");
+        btree.finalize(&tx(10)).await.expect("finalize 10");
 
         // Stale finalize must not regress the frontier or alter visibility.
         btree
-            .finalize(tx(9))
+            .finalize(&tx(9))
             .await
             .expect("stale finalize should be no-op");
 
@@ -471,21 +507,22 @@ async fn large_scan_completes_under_timeout() {
         }
 
         btree.commit(tx(20)).await.expect("commit 20");
-        btree.finalize(tx(20)).await.expect("finalize 20");
+        btree.finalize(&tx(20)).await.expect("finalize 20");
 
         let mut seen = 0_u64;
         timeout(Duration::from_secs(5), async {
-            btree
-                .for_each_row_in_order(
+            let mut scan = btree
+                .keys(
                     tx(21),
                     (Bound::<Value>::Unbounded, Bound::<Value>::Unbounded),
                     false,
-                    |_| {
-                        seen += 1;
-                    },
                 )
                 .await
                 .unwrap();
+
+            while scan.try_next().await.unwrap().is_some() {
+                seen += 1;
+            }
         })
         .await
         .expect("large scan should finish in bounded time");
@@ -500,7 +537,7 @@ async fn many_later_readers_unblock_after_commit() {
     Box::pin(async {
         let root = init_root("many-readers-unblock");
         let (persistent, txn) = load_roots(&root);
-        let btree = BTree::<TestTxn>::new(persistent).await.unwrap();
+        let btree = string_tree(persistent).await;
 
         btree
             .insert_row(&txn.with_id(tx(50)), vec![Value::from("hot")])
@@ -542,7 +579,7 @@ async fn concurrent_writer_conflict_matrix() {
     Box::pin(async {
         let root = init_root("writer-conflict-matrix");
         let (persistent, txn) = load_roots(&root);
-        let btree = BTree::<TestTxn>::new(persistent).await.unwrap();
+        let btree = string_tree(persistent).await;
         let barrier = Arc::new(Barrier::new(4));
 
         let later_same = {
@@ -622,7 +659,7 @@ async fn snapshot_scan_is_coherent_under_concurrent_commits() {
         }
 
         btree.commit(tx(30)).await.expect("commit 30");
-        btree.finalize(tx(30)).await.expect("finalize 30");
+        btree.finalize(&tx(30)).await.expect("finalize 30");
 
         let barrier = Arc::new(Barrier::new(3));
 
@@ -633,19 +670,20 @@ async fn snapshot_scan_is_coherent_under_concurrent_commits() {
                 barrier.wait().await;
 
                 let mut saw_future_key = false;
-                btree
-                    .for_each_row_in_order(
+                let mut scan = btree
+                    .keys(
                         tx(31),
                         (Bound::<Value>::Unbounded, Bound::<Value>::Unbounded),
                         false,
-                        |row| {
-                            if row.as_slice() == [Value::from(100_u64)] {
-                                saw_future_key = true;
-                            }
-                        },
                     )
                     .await
                     .unwrap();
+
+                while let Some(row) = scan.try_next().await.unwrap() {
+                    if row.as_slice() == [Value::from(100_u64)] {
+                        saw_future_key = true;
+                    }
+                }
 
                 saw_future_key
             })
@@ -671,7 +709,7 @@ async fn snapshot_scan_is_coherent_under_concurrent_commits() {
 
         let saw_future_key = scan_task.await.expect("scan task join");
         writer_task.await.expect("writer task join");
-        btree.finalize(tx(32)).await.expect("finalize after scan");
+        btree.finalize(&tx(32)).await.expect("finalize after scan");
 
         assert!(
             !saw_future_key,
@@ -706,11 +744,11 @@ async fn lifecycle_noop_paths_do_not_leak_reservations_soak() {
 
             btree.commit(txn_id).await.expect("commit");
             btree.commit(txn_id).await.expect("duplicate commit no-op");
-            btree.finalize(txn_id).await.expect("finalize");
+            btree.finalize(&txn_id).await.expect("finalize");
 
             if i > 0 {
                 btree
-                    .finalize(tx(999 + i))
+                    .finalize(&tx(999 + i))
                     .await
                     .expect("stale finalize no-op");
             }
@@ -743,7 +781,7 @@ async fn load_smoke_mixed_mutation_and_scan() {
         }
 
         btree.commit(tx(2_000)).await.expect("commit 2000");
-        btree.finalize(tx(2_000)).await.expect("finalize 2000");
+        btree.finalize(&tx(2_000)).await.expect("finalize 2000");
 
         for i in (0_u64..10_000_u64).step_by(2) {
             btree
@@ -760,7 +798,7 @@ async fn load_smoke_mixed_mutation_and_scan() {
         }
 
         btree.commit(tx(2_001)).await.expect("commit 2001");
-        btree.finalize(tx(2_001)).await.expect("finalize 2001");
+        btree.finalize(&tx(2_001)).await.expect("finalize 2001");
 
         let total = timeout(Duration::from_secs(10), btree.count(tx(2_002)))
             .await
@@ -772,20 +810,21 @@ async fn load_smoke_mixed_mutation_and_scan() {
 
         let mut range_count = 0_u64;
         timeout(Duration::from_secs(10), async {
-            btree
-                .for_each_row_in_order(
+            let mut scan = btree
+                .keys(
                     tx(2_002),
                     (
                         Bound::Included(Value::from(9_000_u64)),
                         Bound::Included(Value::from(11_000_u64)),
                     ),
                     false,
-                    |_| {
-                        range_count += 1;
-                    },
                 )
                 .await
                 .unwrap();
+
+            while scan.try_next().await.unwrap().is_some() {
+                range_count += 1;
+            }
         })
         .await
         .expect("range scan should complete");
@@ -800,7 +839,7 @@ async fn finalize_conflicts_with_future_read() {
     Box::pin(async {
         let root = init_root("finalize-future-read-conflict");
         let (persistent, txn) = load_roots(&root);
-        let btree = BTree::<TestTxn>::new(persistent).await.unwrap();
+        let btree = string_tree(persistent).await;
 
         btree
             .insert_row(&txn.with_id(tx(9)), vec![Value::from("k")])
@@ -808,7 +847,7 @@ async fn finalize_conflicts_with_future_read() {
             .expect("insert seed key");
 
         btree.commit(tx(9)).await.expect("commit 9");
-        btree.finalize(tx(9)).await.expect("finalize 9");
+        btree.finalize(&tx(9)).await.expect("finalize 9");
 
         // Register an overlapping future read at txn 11.
         assert!(
@@ -823,7 +862,7 @@ async fn finalize_conflicts_with_future_read() {
         // it merges already-committed data into canon. Future reads are
         // protected by their own permits and by the DirLock on persistent storage.
         btree
-            .finalize(tx(10))
+            .finalize(&tx(10))
             .await
             .expect("finalize should succeed with future read");
 
@@ -847,7 +886,8 @@ async fn finalize_conflicts_with_future_read() {
                 .await
                 .unwrap();
 
-            let mut finalize = Box::pin(btree.finalize(tx(n)));
+            let id = tx(n);
+            let mut finalize = Box::pin(btree.finalize(&id));
             assert!(futures::poll!(&mut finalize).is_pending());
             if consume {
                 assert!(!stream.try_collect::<Vec<_>>().await.unwrap().is_empty());
@@ -871,7 +911,7 @@ async fn blocked_reader_cancellation_does_not_poison_lock_state() {
     Box::pin(async {
         let root = init_root("blocked-reader-cancel");
         let (persistent, txn) = load_roots(&root);
-        let btree = BTree::<TestTxn>::new(persistent).await.unwrap();
+        let btree = string_tree(persistent).await;
 
         btree
             .insert_row(&txn.with_id(tx(60)), vec![Value::from("hot")])
@@ -899,7 +939,7 @@ async fn blocked_reader_cancellation_does_not_poison_lock_state() {
         assert!(aborted.is_err(), "blocked reader should abort cleanly");
 
         // Simulate timeout cleanup using rollback and verify no lock poisoning remains.
-        btree.rollback(tx(60)).expect("rollback 60");
+        btree.rollback(&tx(60)).await.expect("rollback 60");
 
         let visible = timeout(
             Duration::from_secs(1),
@@ -920,7 +960,19 @@ async fn multi_column_partial_overlap_blocking_behavior() {
         let (persistent, txn) = load_roots(&root);
         let btree = BTree::<TestTxn>::try_with_schema(
             persistent,
-            super::BTreeSchema::new(super::StorageConfig::default(), 2, None).unwrap(),
+            super::BTreeSchema::try_from(vec![
+                super::BTreeColumnSchema {
+                    name: "a".into(),
+                    dtype: tc_value::ValueType::String,
+                    max_size: None,
+                },
+                super::BTreeColumnSchema {
+                    name: "b".into(),
+                    dtype: tc_value::ValueType::Number(tc_value::NumberType::Number),
+                    max_size: None,
+                },
+            ])
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -965,7 +1017,7 @@ async fn multi_column_partial_overlap_blocking_behavior() {
         );
 
         assert_eq!(
-            btree.rollback(tx(80)).unwrap_err().code(),
+            btree.rollback(&tx(80)).await.unwrap_err().code(),
             tc_error::ErrorKind::Conflict
         );
     })
@@ -996,12 +1048,12 @@ async fn reservation_fuzz_no_read_starvation() {
                     btree.commit(txn_id).await.expect("fuzz duplicate commit");
                 }
             } else {
-                btree.rollback(txn_id).expect("fuzz rollback");
+                btree.rollback(&txn_id).await.expect("fuzz rollback");
             }
 
             if i > 0 {
                 btree
-                    .finalize(tx(2_999 + i))
+                    .finalize(&tx(2_999 + i))
                     .await
                     .expect("fuzz finalize frontier");
             }
@@ -1024,7 +1076,7 @@ async fn same_txn_read_your_own_write_is_non_blocking() {
     Box::pin(async {
         let root = init_root("same-txn-read-own-write");
         let (persistent, txn) = load_roots(&root);
-        let btree = BTree::<TestTxn>::new(persistent).await.unwrap();
+        let btree = string_tree(persistent).await;
 
         btree
             .insert_row(&txn.with_id(tx(90)), vec![Value::from("own")])
@@ -1048,7 +1100,7 @@ async fn same_txn_read_your_own_delete_is_non_blocking() {
     Box::pin(async {
         let root = init_root("same-txn-read-own-delete");
         let (persistent, txn) = load_roots(&root);
-        let btree = BTree::<TestTxn>::new(persistent).await.unwrap();
+        let btree = string_tree(persistent).await;
 
         btree
             .insert_row(&txn.with_id(tx(91)), vec![Value::from("gone")])
@@ -1077,16 +1129,17 @@ async fn repeated_rollback_and_finalize_are_idempotent() {
     Box::pin(async {
         let root = init_root("repeated-lifecycle-idempotency");
         let (persistent, txn) = load_roots(&root);
-        let btree = BTree::<TestTxn>::new(persistent).await.unwrap();
+        let btree = string_tree(persistent).await;
 
         btree
             .insert_row(&txn.with_id(tx(92)), vec![Value::from("rollback")])
             .await
             .expect("insert key for rollback");
 
-        btree.rollback(tx(92)).expect("first rollback");
+        btree.rollback(&tx(92)).await.expect("first rollback");
         btree
-            .rollback(tx(92))
+            .rollback(&tx(92))
+            .await
             .expect("second rollback should be no-op");
 
         btree
@@ -1096,9 +1149,9 @@ async fn repeated_rollback_and_finalize_are_idempotent() {
 
         btree.commit(tx(93)).await.expect("commit 93");
 
-        btree.finalize(tx(93)).await.expect("first finalize");
+        btree.finalize(&tx(93)).await.expect("first finalize");
         btree
-            .finalize(tx(93))
+            .finalize(&tx(93))
             .await
             .expect("second finalize should be no-op");
 
@@ -1125,7 +1178,7 @@ async fn empty_tree_semantics_across_lifecycle() {
     Box::pin(async {
         let root = init_root("empty-tree-lifecycle");
         let (persistent, _) = load_roots(&root);
-        let btree = BTree::<TestTxn>::new(persistent).await.unwrap();
+        let btree = string_tree(persistent).await;
 
         assert!(btree.is_empty(tx(95)).await.unwrap());
         assert_eq!(btree.count(tx(95)).await.unwrap(), 0);
@@ -1142,7 +1195,7 @@ async fn empty_tree_semantics_across_lifecycle() {
             .expect("empty commit should be allowed");
 
         btree
-            .finalize(tx(95))
+            .finalize(&tx(95))
             .await
             .expect("empty finalize should be allowed");
 
@@ -1173,54 +1226,103 @@ async fn decoding_reports_root_admission_failure() {
     let encoded =
         destream_json::encode((schema, Vec::<Vec<Value>>::new())).expect("encode empty BTree");
 
-    let decoded: Result<super::DecodedBTreePayload<TestTxn>, _> =
-        destream_json::try_decode(txn, encoded).await;
+    let decoded: Result<super::BTree<TestTxn>, _> = destream_json::try_decode(txn, encoded).await;
 
-    let error = decoded.expect_err("root exceeds delegated cache budget");
-    assert!(error.to_string().contains("capacity"), "{error}");
+    decoded.expect_err("native creation exceeds delegated cache budget");
     std::fs::remove_dir_all(&*root).expect("remove test root");
 }
 
 #[tokio::test]
 async fn schema_creation_and_storage_failures_are_errors() {
     use safecast::{CastFrom, TryCastFrom};
+    use tc_value::class::NativeClass;
 
     use super::{BTreeColumnSchema, BTreeSchema, StorageConfig};
 
     let name = String::from("column");
     let pointer = name.as_ptr();
     let dtype = Value::cast_from(tc_value::ValueType::String);
-    let column = BTreeColumnSchema::opt_cast_from(Value::Tuple(vec![
+    let column = BTreeColumnSchema::opt_cast_from(vec![
         Value::String(name),
         dtype.clone(),
         Value::from(8_u64),
-    ]))
+    ])
     .unwrap();
 
     assert_eq!(column.name.as_ptr(), pointer);
     assert_eq!(column.dtype, tc_value::ValueType::String);
     assert_eq!(column.max_size, Some(8_u64.into()));
 
-    for value in [
-        Value::Tuple(vec![Value::from("column"), dtype.clone()]),
-        Value::Tuple(vec![
-            Value::from("column"),
-            dtype.clone(),
-            Value::from(8_u64),
-        ]),
-        Value::Tuple(vec![Value::from(7_u64), dtype.clone()]),
-        Value::Tuple(vec![Value::from("column"), Value::from("invalid type")]),
-        Value::Tuple(vec![Value::from("column"), dtype, Value::None]),
-        Value::Tuple(vec![Value::from("column")]),
+    for (value, accepted) in [
+        (Value::None, false),
+        (Value::Tuple(vec![]), false),
+        (Value::Tuple(vec![Value::from("column")]), false),
+        (
+            Value::Tuple(vec![Value::from("column"), dtype.clone()]),
+            true,
+        ),
+        (
+            Value::Tuple(vec![
+                Value::from("column"),
+                dtype.clone(),
+                Value::from(8_u64),
+            ]),
+            true,
+        ),
+        (
+            Value::Tuple(vec![
+                Value::from("column"),
+                dtype.clone(),
+                Value::from(8_u64),
+                Value::None,
+            ]),
+            false,
+        ),
+        (Value::Tuple(vec![Value::from(7_u64), dtype.clone()]), false),
+        (
+            Value::Tuple(vec![Value::from("column"), Value::from("invalid type")]),
+            false,
+        ),
+        (
+            Value::Tuple(vec![Value::from("column"), dtype, Value::None]),
+            false,
+        ),
     ] {
-        assert_eq!(
-            BTreeColumnSchema::can_cast_from(&value),
-            BTreeColumnSchema::opt_cast_from(value).is_some()
-        );
+        assert_eq!(BTreeColumnSchema::can_cast_from(&value), accepted);
+        let cast = BTreeColumnSchema::opt_cast_from(value.clone());
+        assert_eq!(cast.is_some(), accepted);
+        let decoded =
+            tbon::de::try_decode::<_, _, BTreeColumnSchema>((), tbon::en::encode(&value).unwrap())
+                .await;
+
+        assert_eq!(decoded.is_ok(), accepted);
+        if let Ok(decoded) = decoded {
+            assert_eq!(Some(decoded), cast);
+        }
+
+        if let Value::Tuple(fields) = value {
+            assert_eq!(BTreeColumnSchema::can_cast_from(&fields), accepted);
+            assert_eq!(
+                BTreeColumnSchema::opt_cast_from(fields.clone()).is_some(),
+                accepted
+            );
+
+            let tagged = std::collections::BTreeMap::from([(
+                tc_value::ValueType::Tuple.path().to_string(),
+                fields,
+            )]);
+
+            let decoded = tbon::de::try_decode::<_, _, BTreeColumnSchema>(
+                (),
+                tbon::en::encode(tagged).unwrap(),
+            )
+            .await;
+
+            assert_eq!(decoded.is_ok(), accepted);
+        }
     }
 
-    assert!(BTreeSchema::new(StorageConfig::default(), 0, None).is_err());
-    assert!(BTreeSchema::new(StorageConfig::default(), 2, Some(vec![])).is_err());
+    assert!(BTreeSchema::new(vec![], StorageConfig::default()).is_err());
     let root = init_root("fallible-btree");
     let (dir, _) = load_roots(&root);
     let tree = BTree::<TestTxn>::new(dir.clone()).await.unwrap();
@@ -1236,9 +1338,18 @@ async fn schema_creation_and_storage_failures_are_errors() {
     assert!(tree.count(tx(1)).await.is_err());
     assert!(tree.is_empty(tx(1)).await.is_err());
     assert!(
-        tree.for_each_row_in_order(tx(1), .., false, |_| panic!("missing root yielded a row"))
-            .await
-            .is_err()
+        async {
+            let mut keys = tree
+                .keys(tx(1), (Bound::Unbounded, Bound::Unbounded), false)
+                .await?;
+            assert!(
+                keys.try_next().await?.is_none(),
+                "missing root yielded a row"
+            );
+            Ok::<_, tc_error::TCError>(())
+        }
+        .await
+        .is_err()
     );
 
     drop(tree);

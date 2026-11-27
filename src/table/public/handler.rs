@@ -10,9 +10,9 @@ use tc_error::{TCResult, bad_request};
 use tc_ir::{Id, Map, Scalar};
 use tc_value::Value;
 
-use super::selector::{KeyOrRange, cast_into_range};
 use crate::CollectionState;
 use crate::table::Table;
+use super::selector::{KeyOrRange, cast_into_range};
 
 /// Handler for schema and column-name routes.
 ///
@@ -205,7 +205,7 @@ where
                     KeyOrRange::All => Ok(State::from(table.read_view())),
                     KeyOrRange::Range(range) => {
                         let slice = table.slice(range, &[], false)?;
-                        Ok(State::from(Table::from(slice)))
+                        Ok(State::from(slice))
                     }
                     KeyOrRange::Key(key) => match table.read_row(txn_id, &key).await? {
                         Some(row) => Ok(State::from(Value::Tuple(row.into_vec()))),
@@ -272,7 +272,7 @@ where
 
                 let range = cast_into_range(table.schema(), value)?;
                 let slice = table.slice(range, &[], false)?;
-                Ok(State::from(Table::from(slice)))
+                Ok(State::from(slice))
             })
         }))
     }
@@ -440,7 +440,7 @@ where
                     bad_request!("limit must be a nonnegative integer").consume(error)
                 })?;
 
-                Ok(State::from(Table::from(table.limit(u64::from(limit))?)))
+                Ok(State::from(table.limit(u64::from(limit))))
             })
         }))
     }
@@ -470,7 +470,7 @@ where
                     (columns, false)
                 };
 
-                Ok(State::from(Table::from(table.order_by(&columns, reverse)?)))
+                Ok(State::from(table.order_by(&columns, reverse)?))
             })
         }))
     }
@@ -494,7 +494,7 @@ where
                 let columns: Vec<Id> =
                     value.try_cast_into(|v| bad_request!("invalid column list: {v:?}"))?;
 
-                Ok(State::from(Table::from(table.select(&columns)?)))
+                Ok(State::from(table.select(&columns)?))
             })
         }))
     }

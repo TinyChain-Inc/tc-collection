@@ -6,9 +6,9 @@ use tc_error::{TCError, TCResult};
 use tc_ir::Map;
 use tc_value::Value;
 
+use crate::{CollectionState, StorageContext};
 use super::super::{Tensor, TensorReduceResult};
 use super::{axes, no_parameters, optional, parameter, shape, state};
-use crate::{CollectionState, StorageContext};
 
 fn reduction<S: CollectionState>(value: TensorReduceResult<S::Txn>) -> S {
     match value {

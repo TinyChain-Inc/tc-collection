@@ -9,7 +9,7 @@ type Action = Box<dyn FnOnce() -> fensor::Result<()> + Send>;
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct Counts {
-    pub touched_lookups: usize,
+    pub zero_lookups: usize,
     pub payload_reads: usize,
     pub membership_scans: usize,
     pub overlay_starts: usize,
@@ -92,8 +92,7 @@ pub(super) fn after_scatter(target: &Arc<AtomicU64>) -> fensor::Result<()> {
     }
 }
 
-// Observe a completed native scan after its guards drop. This isolates a
-// materialization handoff between fragmented runs without changing Delta.
+// Observe one completed run after its node guards drop and before the next run.
 pub(super) fn on_membership(
     target: &Arc<AtomicU64>,
     completed_run: usize,

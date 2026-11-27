@@ -4,8 +4,8 @@ use safecast::CastFrom;
 use tc_value::Value;
 use tc_value::class::NativeClass;
 
-use crate::view::{BTreeView, CollectionView, TableView};
 use crate::{BTreeType, TableType, TensorType};
+use super::{BTreeView, CollectionView, TableView};
 
 impl<'en> en::IntoStream<'en> for BTreeView {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {

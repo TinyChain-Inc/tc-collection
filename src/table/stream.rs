@@ -70,22 +70,14 @@ impl Projection {
 /// or drop. Shared guarded-stream cleanup releases the source before the permit.
 /// `limit` and `select` return new `Rows` with the transform applied lazily.
 pub struct Rows {
-    stream: crate::stream::GuardedStream<
-        Result<Row<Value>, std::io::Error>,
-        Option<crate::stream::ReadPermit>,
-    >,
+    stream:
+        crate::stream::GuardedStream<Result<Row<Value>, std::io::Error>, crate::stream::ReadPermit>,
 }
 
 impl Rows {
-    pub(crate) fn new(stream: RowStream, permit: crate::stream::ReadPermit) -> Self {
+    pub(super) fn new(stream: RowStream, permit: crate::stream::ReadPermit) -> Self {
         Self {
-            stream: crate::stream::GuardedStream::new(stream, Some(permit)),
-        }
-    }
-
-    pub(crate) fn local(stream: RowStream) -> Self {
-        Self {
-            stream: crate::stream::GuardedStream::new(stream, None),
+            stream: crate::stream::GuardedStream::new(stream, permit),
         }
     }
 

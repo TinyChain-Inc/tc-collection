@@ -2,8 +2,8 @@
 
 use tc_error::TCError;
 
-use super::super::Tensor;
-use super::{axes, dtype, no_parameters, optional, parameter, shape, state};
+use super::super::{Tensor, schema::dtype};
+use super::{axes, no_parameters, optional, parameter, shape, state};
 use crate::{CollectionState, CopyFrom, StorageContext};
 
 pub(super) struct Matmul<'a, Txn: StorageContext>(pub(super) &'a Tensor<Txn>);
@@ -156,7 +156,10 @@ impl<'a, S: CollectionState<Txn = Txn>, Txn: StorageContext> tc_ir::Handler<'a, 
         'txn: 'a,
     {
         Some(Box::new(move |txn, key| {
-            Box::pin(async move { Ok(state(self.0.cast(txn.id(), dtype(S::from(key))?).await?)) })
+            Box::pin(async move {
+                let dtype = dtype(S::from(key).into_value()?)?;
+                Ok(state(self.0.cast(txn.id(), dtype).await?))
+            })
         }))
     }
 }
@@ -241,28 +244,6 @@ impl<'a, S: CollectionState<Txn = Txn>, Txn: StorageContext> tc_ir::Handler<'a, 
                         self.0,
                     )
                     .await?,
-                ))
-            })
-        }))
-    }
-}
-
-pub(super) struct CopyValues<'a, Txn: StorageContext>(pub(super) &'a Tensor<Txn>);
-
-impl<'a, S: CollectionState<Txn = Txn>, Txn: StorageContext> tc_ir::Handler<'a, S>
-    for CopyValues<'a, Txn>
-{
-    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, S>>
-    where
-        'txn: 'a,
-    {
-        Some(Box::new(move |txn, key| {
-            Box::pin(async move {
-                let _ = key;
-                Ok(state(
-                    self.0
-                        .copy_values(txn, txn.subcontext_unique().context().await?)
-                        .await?,
                 ))
             })
         }))

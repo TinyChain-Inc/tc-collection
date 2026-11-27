@@ -1,14 +1,16 @@
-mod overlay;
-
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::stream::BoxStream;
 use tc_value::Value;
 
+mod overlay;
+
 pub(crate) use overlay::Overlay;
 
 pub(crate) type ReadPermit = txn_lock::semaphore::PermitRead<txn_lock::set::Range<Vec<Value>>>;
+pub(crate) type ReadSnapshot<D> = (ReadPermit, Vec<Arc<D>>);
 
 /// A pull-driven stream which owns the guard that makes its items valid.
 ///

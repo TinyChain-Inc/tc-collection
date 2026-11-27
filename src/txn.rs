@@ -4,7 +4,7 @@ use freqfs::DirLock;
 use tc_error::TCResult;
 use tc_ir::Transaction as IrTransaction;
 
-/// Host-local storage delegated by a protocol transaction.
+/// Host-local allocation for fresh literals and independent transaction-local values.
 ///
 /// The protocol identity is inherited unchanged by child contexts. Only the
 /// caller-provided implementation knows how to resolve the current directory.
@@ -21,6 +21,7 @@ pub trait StorageContext: IrTransaction + Clone + Send + Sync + 'static {
 
     fn subcontext(&self, name: impl Into<String>) -> Self;
     fn subcontext_unique(&self) -> Self;
+
     /// Maximum supplied element bytes for native Tensor literals, checked after
     /// allocation. This does not size storage blocks or bound streamed tensors.
     fn materialized_tensor_bytes(&self) -> usize;
@@ -50,7 +51,8 @@ pub trait CopyFrom<Source>: Sized {
 /// pending destination state without deciding or synchronizing the transaction.
 /// Self-restoration is a no-op only for a writable transaction. Conflicting
 /// reservations reject without waiting. Failed or cancelled staging preserves
-/// the previous pending state; the caller owns unpublished workspace cleanup.
+/// the previous pending state. Lifecycle cleanup or strict reopening reclaims
+/// unreachable staging allocations beneath the destination owner.
 pub trait Restore {
     type Txn: StorageContext;
 

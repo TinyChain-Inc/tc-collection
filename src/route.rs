@@ -30,6 +30,7 @@ pub trait CollectionState:
     fn into_value(self) -> TCResult<Value>;
     fn into_tuple(self) -> TCResult<Vec<Self>>;
     fn into_map(self) -> TCResult<Map<Self>>;
+
     fn into_tensor(self) -> TCResult<Tensor<Self::Txn>>;
 
     /// Inspect an embedded number without consuming or coercing this value.

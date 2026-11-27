@@ -1,23 +1,26 @@
+use futures::StreamExt;
 use futures::stream::BoxStream;
-use tc_error::TCResult;
+use tc_error::{TCError, TCResult};
 use tc_ir::IntoView;
 use tc_value::Value;
 
 use crate::Collection;
-use crate::btree::{BTreeColumnSchema, Keys};
-use crate::table::TableSchema;
+use crate::btree::{BTree, BTreeColumnSchema, Keys};
+use crate::table::{Table, TableSchema};
 use crate::tensor::TensorView as NativeTensorView;
+
+mod encode;
 
 /// A transaction-consistent BTree representation prepared for terminal projection.
 pub struct BTreeView {
-    pub(crate) schema: Vec<BTreeColumnSchema>,
-    pub(crate) keys: Keys,
+    schema: Vec<BTreeColumnSchema>,
+    keys: Keys,
 }
 
 /// A transaction-consistent Table representation prepared for terminal projection.
 pub struct TableView {
-    pub(crate) schema: TableSchema,
-    pub(crate) rows: BoxStream<'static, TCResult<Value>>,
+    schema: TableSchema,
+    rows: BoxStream<'static, TCResult<Value>>,
 }
 
 /// The terminal view of a collection. Route execution returns `Collection`, not this type.
@@ -42,3 +45,53 @@ where
         }
     }
 }
+
+impl<Txn: crate::StorageContext> IntoView for BTree<Txn> {
+    type Txn = Txn;
+
+    type View = BTreeView;
+
+    async fn into_view(self, txn: Txn) -> tc_error::TCResult<Self::View> {
+        let keys = self
+            .keys(txn.id())
+            .await
+            .map_err(|error| txn.storage_error(error))?;
+
+        let keys = keys.map_stream(|stream| {
+            stream
+                .map(move |row| row.map_err(|error| txn.storage_error(error)))
+                .boxed()
+        });
+
+        Ok(BTreeView {
+            schema: self.schema().columns().to_vec(),
+            keys,
+        })
+    }
+}
+
+impl<Txn: crate::StorageContext> IntoView for Table<Txn> {
+    type Txn = Txn;
+
+    type View = TableView;
+
+    async fn into_view(self, txn: Txn) -> TCResult<Self::View> {
+        let schema = self.schema().clone();
+        let rows = self
+            .rows(txn.id())
+            .await
+            .map_err(|error| txn.storage_error(error))?
+            .map(move |row| {
+                row.map(|row| Value::Tuple(row.into_vec()))
+                    .map_err(TCError::from)
+                    .map_err(|error| txn.storage_error(error))
+            })
+            .boxed();
+
+        Ok(TableView { schema, rows })
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/unit/view.rs"]
+mod tests;

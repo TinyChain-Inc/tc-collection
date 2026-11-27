@@ -1,13 +1,15 @@
 //! Select each Tensor route once; operation families own terminal handlers.
 
 use number_general::Number;
-use pathlink::{PathBuf, PathSegment};
-use safecast::CastInto;
+use pathlink::PathSegment;
 use tc_error::{TCError, TCResult};
 use tc_ir::Map;
-use tc_value::{NumberType, Value, number_type_from_path, number_type_path};
+use tc_value::{NumberType, Value, number_type_path};
 
-use super::{AxisRange, Data, Range, Shape as TensorShape, Tensor, TensorSchema, Typed};
+use super::{
+    AxisRange, Range, Shape as TensorShape, Tensor, TensorAccess, TensorBase, TensorSchema,
+    checked_value,
+};
 use crate::{Collection, CollectionState, StorageContext};
 
 // Generate concrete borrowing handlers; argument policy stays at this boundary.
@@ -47,8 +49,7 @@ mod unary;
 use binary::{Add, And, Cond, Div, Eq, Ge, Gt, Le, Log, Lt, Mul, Ne, Or, Pow, Rem, Sub, Xor};
 use reduce::{All, Any, BroadcastReduce, Max, Mean, Min, Norm, Product, Std, Sum};
 use transform::{
-    AsDense, Broadcast, Cast, Copy, CopyValues, Diag, ExpandDims, Flip, Matmul, Mt, Reshape,
-    Squeeze, Transpose,
+    AsDense, Broadcast, Cast, Copy, Diag, ExpandDims, Flip, Matmul, Mt, Reshape, Squeeze, Transpose,
 };
 #[cfg(feature = "complex")]
 use transform::{Fft, Fft2, Ifft, Ifft2, Mh};
@@ -145,7 +146,6 @@ impl<S: CollectionState<Txn = Txn>, Txn: StorageContext> tc_ir::Route<S> for Ten
                 "cond" => Some(Box::new(Cond(self))),
                 "broadcast_reduce" => Some(Box::new(BroadcastReduce(self))),
                 "copy" => Some(Box::new(Copy(self))),
-                "copy_values" => Some(Box::new(CopyValues(self))),
                 "as_dense" => Some(Box::new(AsDense(self))),
                 _ => None,
             },
@@ -200,35 +200,6 @@ fn axes<S: CollectionState>(state: S) -> TCResult<Vec<usize>> {
         .into_iter()
         .map(|axis| usize::try_from(axis).map_err(TCError::bad_request))
         .collect()
-}
-
-fn dtype<S: CollectionState>(state: S) -> TCResult<NumberType> {
-    let raw = match state.into_value()? {
-        Value::String(raw) => raw,
-        Value::Link(link) => link.to_string(),
-        _ => return Err(TCError::bad_request("expected Tensor dtype path")),
-    };
-
-    let dtype = match raw.as_str() {
-        "u8" => Some(NumberType::UInt(number_general::UIntType::U8)),
-        "u16" => Some(NumberType::UInt(number_general::UIntType::U16)),
-        "u32" => Some(NumberType::UInt(number_general::UIntType::U32)),
-        "u64" => Some(NumberType::UInt(number_general::UIntType::U64)),
-        "i8" => Some(NumberType::Int(number_general::IntType::I8)),
-        "i16" => Some(NumberType::Int(number_general::IntType::I16)),
-        "i32" => Some(NumberType::Int(number_general::IntType::I32)),
-        "i64" => Some(NumberType::Int(number_general::IntType::I64)),
-        "f32" => Some(NumberType::Float(number_general::FloatType::F32)),
-        "f64" => Some(NumberType::Float(number_general::FloatType::F64)),
-        "c32" => Some(NumberType::Complex(number_general::ComplexType::C32)),
-        "c64" => Some(NumberType::Complex(number_general::ComplexType::C64)),
-        _ => raw
-            .parse::<PathBuf>()
-            .ok()
-            .and_then(|path| number_type_from_path(&path)),
-    };
-
-    dtype.ok_or_else(|| TCError::bad_request("unsupported Tensor dtype"))
 }
 
 fn range<S: CollectionState>(state: S, shape: &[u64]) -> TCResult<Range> {
@@ -442,64 +413,61 @@ pub(crate) async fn tensor_literal<S: CollectionState>(
     key: S,
     values: S,
 ) -> TCResult<Tensor<S::Txn>> {
-    let mut fields = key.into_tuple()?;
-    if !(2..=3).contains(&fields.len()) {
+    let fields = key.into_tuple()?;
+    if fields.len() != 2 {
         return Err(TCError::bad_request(
-            "Tensor literal key must be [dtype, shape, optional sparse axis]",
+            "Tensor literal key must be [dtype, shape]",
         ));
     }
 
-    let sparse_axis = match (fields.len() == 3).then(|| fields.pop().expect("literal arity")) {
-        None => None,
-        Some(value) => match value.into_value()? {
-            Value::Number(axis) => Some(
-                usize::try_from(super::schema::dimension(axis)?).map_err(TCError::bad_request)?,
-            ),
-            _ => return Err(TCError::bad_request("expected a numeric sparse axis")),
-        },
-    };
-
     let mut fields = fields.into_iter();
-    let schema = TensorSchema::new(
-        dtype(fields.next().expect("literal arity"))?,
-        shape(fields.next().expect("literal arity"))?,
-        sparse_axis,
-    )?;
-
-    let sparse = schema.is_sparse();
-    let values = values.into_tuple()?;
-    if !sparse && values.len() as u64 != schema.native().shape().iter().product::<u64>() {
+    let dtype = super::schema::dtype(fields.next().expect("literal arity").into_value()?)?;
+    let dimensions = shape(fields.next().expect("literal arity"))?;
+    let mut values = values.into_tuple()?.into_iter();
+    let count = values.len() as u64;
+    let first = values.next().map(S::into_value).transpose()?;
+    let sparse = first.as_ref().is_none_or(|value| {
+        matches!(value, Value::Tuple(pair) if matches!(pair.first(), Some(Value::Tuple(_))))
+    });
+    let schema = TensorSchema::logical(dtype, dimensions, sparse)?;
+    if !sparse && count != schema.native().shape().iter().product::<u64>() {
         return Err(TCError::bad_request(
             "Tensor literal value count differs from shape",
         ));
     }
 
-    let capacity = fensor::MAX_BLOCK_CAPACITY;
-    let dir = txn.subcontext_unique().context().await?;
-    let data = dtype_factory!(schema.dtype(), T => {
+    let values = first.into_iter().map(S::from).chain(values);
+    Ok(dtype_factory!(schema.dtype(), T => {
         if sparse {
             let entries = futures::stream::iter(values.into_iter().map(|value| {
                 let fields = value.into_tuple()?;
                 if fields.len() != 2 { return Err(TCError::bad_request("expected sparse [coordinate, value]")); }
                 let mut fields = fields.into_iter();
                 let coord = shape(fields.next().expect("sparse entry arity"))?;
-                let Value::Number(number) = fields.next().expect("sparse entry arity").into_value()? else {
-                    return Err(TCError::bad_request("expected numeric Tensor value"));
-                };
-                if number == Number::from(0u8) { return Err(TCError::bad_request("sparse values must be nonzero")); }
-                Ok((coord.into_vec(), number.cast_into()))
+                let number = literal_number(fields.next().expect("sparse entry arity").into_value()?)?;
+                Ok((coord.into_vec(), checked_value::<T>(number)?))
             }));
-            fensor::Tensor::<_, T>::from_sparse_elements(dir, schema.native().clone(), schema.layout(), capacity, entries).await?
+            TensorBase::<S::Txn, T>::from_sparse_entries::<TCError>(txn, schema, entries).await?
         } else {
             let values = futures::stream::iter(values.into_iter().map(|value| {
-                let Value::Number(number) = value.into_value()? else {
-                    return Err(TCError::bad_request("expected numeric Tensor value"));
-                };
-                Ok::<T, TCError>(number.cast_into())
+                let number = literal_number(value.into_value()?)?;
+                checked_value::<T>(number)
             }));
-            fensor::Tensor::<_, T>::from_values(dir, schema.native().clone(), capacity, values).await?
+            TensorBase::<S::Txn, T>::from_values(txn, schema, values).await?
         }
-    }, dtype => return Err(TCError::bad_request(format!("unsupported Tensor dtype {dtype}"))));
+    }, dtype => return Err(TCError::bad_request(format!("unsupported Tensor dtype {dtype}")))))
+}
 
-    Ok(Tensor { data })
+fn literal_number(value: Value) -> TCResult<Number> {
+    match value {
+        Value::Number(number) => return Ok(number),
+        Value::Tuple(pair) => {
+            if let [Value::Number(re), Value::Number(im)] = pair.as_slice() {
+                return super::complex_value(*re, *im);
+            }
+        }
+        _ => {}
+    }
+
+    Err(TCError::bad_request("expected numeric Tensor value"))
 }

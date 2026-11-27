@@ -61,7 +61,6 @@ async fn finalization() {
         tensor.commit(txn.id()).await.unwrap();
         let start = Instant::now();
         tensor.finalize(&txn.id()).boxed().await.unwrap();
-        tensor.sync_all().await.unwrap();
         record(&workload, "finalize_sync", "mixed", start.elapsed());
         assert!(values(&tensor, id(11)).await.iter().all(|v| *v == 1.));
     }
@@ -110,14 +109,13 @@ async fn mutation() {
 
             let start = Instant::now();
             tensor.finalize(&id(13)).boxed().await.unwrap();
-            tensor.sync_all().await.unwrap();
             record(&workload, "finalize_sync", "mixed", start.elapsed());
         }
     }
 }
 
-// A zero patch exercises replacement traversal during both pending merge and
-// finalization, including the explicit zeros which suppress canonical ones.
+// A zero fill replaces existing pending data and exercises the explicit zeros
+// that suppress canonical ones through finalization.
 async fn zero_replacements() {
     for sparse in [false, true] {
         let (_root, txn) = setup().await;
@@ -126,7 +124,7 @@ async fn zero_replacements() {
         tensor.commit(txn.id()).await.unwrap();
         tensor.finalize(&txn.id()).boxed().await.unwrap();
         let next = txn.at(11);
-        // Keep an existing pending delta so publication merges the staged patch.
+        // Keep an existing pending delta for the full fill to replace.
         tensor.fill(&next, 2.0.into()).boxed().await.unwrap();
         let workload = format!("zero_replacements/{}", layout(sparse));
         let start = Instant::now();
@@ -163,7 +161,6 @@ async fn zero_replacements() {
         tensor.finalize(&next.id()).boxed().await.unwrap();
         record(&workload, "finalize", "mixed", start.elapsed());
         let start = Instant::now();
-        tensor.sync_all().await.unwrap();
         record(&workload, "sync", "mixed", start.elapsed());
         assert_eq!(values(&tensor, id(12)).await, observed);
     }
@@ -189,7 +186,7 @@ async fn assignment() {
         record(&workload, "transpose", "mixed", start.elapsed());
         let start = Instant::now();
         target.write_tensor(&txn, source).boxed().await.unwrap();
-        record(&workload, "merge", "mixed", start.elapsed());
+        record(&workload, "replace_pending", "mixed", start.elapsed());
         assert_eq!(
             values(&target, txn.id()).await,
             (0..1024).map(f64::from).collect::<Vec<_>>()
@@ -198,7 +195,6 @@ async fn assignment() {
         target.commit(txn.id()).await.unwrap();
         let start = Instant::now();
         target.finalize(&txn.id()).boxed().await.unwrap();
-        target.sync_all().await.unwrap();
         record(&workload, "finalize_sync", "mixed", start.elapsed());
     }
 }
@@ -259,6 +255,66 @@ async fn restoration() {
 
         assert!(values(&target, txn.id()).await.iter().all(|v| *v == 2.));
     }
+
+    const WIDTH: u64 = 4096;
+    const SOURCE_CAPACITY: usize = 256;
+    for rows in [32, 128] {
+        for target_capacity in [SOURCE_CAPACITY, 64] {
+            let (_root, txn) = setup().await;
+            let shape = [rows, WIDTH];
+            let schema = TensorSchema::new(
+                number_general::FloatType::F64.into(),
+                shape.as_slice().into(),
+                Some(0),
+            )
+            .unwrap();
+            let source = Tensor::create(
+                txn.subcontext_unique().context().await.unwrap(),
+                schema.clone(),
+                SOURCE_CAPACITY,
+            )
+            .boxed()
+            .await
+            .unwrap();
+            let target = Tensor::create(
+                txn.subcontext_unique().context().await.unwrap(),
+                schema,
+                target_capacity,
+            )
+            .boxed()
+            .await
+            .unwrap();
+            let source_coords = [[0, 0], [rows - 1, WIDTH - 1]];
+            let target_coords = [[0, WIDTH / 4], [rows - 1, WIDTH / 2]];
+            for (tensor, coords) in [(&source, source_coords), (&target, target_coords)] {
+                for coord in coords {
+                    tensor.write_value(&txn, &coord, 2.0.into()).await.unwrap();
+                }
+
+                tensor.commit(txn.id()).await.unwrap();
+                tensor.finalize(&txn.id()).boxed().await.unwrap();
+            }
+
+            let reader = txn.at(11);
+            let workload =
+                format!("restoration/sparse/{rows}x{WIDTH}/{SOURCE_CAPACITY}-to-{target_capacity}");
+            let start = Instant::now();
+            target.restore(&reader, &source).boxed().await.unwrap();
+            record(&workload, "restore", "mixed", start.elapsed());
+            for coord in source_coords {
+                assert_eq!(
+                    target.read_value(reader.id(), &coord).await.unwrap(),
+                    2.0.into()
+                );
+            }
+            for coord in target_coords {
+                assert_eq!(
+                    target.read_value(reader.id(), &coord).await.unwrap(),
+                    0.0.into()
+                );
+            }
+        }
+    }
 }
 
 async fn sparse_count(tensor: &Tensor<Txn>, transaction: u16) -> usize {
@@ -273,7 +329,7 @@ async fn sparse_count(tensor: &Tensor<Txn>, transaction: u16) -> usize {
 
 async fn overlay() {
     // Small selections use bounded logical evaluation; larger ones exercise
-    // occupied-index traversal across pages with the same block geometry.
+    // occupied-index traversal across batches with the same block geometry.
     let cases = if std::env::var_os("COLLECTION_BENCH_SMOKE").is_some() {
         [(256, 1), (4097, 1)]
     } else {
@@ -358,7 +414,6 @@ async fn reads() {
         }
 
         record(&workload, "scan", "warm", start.elapsed());
-        tensor.sync_all().await.unwrap();
     }
 }
 
@@ -369,9 +424,19 @@ async fn integrity() {
 
     for depth in [1, 16] {
         let (_root, txn) = setup().await;
-        let tree = BTree::<Txn>::new(txn.subcontext_unique().context().await.unwrap())
-            .await
-            .unwrap();
+        let tree = BTree::<Txn>::create(
+            txn.subcontext_unique().context().await.unwrap(),
+            tc_collection::btree::BTreeSchema::try_from(vec![
+                tc_collection::btree::BTreeColumnSchema {
+                    name: "key".into(),
+                    dtype: tc_value::ValueType::Number(tc_value::NumberType::Number),
+                    max_size: None,
+                },
+            ])
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 
         let schema = TableSchema::new(
             vec![Column {

@@ -157,6 +157,7 @@ temporary-directory cleanup.
 ```bash
 cargo test --release --features benchmarks --test tensor_benchmark -- --ignored --nocapture
 COLLECTION_BENCH_SUITE=overlay cargo test --release --features benchmarks --test tensor_benchmark -- --ignored --nocapture
+COLLECTION_BENCH_SUITE=restoration cargo test --release --features benchmarks --test tensor_benchmark -- --ignored --nocapture
 ```
 
 `COLLECTION_BENCH_CACHE_BYTES` selects the benchmark fixture's cache budget;
@@ -184,7 +185,7 @@ workers, not this explicit Tokio runtime setting.
 `mutation` measures whole-owner fills and selected fills through the public
 owner-bound write path. Returned geometric views remain read-only.
 The `zero_replacements` suite measures zero-patch merging, mixed-value scans, and
-finalization with synchronization for both layouts. Sparse scan records include
+durable finalization for both layouts. Sparse scan records include
 value consumption, rather than a private index-only probe. The overlay suite
 measures 256-element logical evaluation and 8,193-element indexed traversal at
 each transaction depth, with 20 and 3 repetitions respectively.
@@ -208,7 +209,7 @@ isolated nonzeros occur every 1024 columns, clustered values occupy the first
 runs with 0 or 16 visible deltas. Scalar capacity 1 uses sparse axis 1; the larger
 capacities use axis 0. Sequential, scattered, and four singleton reads warm once
 before four timed repetitions. Four fixed-coordinate writes with separate commits
-and finalization with synchronization follow each read case. Construction and
+and durable finalization follow each read case. Construction and
 post-finalization value verification stay outside timing. Geometry records include
 effective block capacity and canonical payload bytes, excluding index/container overhead;
 these bytes are not an aggregate retained-memory measurement.

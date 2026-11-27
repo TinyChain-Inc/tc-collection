@@ -26,14 +26,15 @@ is the canonical behavioral contract.
   an intermediate vector, map, or set.
 - Receive bootstrap- or transaction-delegated storage/allocation handles. Never
   construct a cache, derive a transaction workspace path, or choose caller storage
-  policy. Allocate transaction-local deltas from the delegated `StorageContext`;
+  policy. Stage deltas beneath the delegated collection owner; fresh literals
+  receive roots from `StorageContext`;
   store `BTreeLock` and `TableLock` with `StorageContext::File` directly; do not
   add storage-mode enums, erased store traits, forwarding wrappers, erased
   directory handles, or runtime downcasts.
 - Standalone named persistent collections are unsupported. Literal and
   transaction-local collections are owned by their enclosing request. Public
   hosting is outside this crate. Persistent owners provide transactional visibility
-  and native materialization; the caller owns durable requests and recovery.
+  and durable native publication; the caller owns durable requests and replay.
 - Callers own durable history, replay, canonical-state selection, and
   reconciliation. Collections own local state transitions and fail closed on
   ambiguity; they do not maintain a WAL, select canonical history, or repair
@@ -43,6 +44,6 @@ is the canonical behavioral contract.
   or adapter path.
 - Every `Transact` method is fallible and idempotent. Preserve one documented
   lock order, release guards before cross-domain operations, and test conflicts,
-  wait-until-finalize, restart, and finalize/sync deadlocks.
+  wait-until-finalize, restart, and publication lock-order deadlocks.
 - Use the shared guard-owning stream for values that retain permits or read
   guards. Cancellation and drop release all owned capacity.

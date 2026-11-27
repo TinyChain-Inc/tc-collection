@@ -3,6 +3,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use freqfs::Cache;
+use futures::TryStreamExt;
 use pathlink::{PathLabel, PathSegment, path_label};
 use safecast::TryCastFrom;
 use tc_error::TCError;
@@ -10,8 +11,8 @@ use tc_ir::{Scalar, Transact, Transaction};
 use tc_value::Value;
 
 use super::*;
+use crate::btree::BTree;
 use crate::btree::BTreeColumnSchema;
-use crate::collection::BTreeView;
 use crate::test::{TempRoot, TestTxn};
 use crate::{CopyFrom, Restore, StorageContext};
 
@@ -138,7 +139,7 @@ fn segment(path: &str) -> PathSegment {
     PathSegment::from_str(path).expect("path segment")
 }
 
-async fn btree_view() -> (Arc<TempRoot>, BTreeView<TestTxn>) {
+async fn btree_view() -> (Arc<TempRoot>, BTree<TestTxn>) {
     let root = TempRoot::new("route");
     std::fs::create_dir_all(root.join("persistent")).expect("persistent root");
     std::fs::create_dir_all(root.join("txn")).expect("transaction root");
@@ -160,12 +161,12 @@ async fn btree_view() -> (Arc<TempRoot>, BTreeView<TestTxn>) {
         max_size: None,
     }];
 
-    let schema = crate::btree::BTreeSchema::try_from(columns.as_slice()).unwrap();
-    let btree = crate::btree::BTree::<TestTxn>::try_with_schema(persistent, schema)
+    let schema = crate::btree::BTreeSchema::try_from(columns.clone()).unwrap();
+    let btree = crate::btree::BTree::<TestTxn>::create(persistent, schema)
         .await
         .unwrap();
 
-    let view = BTreeView::new(columns, btree).unwrap();
+    let view = btree;
 
     (root, view)
 }
@@ -222,11 +223,15 @@ async fn native_materialization_and_cold_hash_preserve_schema_and_contents() {
             };
 
             let schema = match kind {
-                0 => CollectionSchema::BTree(vec![BTreeColumnSchema {
-                    name: "id".into(),
-                    dtype: tc_value::ValueType::Number(tc_value::NumberType::Number),
-                    max_size: None,
-                }]),
+                0 => CollectionSchema::BTree(
+                    vec![BTreeColumnSchema {
+                        name: "id".into(),
+                        dtype: tc_value::ValueType::Number(tc_value::NumberType::Number),
+                        max_size: None,
+                    }]
+                    .try_into()
+                    .unwrap(),
+                ),
                 1 => CollectionSchema::Table(
                     TableSchema::new(
                         vec![Column {
@@ -288,7 +293,6 @@ async fn native_materialization_and_cold_hash_preserve_schema_and_contents() {
                 .await
                 .unwrap();
 
-            snapshot.sync_all().await.unwrap();
             assert!(
                 Collection::copy_from(&reader, snapshot_dir.clone(), &source)
                     .await
@@ -310,6 +314,31 @@ async fn native_materialization_and_cold_hash_preserve_schema_and_contents() {
 }
 
 #[tokio::test]
+async fn tensor_cast_requires_a_canonical_dtype_reference() {
+    use tc_value::{NumberType, number_type_path};
+
+    let txn = TestTxn::fresh(1);
+    let tensor = Tensor::dense_f64(&txn, vec![2], vec![1.0, 2.0])
+        .await
+        .unwrap();
+    let dtype = NumberType::UInt(number_general::UIntType::U64);
+    let key = Value::from(pathlink::Link::from(number_type_path(&dtype)));
+    let cast = || {
+        tc_ir::Route::<TestState>::route(&tensor, &[segment("cast")])
+            .unwrap()
+            .get()
+            .unwrap()
+    };
+
+    let result = cast()(&txn, Scalar::Value(key)).await.unwrap();
+    assert_eq!(result.into_tensor().unwrap().number_type(), dtype);
+    let error = cast()(&txn, Scalar::Value(Value::from("u64")))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tc_error::ErrorKind::BadRequest);
+}
+
+#[tokio::test]
 async fn tensor_route_rejects_unknown_path_and_invalid_shape() {
     let txn = TestTxn::fresh(1);
     let tensor = Tensor::dense_f64(&txn, vec![2], vec![1.0, 2.0])
@@ -327,8 +356,8 @@ async fn tensor_route_rejects_unknown_path_and_invalid_shape() {
 
     assert!(tc_ir::Route::<TestState>::route(&tensor, &[segment("unknown")]).is_none());
 
-    for name in ["copy", "copy_values"] {
-        let route = tc_ir::Route::<TestState>::route(&tensor, &[segment(name)]).unwrap();
+    {
+        let route = tc_ir::Route::<TestState>::route(&tensor, &[segment("copy")]).unwrap();
         let output = route.get().unwrap()(&txn, Scalar::Value(Value::None))
             .await
             .unwrap();
@@ -407,21 +436,30 @@ async fn tensor_route_rejects_unknown_path_and_invalid_shape() {
             };
 
             let shape = || TestState::Tuple(vec![2_u64.into()]);
-            let key = TestState::Tuple(vec![TestState::from(Value::from("f64")), shape()]);
+            let dtype = |dtype| {
+                TestState::from(Value::from(tc_value::number_type_path(&dtype).to_string()))
+            };
+            let f64_type = number_general::FloatType::F64.into();
+            let key = TestState::Tuple(vec![dtype(f64_type), shape()]);
             let value = crate::tensor::route::tensor_literal(&txn, key, literal())
                 .await
                 .unwrap();
 
             assert_eq!(value.read_value(txn.id(), &[1]).await.unwrap(), 2.0.into());
+            let key = TestState::Tuple(vec![dtype(number_general::UIntType::U8.into()), shape()]);
+            let entries = TestState::Tuple(vec![TestState::Tuple(vec![
+                TestState::Tuple(vec![0_u64.into()]),
+                256_u64.into(),
+            ])]);
+            let error = crate::tensor::route::tensor_literal(&txn, key, entries)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tc_error::ErrorKind::BadRequest);
             for (fields, message) in [
                 (vec![], "Tensor literal key must be"),
                 (
-                    vec![
-                        TestState::from(Value::None),
-                        TestState::from(Value::None),
-                        TestState::from(Value::None),
-                    ],
-                    "expected a numeric sparse axis",
+                    vec![dtype(f64_type), shape(), 0_u64.into()],
+                    "Tensor literal key must be",
                 ),
                 (
                     vec![
@@ -431,14 +469,14 @@ async fn tensor_route_rejects_unknown_path_and_invalid_shape() {
                     "unsupported Tensor dtype",
                 ),
                 (
-                    vec![TestState::from(Value::from("f64")), shape()],
+                    vec![dtype(f64_type), shape()],
                     "Tensor literal value count differs from shape",
                 ),
             ] {
                 let error = crate::tensor::route::tensor_literal(
                     &txn,
                     TestState::Tuple(fields),
-                    TestState::Tuple(vec![]),
+                    TestState::Tuple(vec![1_u64.into()]),
                 )
                 .await
                 .unwrap_err();
@@ -446,11 +484,7 @@ async fn tensor_route_rejects_unknown_path_and_invalid_shape() {
                 assert!(error.to_string().contains(message), "{error}");
             }
 
-            let key = TestState::Tuple(vec![
-                TestState::from(Value::from("f64")),
-                shape(),
-                0_u64.into(),
-            ]);
+            let key = TestState::Tuple(vec![dtype(f64_type), shape()]);
 
             let entries = TestState::Tuple(vec![TestState::Tuple(vec![
                 TestState::Tuple(vec![1_u64.into()]),
@@ -461,6 +495,7 @@ async fn tensor_route_rejects_unknown_path_and_invalid_shape() {
                 .await
                 .unwrap();
 
+            assert_eq!(sparse.layout(), fensor::Layout::Sparse { axis: None });
             assert_eq!(sparse.read_value(txn.id(), &[0]).await.unwrap(), 0.0.into());
             assert_eq!(sparse.read_value(txn.id(), &[1]).await.unwrap(), 2.5.into());
             for key in [
@@ -484,7 +519,10 @@ async fn tensor_route_rejects_unknown_path_and_invalid_shape() {
 
             #[cfg(feature = "complex")]
             {
-                let key = TestState::Tuple(vec![TestState::from(Value::from("c64")), shape()]);
+                let key = TestState::Tuple(vec![
+                    dtype(number_general::ComplexType::C64.into()),
+                    shape(),
+                ]);
                 let complex = crate::tensor::route::tensor_literal(&txn, key, literal())
                     .await
                     .unwrap();
@@ -546,12 +584,7 @@ async fn btree_returned_views_cannot_mutate_or_drive_owner_lifecycle() {
     let (_root, owner) = btree_view().await;
     let txn = TestTxn::fresh(1);
     for value in 1..=3_u64 {
-        owner
-            .persistent()
-            .unwrap()
-            .insert_row(&txn, vec![value.into()])
-            .await
-            .unwrap();
+        owner.insert_row(&txn, vec![value.into()]).await.unwrap();
     }
 
     let full = tc_ir::Route::<TestState>::route(&owner, &[])
@@ -591,7 +624,6 @@ async fn btree_returned_views_cannot_mutate_or_drive_owner_lifecycle() {
 
     let owner = Collection::BTree(Box::new(owner));
     for view in views {
-        assert!(view.persistent().is_err());
         let insert = tc_ir::Route::<TestState>::route(&view, &[segment("insert")])
             .unwrap()
             .put()
@@ -623,8 +655,6 @@ async fn btree_returned_views_cannot_mutate_or_drive_owner_lifecycle() {
         let view = Collection::BTree(Box::new(view));
         assert!(!view.is_persistent());
         assert!(view.as_btree().is_none());
-        assert!(view.sync().await.is_err());
-        assert!(view.sync_all().await.is_err());
         assert!(view.commit(txn.id()).await.is_err());
         assert!(view.rollback(&txn.id()).await.is_err());
         assert!(view.finalize(&txn.id()).await.is_err());
@@ -632,7 +662,7 @@ async fn btree_returned_views_cannot_mutate_or_drive_owner_lifecycle() {
         assert!(owner.restore(&txn, &view).await.is_err());
     }
 
-    let copied = BTreeView::copy_from(
+    let copied = BTree::copy_from(
         &txn,
         txn.subcontext_unique().context().await.unwrap(),
         &full,
@@ -640,15 +670,53 @@ async fn btree_returned_views_cannot_mutate_or_drive_owner_lifecycle() {
     .await
     .unwrap();
 
-    copied
-        .persistent()
-        .unwrap()
-        .insert_row(&txn, vec![4_u64.into()])
-        .await
-        .unwrap();
+    copied.insert_row(&txn, vec![4_u64.into()]).await.unwrap();
 
     assert_eq!(copied.count(txn.id()).await.unwrap(), 4);
     assert_eq!(owner.as_btree().unwrap().count(txn.id()).await.unwrap(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn tensor_literals_and_streams_reject_the_same_noncanonical_inputs() {
+    Box::pin(async {
+        let (_root, txn) = crate::test::tensor::setup().await;
+        let dtype = tc_value::number_type_path(&number_general::UIntType::U8.into()).to_string();
+        for (dtype, dim, contents) in [
+            (dtype.as_str(), Value::from(1u64), vec![Value::from("1")]),
+            (dtype.as_str(), Value::from(1.0), vec![Value::from(1u64)]),
+            (
+                dtype.as_str(),
+                Value::from(1u64),
+                vec![Value::Tuple(vec![
+                    Value::Tuple(vec![Value::from(0.0)]),
+                    Value::from(1u64),
+                ])],
+            ),
+            ("u8", Value::from(1u64), vec![Value::from(1u64)]),
+        ] {
+            let metadata = Value::Tuple(vec![Value::from(dtype), Value::Tuple(vec![dim])]);
+            let contents = Value::Tuple(contents);
+            let error = crate::tensor::route::tensor_literal(
+                &txn,
+                TestState::from(metadata.clone()),
+                TestState::from(contents.clone()),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), tc_error::ErrorKind::BadRequest);
+
+            let encoded = destream_json::encode((metadata, contents))
+                .unwrap()
+                .map_err(std::io::Error::other);
+            let decoded = destream_json::try_decode::<_, _, crate::tensor::Tensor<TestTxn>>(
+                txn.clone(),
+                encoded,
+            )
+            .await;
+            assert!(decoded.is_err());
+        }
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -878,102 +946,6 @@ async fn tensor_handlers_reject_unused_parameters() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn btree_views_validate_schema_pairing_and_share_metadata() {
-    use tc_ir::IntoView;
-
-    Box::pin(async {
-        let txn = TestTxn::fresh(1);
-        let columns = vec![BTreeColumnSchema {
-            name: "id".into(),
-            dtype: tc_value::ValueType::Number(tc_value::NumberType::Number),
-            max_size: Some(32_u64.into()),
-        }];
-
-        let dir = txn.subcontext_unique().context().await.unwrap();
-        let schema = crate::btree::BTreeSchema::try_from(columns.as_slice()).unwrap();
-
-        let raw = crate::btree::BTree::<TestTxn>::try_with_schema(dir.clone(), schema)
-            .await
-            .unwrap();
-
-        let held = dir.write().await;
-        let wrong_type = vec![BTreeColumnSchema {
-            dtype: tc_value::ValueType::String,
-            ..columns[0].clone()
-        }];
-
-        for invalid in [
-            Vec::new(),
-            vec![columns[0].clone(), columns[0].clone()],
-            wrong_type,
-        ] {
-            let error = BTreeView::new(invalid, raw.clone()).unwrap_err();
-            assert_eq!(error.code(), tc_error::ErrorKind::BadRequest);
-            assert!(!error.requires_recovery());
-        }
-
-        let view = BTreeView::new(columns.clone(), raw.clone()).unwrap();
-        let alias = view.clone();
-        let slice = view.slice((Bound::Unbounded, Bound::Unbounded), false);
-        assert!(std::ptr::eq(view.schema(), alias.schema()));
-        assert!(std::ptr::eq(view.schema(), slice.schema()));
-        let nested = slice.slice(
-            (Bound::Included(0_u64.into()), Bound::Excluded(2_u64.into())),
-            false,
-        );
-
-        assert!(std::ptr::eq(view.schema(), nested.schema()));
-        drop(held);
-        raw.insert_row(&txn, vec![1_u64.into()]).await.unwrap();
-        assert_eq!(nested.count(txn.id()).await.unwrap(), 1);
-        let terminal = alias.into_view(txn.clone()).await.unwrap();
-        assert_eq!(terminal.schema, columns);
-        drop(terminal);
-        drop(slice);
-        drop(nested);
-        let metadata = view.schema().as_ptr();
-        let mut terminal = view.into_view(txn.clone()).await.unwrap();
-        assert_eq!(
-            terminal.schema.as_ptr(),
-            metadata,
-            "unique metadata moves into the wire header"
-        );
-
-        assert_eq!(
-            futures::TryStreamExt::try_next(&mut terminal.keys)
-                .await
-                .unwrap()
-                .unwrap(),
-            vec![Value::from(1_u64)]
-        );
-
-        assert!(
-            futures::TryStreamExt::try_next(&mut terminal.keys)
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        drop(terminal);
-        raw.insert_row(&txn, vec![2_u64.into()]).await.unwrap();
-        let untyped =
-            crate::btree::BTree::<TestTxn>::new(txn.subcontext_unique().context().await.unwrap())
-                .await
-                .unwrap();
-
-        assert!(BTreeView::new(columns, untyped.clone()).is_err());
-        untyped
-            .insert_row(
-                &txn,
-                vec![Value::from("raw trees still accept untyped keys")],
-            )
-            .await
-            .unwrap();
-    })
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn restoration_uses_one_semantic_schema_rule() {
     use std::time::Duration;
 
@@ -993,15 +965,13 @@ async fn restoration_uses_one_semantic_schema_rule() {
             max_size: None,
         }];
 
-        let schema = BTreeSchema::try_from(columns.as_slice()).unwrap();
-        let raw = BTree::<TestTxn>::try_with_schema(
-            txn.subcontext_unique().context().await.unwrap(),
-            schema,
-        )
-        .await
-        .unwrap();
+        let schema = BTreeSchema::try_from(columns.clone()).unwrap();
+        let raw =
+            BTree::<TestTxn>::create(txn.subcontext_unique().context().await.unwrap(), schema)
+                .await
+                .unwrap();
 
-        let target = BTreeView::new(columns.clone(), raw.clone()).unwrap();
+        let target = raw.clone();
         let mismatches = [
             BTreeColumnSchema {
                 name: "other".into(),
@@ -1019,15 +989,12 @@ async fn restoration_uses_one_semantic_schema_rule() {
 
         for column in mismatches {
             let columns = vec![column];
-            let schema = BTreeSchema::try_from(columns.as_slice()).unwrap();
-            let source = BTree::<TestTxn>::try_with_schema(
-                txn.subcontext_unique().context().await.unwrap(),
-                schema,
-            )
-            .await
-            .unwrap();
+            let schema = BTreeSchema::try_from(columns.clone()).unwrap();
+            let source =
+                BTree::<TestTxn>::create(txn.subcontext_unique().context().await.unwrap(), schema)
+                    .await
+                    .unwrap();
 
-            let source = BTreeView::new(columns, source).unwrap();
             let context = txn.context().await.unwrap();
             let held = context.write().await;
             let error = Collection::BTree(Box::new(target.clone()))
@@ -1050,16 +1017,15 @@ async fn restoration_uses_one_semantic_schema_rule() {
 
         let later = txn.with_id(tx(12));
         let source_schema = BTreeSchema::new(
+            columns,
             StorageConfig {
                 order: 4,
                 block_size: 8192,
             },
-            1,
-            Some(vec![columns[0].dtype.clone()]),
         )
         .unwrap();
 
-        let source = BTree::<TestTxn>::try_with_schema(
+        let source = BTree::<TestTxn>::create(
             txn.subcontext_unique().context().await.unwrap(),
             source_schema,
         )
@@ -1067,7 +1033,7 @@ async fn restoration_uses_one_semantic_schema_rule() {
         .unwrap();
 
         source.insert_row(&later, vec![5_u64.into()]).await.unwrap();
-        let source = BTreeView::new(columns, source).unwrap();
+
         target.restore(&later, &source).await.unwrap();
         assert!(
             target
@@ -1076,7 +1042,7 @@ async fn restoration_uses_one_semantic_schema_rule() {
                 .unwrap()
         );
 
-        raw.rollback(later.id()).unwrap();
+        raw.rollback(&later.id()).await.unwrap();
 
         let table_schema = |key: &str, dtype: ValueType, index: &str, storage| {
             TableSchema::new(
@@ -1191,7 +1157,7 @@ async fn restoration_uses_one_semantic_schema_rule() {
             &[1_u64.into(), 8_u64.into()]
         );
 
-        target.rollback(later.id()).unwrap();
+        target.rollback(&later.id()).await.unwrap();
 
         for target_axis in [None, Some(0), Some(1)] {
             let dtype = NumberType::Float(number_general::FloatType::F64);
@@ -1202,7 +1168,7 @@ async fn restoration_uses_one_semantic_schema_rule() {
                     .unwrap();
 
             for source_axis in [None, Some(0), Some(1)] {
-                if source_axis == target_axis {
+                if source_axis.is_some() == target_axis.is_some() {
                     continue;
                 }
 
@@ -1261,7 +1227,6 @@ async fn restoration_uses_one_semantic_schema_rule() {
 async fn concrete_views_preserve_error_policy_and_release_sources() {
     use std::cell::RefCell;
 
-    use futures::TryStreamExt;
     use tc_ir::IntoView;
     use tc_value::{NumberType, ValueType};
 
@@ -1293,11 +1258,15 @@ async fn concrete_views_preserve_error_policy_and_release_sources() {
                     .unwrap(),
                 )
             } else {
-                CollectionSchema::BTree(vec![BTreeColumnSchema {
-                    name: "id".into(),
-                    dtype,
-                    max_size: None,
-                }])
+                CollectionSchema::BTree(
+                    vec![BTreeColumnSchema {
+                        name: "id".into(),
+                        dtype,
+                        max_size: None,
+                    }]
+                    .try_into()
+                    .unwrap(),
+                )
             };
 
             let owner = Collection::<TestTxn>::create(dir.clone(), schema)
@@ -1305,9 +1274,18 @@ async fn concrete_views_preserve_error_policy_and_release_sources() {
                 .unwrap();
 
             let native = if table {
-                dir.read().await.get_dir("primary").unwrap().clone()
+                dir.read()
+                    .await
+                    .get_dir("base")
+                    .cloned()
+                    .unwrap()
+                    .read()
+                    .await
+                    .get_dir("primary")
+                    .unwrap()
+                    .clone()
             } else {
-                dir.clone()
+                dir.read().await.get_dir("base").cloned().unwrap()
             };
 
             let root = native
@@ -1341,13 +1319,7 @@ async fn concrete_views_preserve_error_policy_and_release_sources() {
 
                         let error = match &mut projected {
                             Err(error) => error.clone(),
-                            Ok(CollectionView::BTree(view)) => {
-                                view.keys.try_next().await.unwrap_err()
-                            }
-                            Ok(CollectionView::Table(view)) => {
-                                view.rows.try_next().await.unwrap_err()
-                            }
-                            Ok(CollectionView::Tensor(_)) => unreachable!(),
+                            Ok(view) => view.next_error_for_test().await,
                         };
 
                         assert!(error.requires_recovery());
@@ -1360,15 +1332,10 @@ async fn concrete_views_preserve_error_policy_and_release_sources() {
                             b_tree::Node::Leaf(Vec::new());
 
                         match &owner {
-                            Collection::BTree(view) => view
-                                .persistent()
-                                .unwrap()
-                                .insert_row(&txn, vec![7_u64.into()])
-                                .await
-                                .unwrap(),
+                            Collection::BTree(view) => {
+                                view.insert_row(&txn, vec![7_u64.into()]).await.unwrap()
+                            }
                             Collection::Table(view) => view
-                                .persistent()
-                                .unwrap()
                                 .upsert_row(&txn, vec![7_u64.into()], vec![8_u64.into()])
                                 .await
                                 .unwrap(),
@@ -1406,11 +1373,9 @@ fn semantic_schema_construction_moves_fields_and_reports_errors() {
         panic!("BTree schema")
     };
 
-    assert_eq!(columns[0].name.as_ptr(), pointer);
-    let native = BTreeSchema::try_from(columns.as_slice()).unwrap();
-    assert_eq!(b_tree::Schema::len(&native), 1);
-    assert_eq!(columns[0].name.as_ptr(), pointer);
-    assert!(BTreeSchema::try_from([].as_slice()).is_err());
+    assert_eq!(columns.columns()[0].name.as_ptr(), pointer);
+    assert_eq!(b_tree::Schema::len(&columns), 1);
+    assert!(BTreeSchema::try_from(Vec::new()).is_err());
 
     for value in [
         Value::None,
@@ -1424,6 +1389,37 @@ fn semantic_schema_construction_moves_fields_and_reports_errors() {
 
     let unknown = crate::BTreeType.path().append(pathlink::label("unknown"));
     assert!(CollectionSchema::try_from((unknown, Value::None)).is_err());
+
+    let key = Value::Tuple(vec![Value::Tuple(vec![
+        Value::from("id"),
+        Value::from(tc_value::ValueType::String.path().to_string()),
+    ])]);
+
+    let columns = Value::Tuple(vec![key.clone(), Value::Tuple(vec![])]);
+    let valid = Value::Tuple(vec![columns.clone(), Value::None]);
+    assert!(crate::table::TableSchema::try_from(valid).is_ok());
+
+    for value in [
+        Value::Tuple(vec![columns.clone(), Value::None, Value::None]),
+        Value::Tuple(vec![
+            Value::Tuple(vec![key, Value::Tuple(vec![]), Value::None]),
+            Value::None,
+        ]),
+        Value::Tuple(vec![
+            columns,
+            Value::Tuple(vec![Value::Tuple(vec![
+                Value::from("by_id"),
+                Value::Tuple(vec![Value::from("id")]),
+                Value::None,
+            ])]),
+        ]),
+    ] {
+        let direct = crate::table::TableSchema::try_from(value.clone()).unwrap_err();
+        let delegated = CollectionSchema::try_from((crate::TableType.path(), value)).unwrap_err();
+        assert_eq!(direct.code(), tc_error::ErrorKind::BadRequest);
+        assert_eq!(delegated.code(), direct.code());
+        assert!(!delegated.requires_recovery());
+    }
 
     let dtype =
         tc_value::number_type_path(&tc_value::NumberType::Float(number_general::FloatType::F64));
@@ -1469,7 +1465,7 @@ fn semantic_schema_construction_moves_fields_and_reports_errors() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn collection_lifecycle_preserves_owner_view_and_local_semantics() {
+async fn collection_lifecycle_preserves_owner_and_view_semantics() {
     use safecast::CastFrom;
 
     use crate::btree::StorageConfig;
@@ -1491,11 +1487,15 @@ async fn collection_lifecycle_preserves_owner_view_and_local_semantics() {
         .unwrap();
 
         for schema in [
-            CollectionSchema::BTree(vec![BTreeColumnSchema {
-                name: "id".into(),
-                dtype: tc_value::ValueType::String,
-                max_size: None,
-            }]),
+            CollectionSchema::BTree(
+                vec![BTreeColumnSchema {
+                    name: "id".into(),
+                    dtype: tc_value::ValueType::String,
+                    max_size: None,
+                }]
+                .try_into()
+                .unwrap(),
+            ),
             CollectionSchema::Table(table_schema.clone()),
         ] {
             let owner = Collection::<TestTxn>::create(
@@ -1522,34 +1522,31 @@ async fn collection_lifecycle_preserves_owner_view_and_local_semantics() {
             assert!(owner.commit(tx(10)).await.is_err());
             owner.rollback(&tx(12)).await.unwrap();
             owner.finalize(&tx(11)).await.unwrap();
-            owner.sync().await.unwrap();
-            owner.sync_all().await.unwrap();
             assert!(view.commit(tx(13)).await.is_err());
             assert!(view.rollback(&tx(13)).await.is_err());
             assert!(view.finalize(&tx(13)).await.is_err());
-            assert!(view.sync().await.is_err());
-            assert!(view.sync_all().await.is_err());
             owner.commit(tx(14)).await.unwrap();
         }
 
         let encoded =
             destream_json::encode((Value::cast_from(table_schema), Vec::<Value>::new())).unwrap();
 
-        let local = destream_json::try_decode::<_, _, crate::table::DecodedTablePayload<TestTxn>>(
-            txn.clone(),
-            encoded,
-        )
-        .await
-        .unwrap()
-        .table;
+        let local =
+            destream_json::try_decode::<_, _, crate::table::Table<TestTxn>>(txn.clone(), encoded)
+                .await
+                .unwrap();
 
-        assert!(matches!(local, Table::Local(_)));
+        assert!(matches!(local, Table::File(_)));
         let delegated = Collection::from(local.clone());
         for _ in 0..2 {
             delegated.commit(tx(10)).await.unwrap();
-            delegated.rollback(&tx(10)).await.unwrap();
+            assert!(delegated.rollback(&tx(10)).await.is_err());
+            delegated.rollback(&tx(11)).await.unwrap();
+        }
+
+        for _ in 0..2 {
             delegated.finalize(&tx(10)).await.unwrap();
-            assert_eq!(local.count(tx(10)).await.unwrap(), 0);
+            assert_eq!(local.count(tx(12)).await.unwrap(), 0);
         }
     })
     .await;

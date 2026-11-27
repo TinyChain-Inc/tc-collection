@@ -3,13 +3,12 @@
 
 use std::time::Instant;
 
-use fensor::TensorSource;
-use futures::{FutureExt, TryStreamExt, stream};
+use futures::{FutureExt, TryStreamExt};
 use number_general::{FloatType, Number, NumberType};
 use tc_collection::tensor::AxisRange;
 use tc_ir::{Transact, Transaction};
 
-use super::{PersistentFile, StorageContext, Tensor, TensorSchema, Txn, id, record, setup};
+use super::{StorageContext, Tensor, TensorSchema, Txn, id, record, setup};
 
 async fn scan(tensor: &Tensor<Txn>, expected: &[f64]) {
     let mut values = tensor.elements(id(40)).await.unwrap();
@@ -87,39 +86,32 @@ pub(super) async fn run() {
                 .unwrap();
 
                 let dir = txn.subcontext_unique().context().await.unwrap();
-                let entries = stream::iter(
-                    expected
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, value)| **value != 0.0)
-                        .map(|(offset, &value)| {
-                            Ok::<_, fensor::Error>((
-                                vec![(offset / columns) as u64, (offset % columns) as u64],
-                                value,
-                            ))
-                        }),
-                );
+                let tensor = Tensor::<Txn>::create(dir, schema, capacity)
+                    .boxed()
+                    .await
+                    .unwrap();
 
-                let native = fensor::Tensor::<PersistentFile, f64>::from_sparse_elements(
-                    dir.clone(),
-                    fensor::TensorSchema::new(schema.dtype(), shape.as_slice().into()).unwrap(),
-                    schema.layout(),
-                    capacity,
-                    entries,
-                )
-                .boxed()
-                .await
-                .unwrap();
+                if full {
+                    tensor.fill(&txn, 1.0.into()).boxed().await.unwrap();
+                } else {
+                    for offset in (0..expected.len()).step_by(capacity) {
+                        tensor
+                            .write_value(
+                                &txn,
+                                &[(offset / columns) as u64, (offset % columns) as u64],
+                                1.0.into(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                }
 
-                let geometry = native.storage_geometry();
-                assert_eq!(geometry.block_capacity(), capacity);
-                native.sync_all().await.unwrap();
-                drop(native);
-
-                let tensor = Tensor::<Txn>::load(dir, schema).boxed().await.unwrap();
+                tensor.commit(txn.id()).await.unwrap();
+                tensor.finalize(&txn.id()).await.unwrap();
+                let blocks = expected.len() / capacity;
                 for version in 0..depth {
                     let next = txn.at(11 + version);
-                    let offset = usize::from(version) % geometry.block_count() as usize * capacity;
+                    let offset = usize::from(version) % blocks * capacity;
                     let value = f64::from(version) + 2.0;
                     tensor
                         .write_value(
@@ -158,8 +150,8 @@ pub(super) async fn run() {
 
                 for (metric, count) in [
                     ("elements", expected.len()),
-                    ("block_elements", geometry.block_capacity()),
-                    ("blocks", geometry.block_count() as usize),
+                    ("block_elements", capacity),
+                    ("blocks", blocks),
                     (
                         "nonzero_elements",
                         expected.iter().filter(|&&value| value != 0.0).count(),

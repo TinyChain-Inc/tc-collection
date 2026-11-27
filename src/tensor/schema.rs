@@ -7,7 +7,9 @@ use tc_value::{NumberType, Value, ValueType};
 /// Maximum dimensions admitted by collection wire and filesystem metadata.
 pub(crate) const MAX_TENSOR_METADATA_RANK: usize = 4096;
 
-/// Tensor dtype, shape, and optional last sparse axis for wire reconstruction.
+pub(super) const SPARSE_TAG: &str = "sparse";
+
+/// Tensor dtype, shape, and optional last sparse axis for native storage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TensorSchema {
     native: fensor::TensorSchema,
@@ -19,6 +21,16 @@ impl TensorSchema {
     /// Shapes require 1–4096 nonzero dimensions; scalar results use `Number`.
     pub fn new(dtype: NumberType, shape: Shape, sparse_axis: Option<usize>) -> TCResult<Self> {
         let layout = sparse_axis.map_or(Layout::Dense, |axis| Layout::Sparse { axis: Some(axis) });
+        Self::from_geometry(dtype, shape, layout)
+    }
+
+    pub(super) fn logical(dtype: NumberType, shape: Shape, sparse: bool) -> TCResult<Self> {
+        let layout = if sparse {
+            Layout::Sparse { axis: None }
+        } else {
+            Layout::Dense
+        };
+
         Self::from_geometry(dtype, shape, layout)
     }
 
@@ -85,20 +97,36 @@ impl TensorSchema {
             None => Layout::Dense,
         }
     }
-}
 
-impl From<TensorSchema> for Value {
-    fn from(schema: TensorSchema) -> Self {
+    pub(super) fn logical_value(&self) -> Value {
+        self.value(None)
+    }
+
+    pub(super) fn into_default_sparse(mut self) -> Self {
+        self.sparse_axis = self.shape().len().checked_sub(1);
+        self
+    }
+
+    // Keep the sparse state hash domain independent of the wire envelope.
+    pub(crate) fn sparse_hash_schema(&self) -> Value {
+        self.value(Some(Value::from(SPARSE_TAG)))
+    }
+
+    fn value(&self, sparse: Option<Value>) -> Value {
         let mut fields = vec![
-            Value::cast_from(ValueType::Number(schema.dtype())),
-            Value::Tuple(schema.shape().iter().copied().map(Value::from).collect()),
+            Value::cast_from(ValueType::Number(self.dtype())),
+            Value::Tuple(self.shape().iter().copied().map(Value::from).collect()),
         ];
 
-        if let Some(axis) = schema.sparse_axis {
-            fields.push(Value::from(axis as u64));
-        }
-
+        fields.extend(sparse);
         Value::Tuple(fields)
+    }
+}
+
+/// The native storage descriptor retains the selected axis for strict reopening.
+impl From<TensorSchema> for Value {
+    fn from(schema: TensorSchema) -> Self {
+        schema.value(schema.sparse_axis.map(|axis| Value::from(axis as u64)))
     }
 }
 
@@ -112,15 +140,12 @@ impl TryFrom<Value> for TensorSchema {
 
         if !(2..=3).contains(&fields.len()) {
             return Err(TCError::bad_request(
-                "Tensor schema requires dtype, shape, and optional sparse axis",
+                "Tensor schema requires dtype, shape, and an optional sparse storage setting",
             ));
         }
 
         let mut fields = fields.into_iter();
-        let Some(ValueType::Number(dtype)) = fields.next().and_then(ValueType::opt_cast_from)
-        else {
-            return Err(TCError::bad_request("expected Tensor dtype path"));
-        };
+        let dtype = dtype(fields.next().expect("schema arity"))?;
 
         let Some(Value::Tuple(shape)) = fields.next() else {
             return Err(TCError::bad_request("expected Tensor shape"));
@@ -136,13 +161,27 @@ impl TryFrom<Value> for TensorSchema {
 
         let sparse_axis = match fields.next() {
             None => None,
+            Some(Value::String(tag)) if tag.as_str() == SPARSE_TAG => {
+                return Self::logical(dtype, shape, true);
+            }
             Some(Value::Number(axis)) => {
                 Some(usize::try_from(dimension(axis)?).map_err(TCError::bad_request)?)
             }
-            _ => return Err(TCError::bad_request("expected a Tensor sparse axis")),
+            _ => {
+                return Err(TCError::bad_request(
+                    "expected 'sparse' or a Tensor sparse axis",
+                ));
+            }
         };
 
         Self::new(dtype, shape, sparse_axis)
+    }
+}
+
+pub(super) fn dtype(value: Value) -> TCResult<NumberType> {
+    match ValueType::opt_cast_from(value) {
+        Some(ValueType::Number(dtype)) => Ok(dtype),
+        _ => Err(TCError::bad_request("unsupported Tensor dtype path")),
     }
 }
 
@@ -150,20 +189,6 @@ pub(super) fn dimension(value: Number) -> TCResult<u64> {
     match value {
         Number::UInt(value) => Ok(u64::from(value)),
         Number::Int(value) => u64::try_from(i64::from(value)).map_err(TCError::bad_request),
-        Number::Float(value) => {
-            let value = f64::from(value);
-            if value.is_finite()
-                && value >= 0.0
-                && value.fract() == 0.0
-                && value < 18_446_744_073_709_551_616.0
-            {
-                Ok(value as u64)
-            } else {
-                Err(TCError::bad_request(
-                    "expected an unsigned integer dimension",
-                ))
-            }
-        }
         _ => Err(TCError::bad_request(
             "expected an unsigned integer dimension",
         )),

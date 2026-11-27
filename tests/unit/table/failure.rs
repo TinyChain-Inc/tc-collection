@@ -1,6 +1,6 @@
 use futures::TryStreamExt;
 use tc_error::TCResult;
-use tc_ir::{Transaction, TxnId};
+use tc_ir::{Transact, Transaction, TxnId};
 
 use super::{Delta, PersistentTable, Range, TableFile, TableSchema, upsert};
 use crate::btree::StorageConfig;
@@ -10,8 +10,45 @@ use crate::{CopyFrom, Restore, StorageContext};
 
 impl<Txn: StorageContext> PersistentTable<Txn> {
     pub(in crate::table) fn finalized(&self) -> TCResult<Option<TxnId>> {
-        Ok(self.owner.read_state().finalized)
+        Ok(self.versions.finalized_for_test())
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn immutable_access_does_not_wait_for_transaction_state() {
+    let (_root, txn) = setup().await;
+    let schema = TableSchema::new(
+        vec![Column {
+            name: "id".parse().unwrap(),
+            dtype: ValueType::Number(tc_value::NumberType::Number),
+        }],
+        vec![],
+        vec![],
+        StorageConfig::default(),
+    )
+    .unwrap();
+
+    let table =
+        PersistentTable::<Txn>::try_new(txn.subcontext_unique().context().await.unwrap(), schema)
+            .await
+            .unwrap();
+
+    let alias = table.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let (worker, result) = {
+        let _state = table.versions.hold_state_for_test();
+        let worker = tokio::spawn(async move {
+            let _ = format!("{alias:?}");
+            assert_eq!(alias.schema().key().len(), 1);
+            sender.send(()).unwrap();
+        });
+
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(3));
+        (worker, result)
+    };
+
+    worker.await.unwrap();
+    assert!(result.is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -49,26 +86,29 @@ async fn selected_delta_baseline_and_scan_setup_survive_finalized_workspace_clea
 
         table.commit(txn.id()).await.unwrap();
         let later = txn.at(11);
-        let snapshot = table.owner.visible_snapshot(later.id()).unwrap();
-        let mut point = table.owner.point_read(later.id()).unwrap();
+        let snapshot = table.versions.visible_snapshot(later.id()).unwrap();
         let (entered, mut observed) = tokio::sync::oneshot::channel();
         let (resume, paused) = tokio::sync::oneshot::channel();
         let mut pause = Some((entered, paused));
-        let mut read = Box::pin(tokio::task::unconstrained(point.resolve(|delta| {
-            let pause = pause.take();
-            async move {
-                if let Some((entered, paused)) = pause {
-                    entered.send(()).unwrap();
-                    paused.await.unwrap();
-                }
+        let mut read = Box::pin(tokio::task::unconstrained(table.versions.lookup(
+            later.id(),
+            true,
+            |delta| {
+                let pause = pause.take();
+                async move {
+                    if let Some((entered, paused)) = pause {
+                        entered.send(()).unwrap();
+                        paused.await.unwrap();
+                    }
 
-                delta.lookup(&[1u64.into()]).await
-            }
-        })));
+                    delta.lookup(&[1u64.into()]).await
+                }
+            },
+        )));
 
         assert!(read.as_mut().now_or_never().is_none());
         observed.try_recv().unwrap();
-        table.finalize(txn.id()).await.unwrap();
+        table.finalize(&txn.id()).await.unwrap();
         writes
             .context()
             .await
@@ -80,12 +120,14 @@ async fn selected_delta_baseline_and_scan_setup_survive_finalized_workspace_clea
             .unwrap();
 
         resume.send(()).unwrap();
-        assert!(read.await.unwrap().is_none());
         assert_eq!(
-            point
-                .canonical()
-                .unwrap()
-                .get_row(&[1u64.into()])
+            read.await.unwrap().unwrap().unwrap()[1],
+            Value::from("original")
+        );
+
+        assert_eq!(
+            table
+                .read_row(later.id(), &[1u64.into()])
                 .await
                 .unwrap()
                 .unwrap()[1],
@@ -107,13 +149,7 @@ async fn selected_delta_baseline_and_scan_setup_survive_finalized_workspace_clea
             .await
             .unwrap();
 
-        let pending = table
-            .owner
-            .read_state()
-            .pending
-            .get(&later.id())
-            .unwrap()
-            .clone();
+        let pending = table.versions.pending_for_test(later.id());
 
         assert_eq!(
             pending
@@ -170,7 +206,7 @@ async fn before_after_deltas_preserve_indexes_ties_and_repeated_changes() {
     }
 
     table.commit(txn.id()).await.unwrap();
-    table.finalize(txn.id()).await.unwrap();
+    table.finalize(&txn.id()).await.unwrap();
     let writer = txn.at(11);
     table
         .upsert_row(&writer, vec![a.clone()], vec!["new".into()])
@@ -248,13 +284,7 @@ async fn before_after_deltas_preserve_indexes_ties_and_repeated_changes() {
         );
     }
 
-    let delta = table
-        .owner
-        .read_state()
-        .pending
-        .get(&writer.id())
-        .unwrap()
-        .clone();
+    let delta = table.versions.pending_for_test(writer.id());
 
     assert_eq!(
         delta
@@ -282,9 +312,9 @@ async fn before_after_deltas_preserve_indexes_ties_and_repeated_changes() {
     );
 
     table.commit(writer.id()).await.unwrap();
-    table.finalize(writer.id()).await.unwrap();
+    table.finalize(&writer.id()).await.unwrap();
     assert_eq!(collection.hash(txn.at(12).id()).await.unwrap(), hash);
-    let native = table.owner.read_state().persistent.clone();
+    let native = table.canonical.clone();
     native.validate().await.unwrap();
     table
         .upsert_row(&txn.at(12), vec![Value::from(f64::NAN)], vec!["nan".into()])
@@ -325,16 +355,16 @@ async fn interrupted_table_mutation_is_discarded_by_rollback() {
             .await
             .unwrap();
 
-            let workspace = txn.subcontext_unique().context().await.unwrap();
-            let delta = Delta::create(table.schema.clone(), workspace.clone())
+            let storage = table.store.allocate().await.unwrap();
+            let workspace = storage.dir().clone();
+            let delta = Delta::create(table.schema().clone(), storage)
                 .await
                 .unwrap();
 
             table
-                .owner
-                .write_state()
-                .pending
-                .insert(txn.id(), delta.clone());
+                .versions
+                .replace_pending(txn.id(), delta.clone(), |_| Ok(()))
+                .unwrap();
 
             // The original row must survive a failed or cancelled replacement.
             delta
@@ -342,7 +372,7 @@ async fn interrupted_table_mutation_is_discarded_by_rollback() {
                 .await
                 .unwrap();
 
-            let snapshot = table.owner.visible_snapshot(txn.id()).unwrap();
+            let snapshot = table.versions.visible_snapshot(txn.id()).unwrap();
             if cancel {
                 let blocked = delta.inserts.write().await;
                 let mut update =
@@ -381,7 +411,7 @@ async fn interrupted_table_mutation_is_discarded_by_rollback() {
 
             drop(snapshot); // Do not reuse results from the interrupted transaction.
             assert!(delta.inserts.try_write().is_ok());
-            table.rollback(txn.id()).unwrap();
+            table.rollback(&txn.id()).await.unwrap();
             assert!(
                 table
                     .read_row(txn.id(), &[1u64.into()])
@@ -419,14 +449,25 @@ async fn bulk_source_error_after_rows_requires_rollback() {
             .await
             .unwrap();
 
-        let canonical = table.owner.read_state().persistent.clone();
+        let canonical = table.canonical.clone();
         for key in 0..8u64 {
             upsert(&canonical, vec![key.into()], vec![0u64.into()])
                 .await
                 .unwrap();
         }
 
-        let primary = dir.read().await.get_dir("primary").unwrap().clone();
+        let primary = dir
+            .read()
+            .await
+            .get_dir("base")
+            .cloned()
+            .unwrap()
+            .read()
+            .await
+            .get_dir("primary")
+            .unwrap()
+            .clone();
+
         let root = primary
             .read()
             .await
@@ -444,11 +485,11 @@ async fn bulk_source_error_after_rows_requires_rollback() {
         values.insert("value".parse().unwrap(), 9u64.into());
         assert!(table.update(&txn, Range::default(), values).await.is_err());
         assert!(
-            table.owner.state.read().unwrap().pending.is_empty(),
+            !table.versions.has_pending_for_test(),
             "source failure must leave pending membership unchanged"
         );
 
-        let root = txn.context().await.unwrap();
+        let root = dir.read().await.get_dir("versions").cloned().unwrap();
         let workspaces: Vec<_> = root
             .read()
             .await
@@ -461,8 +502,8 @@ async fn bulk_source_error_after_rows_requires_rollback() {
             let inserts = workspace.read().await.get_dir("inserts").cloned();
             if let Some(inserts) = inserts {
                 let staged = TableFile::load(
-                    table.schema.clone(),
-                    crate::persistence::value_order(),
+                    table.schema().clone(),
+                    tc_value::ValueCollator::default(),
                     inserts,
                 )
                 .unwrap();
@@ -476,7 +517,7 @@ async fn bulk_source_error_after_rows_requires_rollback() {
             "earlier rows remain staged in delegated storage"
         );
 
-        table.rollback(txn.id()).unwrap();
+        table.rollback(&txn.id()).await.unwrap();
     })
     .await;
 }
@@ -507,7 +548,7 @@ async fn equal_norm_keys_preserve_identity_and_range_selection() {
             .await
             .unwrap();
 
-    let native = table.owner.read_state().persistent.clone();
+    let native = table.canonical.clone();
     {
         let _guard = native.write().await;
         let invalid = native.get_row(&[]);
@@ -573,7 +614,7 @@ async fn equal_norm_keys_preserve_identity_and_range_selection() {
     }
 
     table.commit(txn.id()).await.unwrap();
-    table.finalize(txn.id()).await.unwrap();
+    table.finalize(&txn.id()).await.unwrap();
     let later = txn.at(11);
     table
         .upsert_row(&later, vec![left.clone()], vec!["new-left".into()])
@@ -613,7 +654,7 @@ async fn equal_norm_keys_preserve_identity_and_range_selection() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].as_slice(), &[left, Value::from("new-left")]);
     table.commit(later.id()).await.unwrap();
-    table.finalize(later.id()).await.unwrap();
+    table.finalize(&later.id()).await.unwrap();
     assert!(
         table
             .read_row(txn.at(12).id(), &[right])
@@ -687,17 +728,16 @@ async fn deep_visible_versions_use_normal_worker_stacks() {
                         .unwrap();
                 }
 
-                {
-                    let mut state = collection.owner.write_state();
-                    state.pending.clear();
-                    // Reuse native fixtures to measure version depth rather than directory setup.
-                    for nonce in 0..1024 {
-                        state.committed.insert(
+                // Reuse native fixtures to isolate version depth from directory setup.
+
+                collection
+                    .versions
+                    .seed_committed_for_test((0..1024).map(|nonce| {
+                        (
                             TxnId::from_parts(NetworkTime::from_nanos(1), nonce),
-                            Some(delta.clone()),
-                        );
-                    }
-                }
+                            delta.clone(),
+                        )
+                    }));
 
                 let read_id = TxnId::from_parts(NetworkTime::from_nanos(1), 4096);
                 eprintln!("{phase}: constructing visible stream");
@@ -749,7 +789,7 @@ async fn point_lookup_skips_shadowed_corruption() {
             .await
             .unwrap();
 
-        let canonical = table.owner.read_state().persistent.clone();
+        let canonical = table.canonical.clone();
         upsert(&canonical, vec![0u64.into()], vec![0u64.into()])
             .await
             .unwrap();
@@ -777,7 +817,18 @@ async fn point_lookup_skips_shadowed_corruption() {
             .unwrap();
 
         table.commit(txn.id()).await.unwrap();
-        let primary = dir.read().await.get_dir("primary").unwrap().clone();
+        let primary = dir
+            .read()
+            .await
+            .get_dir("base")
+            .cloned()
+            .unwrap()
+            .read()
+            .await
+            .get_dir("primary")
+            .unwrap()
+            .clone();
+
         assert!(
             primary
                 .write()
@@ -828,7 +879,7 @@ async fn point_lookup_skips_shadowed_corruption() {
                 .is_none()
         );
 
-        table.rollback(later.id()).unwrap();
+        table.rollback(&later.id()).await.unwrap();
         assert!(
             table
                 .read_row(later.id(), &[0u64.into()])
@@ -878,7 +929,7 @@ async fn canonical_count_yields_cooperatively() {
         .await
         .unwrap();
 
-        let native = table.owner.read_state().persistent.clone();
+        let native = table.canonical.clone();
         {
             let mut write = native.write().await;
             for key in 0..256_u64 {
@@ -970,7 +1021,15 @@ async fn restoration_self_and_conflicting_sources_are_bounded() {
             drop(held);
             assert!(has(target.clone(), txn.clone(), key).await);
 
-            let context = txn.context().await.unwrap();
+            let context = source
+                .store
+                .base()
+                .read()
+                .await
+                .get_dir("primary")
+                .cloned()
+                .unwrap();
+
             let context_guard = context.write().await;
             let mut restore = Box::pin(target.restore(&txn, source));
             assert!(
@@ -981,7 +1040,6 @@ async fn restoration_self_and_conflicting_sources_are_bounded() {
 
             assert!(
                 source
-                    .owner
                     .try_acquire_write_permit(txn.id(), txn_lock::set::Range::All)
                     .is_err(),
                 "source snapshot is admitted before staging"
@@ -1002,20 +1060,18 @@ async fn restoration_self_and_conflicting_sources_are_bounded() {
 
             drop(
                 target
-                    .owner
                     .try_acquire_write_permit(txn.id(), txn_lock::set::Range::All)
                     .unwrap(),
             );
 
             drop(
                 source
-                    .owner
                     .try_acquire_write_permit(txn.id(), txn_lock::set::Range::All)
                     .unwrap(),
             );
 
-            target.rollback(txn.id()).unwrap();
-            source.rollback(txn.id()).unwrap();
+            target.rollback(&txn.id()).await.unwrap();
+            source.rollback(&txn.id()).await.unwrap();
         }
 
         let dir = txn.subcontext_unique().context().await.unwrap();
@@ -1023,13 +1079,13 @@ async fn restoration_self_and_conflicting_sources_are_bounded() {
         let source = make(txn.subcontext_unique().context().await.unwrap()).await;
         seed(target.clone(), txn.at(9), 1).await;
         target.commit(txn.at(9).id()).await.unwrap();
-        target.finalize(txn.at(9).id()).await.unwrap();
+        target.finalize(&txn.at(9).id()).await.unwrap();
         seed(target.clone(), txn.clone(), 3).await;
         seed(source.clone(), txn.clone(), 2).await;
         target.restore(&txn, &source).await.unwrap();
         assert!(has(target.clone(), txn.clone(), 2).await);
         assert!(!has(target.clone(), txn.clone(), 3).await);
-        target.rollback(txn.id()).unwrap();
+        target.rollback(&txn.id()).await.unwrap();
         assert!(has(target.clone(), txn.clone(), 1).await);
         assert!(!has(target.clone(), txn.clone(), 2).await);
         source.commit(txn.id()).await.unwrap();
@@ -1037,9 +1093,8 @@ async fn restoration_self_and_conflicting_sources_are_bounded() {
         target.restore(&later, &source).await.unwrap();
         target.commit(later.id()).await.unwrap();
         assert!(target.restore(&later, &target).await.is_err());
-        target.finalize(later.id()).await.unwrap();
+        target.finalize(&later.id()).await.unwrap();
         assert!(target.restore(&later, &target).await.is_err());
-        target.sync_all().await.unwrap();
         let path = dir.read().await.path().to_owned();
         drop(target);
         let cache = freqfs::Cache::<crate::PersistentFile>::new(
@@ -1092,7 +1147,18 @@ async fn restoration_source_failure_preserves_pending_data() {
             .await
             .unwrap();
 
-        let native = source_dir.read().await.get_dir("primary").unwrap().clone();
+        let native = source_dir
+            .read()
+            .await
+            .get_dir("base")
+            .cloned()
+            .unwrap()
+            .read()
+            .await
+            .get_dir("primary")
+            .unwrap()
+            .clone();
+
         let root = native
             .read()
             .await
@@ -1119,19 +1185,17 @@ async fn restoration_source_failure_preserves_pending_data() {
         drop(root.try_write::<b_table::Node<tc_value::Value>>().unwrap());
         drop(
             source
-                .owner
                 .try_acquire_write_permit(txn.id(), txn_lock::set::Range::All)
                 .unwrap(),
         );
 
         drop(
             target
-                .owner
                 .try_acquire_write_permit(txn.id(), txn_lock::set::Range::All)
                 .unwrap(),
         );
 
-        let selection = source.limit(1).select(vec!["id".parse().unwrap()]).unwrap();
+        let selection = source.limit(1).select(&["id".parse().unwrap()]).unwrap();
         assert!(
             selection
                 .count(txn.id())
@@ -1150,15 +1214,14 @@ async fn restoration_source_failure_preserves_pending_data() {
 
         assert!(
             selection
-                .for_each_row_in_order(txn.id(), |_| panic!(
-                    "corrupt source must not reach callback"
-                ))
+                .rows(txn.id())
                 .await
-                .unwrap_err()
+                .err()
+                .expect("corrupt source")
                 .requires_recovery()
         );
 
-        target.rollback(txn.id()).unwrap();
+        target.rollback(&txn.id()).await.unwrap();
     })
     .await;
 }
@@ -1251,7 +1314,7 @@ async fn copying_preserves_equal_norm_keys_and_rejects_ambiguity() {
         let projected = crate::table::PersistentTable::copy_from(
             &txn,
             txn.subcontext_unique().context().await.unwrap(),
-            &Table::from(reordered),
+            &reordered,
         )
         .await
         .unwrap();
@@ -1271,7 +1334,7 @@ async fn copying_preserves_equal_norm_keys_and_rejects_ambiguity() {
         let error = crate::table::PersistentTable::copy_from(
             &txn,
             txn.subcontext_unique().context().await.unwrap(),
-            &Table::from(reversed),
+            &reversed,
         )
         .await
         .unwrap_err();
@@ -1286,13 +1349,7 @@ async fn copying_preserves_equal_norm_keys_and_rejects_ambiguity() {
             original
         );
 
-        let delta = source
-            .owner
-            .read_state()
-            .pending
-            .get(&txn.id())
-            .unwrap()
-            .clone();
+        let delta = source.versions.pending_for_test(txn.id());
 
         let held = delta.inserts.write().await;
         let cancelled = txn.subcontext_unique().context().await.unwrap();
@@ -1308,7 +1365,6 @@ async fn copying_preserves_equal_norm_keys_and_rejects_ambiguity() {
 
         assert!(
             source
-                .owner
                 .try_acquire_write_permit(txn.id(), txn_lock::set::Range::All)
                 .is_err()
         );
@@ -1317,7 +1373,6 @@ async fn copying_preserves_equal_norm_keys_and_rejects_ambiguity() {
         drop(held);
         drop(
             source
-                .owner
                 .try_acquire_write_permit(txn.id(), txn_lock::set::Range::All)
                 .unwrap(),
         );
@@ -1336,7 +1391,6 @@ async fn copying_preserves_equal_norm_keys_and_rejects_ambiguity() {
             original
         );
 
-        copy.sync_all().await.unwrap();
         let path = out.read().await.path().to_owned();
         drop(copy);
         drop(out);
@@ -1370,7 +1424,18 @@ async fn copying_preserves_equal_norm_keys_and_rejects_ambiguity() {
                 .await
                 .unwrap();
 
-            let primary = dir.read().await.get_dir("primary").unwrap().clone();
+            let primary = dir
+                .read()
+                .await
+                .get_dir("base")
+                .cloned()
+                .unwrap()
+                .read()
+                .await
+                .get_dir("primary")
+                .unwrap()
+                .clone();
+
             let root = primary
                 .read()
                 .await
@@ -1410,7 +1475,6 @@ async fn copying_preserves_equal_norm_keys_and_rejects_ambiguity() {
             drop(guard);
             drop(
                 source
-                    .owner
                     .try_acquire_write_permit(txn.id(), txn_lock::set::Range::All)
                     .unwrap(),
             );

@@ -89,161 +89,7 @@ async fn buffered_payload_saves_flush_exact_bytes_and_report_errors() {
 }
 
 #[tokio::test]
-async fn sparse_nodes_retain_bits_and_reject_unbounded_or_wrong_payloads() {
-    use fensor::SparseCell::{Key, Payload};
-    use futures::{TryStreamExt, stream};
-
-    let bits = [0u64, 1 << 63, 0x7ff8000000000123, f64::INFINITY.to_bits()];
-    for len in [1, 3, fensor::MAX_BLOCK_CAPACITY] {
-        let values: Vec<_> = (0..len)
-            .map(|i| f64::from_bits(bits[i % bits.len()]))
-            .collect();
-
-        let entry = PersistentFile::SparseF64(b_table::Node::Leaf(vec![vec![
-            Key(1),
-            Payload(values.clone()),
-        ]]));
-
-        let decoded = decode_entry(&entry).await;
-        assert!(AsType::<fensor::SparseNode<f32>>::as_type(&decoded).is_none());
-        let PersistentFile::SparseF64(b_table::Node::Leaf(rows)) = decoded else {
-            panic!("wrong payload tag")
-        };
-
-        let Payload(actual) = &rows[0][1] else {
-            panic!("wrong cell kind")
-        };
-
-        assert_eq!(
-            actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            values.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-        );
-    }
-
-    for row in [
-        vec![Key(2)],
-        vec![Key(2), Payload(vec![f64::from_bits(bits[2]), -0.])],
-    ] {
-        let node = b_table::Node::Index(vec![row.clone()], vec![Default::default(); 2]);
-        let decoded = decode_entry(&PersistentFile::SparseF64(node)).await;
-        let PersistentFile::SparseF64(b_table::Node::Index(rows, children)) = decoded else {
-            panic!("wrong compact node kind")
-        };
-
-        assert_eq!(rows, vec![row]);
-        assert_eq!(children.len(), 2);
-        if let Some(Payload(values)) = rows[0].get(1) {
-            assert_eq!(values[0].to_bits(), bits[2]);
-            assert_eq!(values[1].to_bits(), (-0.0f64).to_bits());
-        }
-    }
-
-    let maximum = PersistentFile::SparseF64(b_table::Node::Leaf(
-        (0..4)
-            .map(|id| vec![Key(id), Payload(vec![1.; fensor::MAX_BLOCK_CAPACITY])])
-            .collect(),
-    ));
-
-    decode_entry(&maximum).await;
-    #[cfg(feature = "complex")]
-    {
-        let value = fensor::complex::Complex64::new(f64::from_bits(bits[2]), -0.);
-        let entry = PersistentFile::SparseC64(b_table::Node::Leaf(vec![vec![
-            Key(1),
-            Payload(vec![value]),
-        ]]));
-
-        let decoded = decode_entry(&entry).await;
-        let PersistentFile::SparseC64(b_table::Node::Leaf(rows)) = decoded else {
-            panic!("wrong complex tag")
-        };
-
-        assert_eq!(rows[0][1], Payload(vec![value]));
-    }
-
-    struct Raw(Vec<u8>);
-
-    impl<'en> en::IntoStream<'en> for Raw {
-        fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-            encoder.encode_array_u8(stream::iter([self.0]))
-        }
-    }
-
-    async fn rejects<'en, V: en::IntoStream<'en> + 'en>(value: V) {
-        let chunks = tbon::en::encode(value)
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        assert!(
-            tbon::de::try_decode::<_, _, PersistentFile>(
-                (),
-                stream::iter(chunks.clone().into_iter().map(Ok::<_, std::io::Error>))
-            )
-            .await
-            .is_err()
-        );
-    }
-
-    let b_table::Node::Index(_, children) =
-        b_table::Node::<u64>::Index(Vec::new(), vec![Default::default(); 3])
-    else {
-        unreachable!()
-    };
-
-    for count in [0, 1, 3] {
-        rejects((39u8, (false, vec![(0u64,)], children[..count].to_vec()))).await;
-    }
-
-    rejects((39u8, (true, vec![(0u64,)], Vec::<u64>::new()))).await;
-    rejects((
-        39u8,
-        (false, vec![Vec::<u64>::new()], children[..2].to_vec()),
-    ))
-    .await;
-
-    rejects((39u8, (false, vec![("bad block",)], children[..2].to_vec()))).await;
-    rejects((
-        39u8,
-        (
-            false,
-            vec![(0u64, Raw(vec![0; 8]), 1u64)],
-            children[..2].to_vec(),
-        ),
-    ))
-    .await;
-
-    // Old copied-minimum nodes had one complete row for every child.
-    rejects((
-        39u8,
-        (false, vec![(0u64, Raw(vec![0; 8]))], children[..1].to_vec()),
-    ))
-    .await;
-
-    for bytes in [0, 1, 7, 9, (fensor::MAX_BLOCK_CAPACITY + 1) * 8] {
-        rejects((
-            39u8,
-            (true, vec![(0u64, Raw(vec![0; bytes]))], Vec::<u64>::new()),
-        ))
-        .await;
-    }
-
-    for (rows, values) in [(1025, 1), (5, fensor::MAX_BLOCK_CAPACITY)] {
-        let rows: Vec<_> = (0..rows)
-            .map(|id| (id as u64, Raw(vec![0; values * 8])))
-            .collect();
-
-        rejects((39u8, (true, rows, Vec::<u64>::new()))).await;
-    }
-
-    rejects((
-        39u8,
-        (true, vec![(0u64, 0u64, Raw(vec![0; 8]))], Vec::<u64>::new()),
-    ))
-    .await;
-
-    rejects((39u8, (true, vec![(0u64, Raw(vec![0; 8]))], vec![0u64]))).await;
+async fn tensor_files_preserve_dtype_tags_and_bound_decoding() {
     let extra = (21u8, (vec![4u64], true, None::<u64>, 1u64, 0u64));
     assert!(
         tbon::de::try_decode::<_, _, PersistentFile>((), tbon::en::encode(extra).unwrap())
@@ -258,10 +104,7 @@ async fn sparse_nodes_retain_bits_and_reject_unbounded_or_wrong_payloads() {
 
     assert!(AsType::<fensor::TensorMetadata<f64>>::as_type(&decoded).is_some());
     decode_entry(&decoded).await;
-}
 
-#[tokio::test]
-async fn tensor_files_preserve_dtype_tags_and_bound_decoding() {
     async fn assert_tag(tag: u8, entry: PersistentFile) {
         let (actual, _): (u8, de::IgnoredAny) =
             tbon::de::try_decode((), tbon::en::encode(&entry).unwrap())
@@ -289,10 +132,13 @@ async fn tensor_files_preserve_dtype_tags_and_bound_decoding() {
 
             assert_tag(
                 $sparse_tag,
-                PersistentFile::$sparse(b_tree::Node::Leaf(vec![vec![
-                    fensor::SparseCell::Key(0),
-                    fensor::SparseCell::Payload(vec![Default::default()]),
-                ]])),
+                PersistentFile::$sparse(
+                    b_tree::Node::Leaf(vec![vec![
+                        fensor::SparseCell::Key(0),
+                        fensor::SparseCell::Payload(vec![Default::default()]),
+                    ]])
+                    .into(),
+                ),
             )
             .await;
         };
@@ -300,26 +146,34 @@ async fn tensor_files_preserve_dtype_tags_and_bound_decoding() {
 
     assert_tag(0, PersistentFile::Node(b_tree::Node::Leaf(vec![]))).await;
     assert_tag(1, PersistentFile::TensorIndex(b_tree::Node::Leaf(vec![]))).await;
-    check_dtype!(U8, MetadataU8, SparseU8; 2, 3, 30);
-    check_dtype!(U16, MetadataU16, SparseU16; 4, 5, 31);
-    check_dtype!(U32, MetadataU32, SparseU32; 6, 7, 32);
-    check_dtype!(U64, MetadataU64, SparseU64; 8, 9, 33);
-    check_dtype!(I8, MetadataI8, SparseI8; 10, 11, 34);
-    check_dtype!(I16, MetadataI16, SparseI16; 12, 13, 35);
-    check_dtype!(I32, MetadataI32, SparseI32; 14, 15, 36);
-    check_dtype!(I64, MetadataI64, SparseI64; 16, 17, 37);
-    check_dtype!(F32, MetadataF32, SparseF32; 18, 19, 38);
-    check_dtype!(F64, MetadataF64, SparseF64; 20, 21, 39);
+    check_dtype!(U8, MetadataU8, SparseU8; 2, 3, 42);
+    check_dtype!(U16, MetadataU16, SparseU16; 4, 5, 43);
+    check_dtype!(U32, MetadataU32, SparseU32; 6, 7, 44);
+    check_dtype!(U64, MetadataU64, SparseU64; 8, 9, 45);
+    check_dtype!(I8, MetadataI8, SparseI8; 10, 11, 46);
+    check_dtype!(I16, MetadataI16, SparseI16; 12, 13, 47);
+    check_dtype!(I32, MetadataI32, SparseI32; 14, 15, 48);
+    check_dtype!(I64, MetadataI64, SparseI64; 16, 17, 49);
+    check_dtype!(F32, MetadataF32, SparseF32; 18, 19, 50);
+    check_dtype!(F64, MetadataF64, SparseF64; 20, 21, 51);
     #[cfg(feature = "complex")]
     {
-        check_dtype!(C32, MetadataC32, SparseC32; 22, 23, 40);
-        check_dtype!(C64, MetadataC64, SparseC64; 24, 25, 41);
+        check_dtype!(C32, MetadataC32, SparseC32; 22, 23, 52);
+        check_dtype!(C64, MetadataC64, SparseC64; 24, 25, 53);
     }
 
     let entry = PersistentFile::F64(vec![1.0, 2.0]);
     let decoded = decode_entry(&entry).await;
     assert!(AsType::<Vec<f64>>::as_type(&decoded).is_some());
     assert!(AsType::<Vec<u64>>::as_type(&decoded).is_none());
+    let sparse = PersistentFile::from(b_tree::Node::Leaf(vec![vec![
+        fensor::SparseCell::Key(0),
+        fensor::SparseCell::Payload(vec![3f64]),
+    ]]));
+
+    let decoded = decode_entry(&sparse).await;
+    assert!(AsType::<crate::TensorSparseNode<f64>>::as_type(&decoded).is_some());
+    assert!(AsType::<crate::TensorSparseNode<f32>>::as_type(&decoded).is_none());
     let row = vec![1];
     for leaf in [false, true] {
         let node = if leaf {
@@ -412,11 +266,16 @@ async fn tensor_files_preserve_dtype_tags_and_bound_decoding() {
             .is_err()
     );
 
-    // An unknown tag must not cause a decoder to reinterpret its payload.
-    let unknown = (255u8, vec![0.0f64]);
-    assert!(
-        tbon::de::try_decode::<_, _, PersistentFile>((), tbon::en::encode(unknown).unwrap())
+    // Even a structurally valid separator-only node must use a current tag.
+    for tag in (30u8..=41).chain([255u8]) {
+        let index = b_tree::Node::Index(vec![(0u64,)], vec![Default::default(); 2]);
+        assert!(
+            tbon::de::try_decode::<_, _, PersistentFile>(
+                (),
+                tbon::en::encode((tag, index)).unwrap()
+            )
             .await
             .is_err()
-    );
+        );
+    }
 }

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use b_table::Row;
 use futures::TryStreamExt;
 use futures::future::join_all;
+use tc_ir::Transact;
 use tc_value::{Value, ValueType};
 use tokio::sync::{Barrier, mpsc, oneshot};
 use tokio::time::{Duration, timeout};
@@ -16,6 +17,19 @@ use super::{
 use crate::btree::StorageConfig;
 use crate::test::{TestTxn, init_root, load_roots, tx};
 use crate::{CopyFrom, PersistentFile};
+
+fn test_rows(stream: super::stream::RowStream) -> Rows {
+    let semaphore = txn_lock::semaphore::Semaphore::new(b_tree::RangeCollator::new(
+        tc_value::ValueCollator::default(),
+    ));
+
+    Rows::new(
+        stream,
+        semaphore
+            .try_read(tx(10), txn_lock::set::Range::All)
+            .unwrap(),
+    )
+}
 
 fn simple_schema() -> TableSchema {
     let key = vec![Column {
@@ -159,7 +173,7 @@ async fn delete_moves_row_to_pending_deletes() {
             .expect("upsert row");
 
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
         table
             .delete_row(&txn.with_id(tx(11)), vec![Value::from(1_u64)])
@@ -305,7 +319,7 @@ async fn rollback_discards_pending_and_unblocks() {
             "later txn read should block while earlier overlapping write is pending"
         );
 
-        table.rollback(tx(10)).expect("rollback");
+        table.rollback(&tx(10)).await.expect("rollback");
 
         let row = timeout(
             Duration::from_secs(1),
@@ -341,7 +355,7 @@ async fn finalize_merges_committed_into_canon() {
             .expect("upsert row");
 
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
         assert!(
             table
@@ -377,7 +391,7 @@ async fn duplicate_commit_is_idempotent_table() {
 
         table.commit(tx(10)).await.expect("commit");
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
         assert!(
             table
@@ -410,9 +424,9 @@ async fn stale_finalize_is_noop_table() {
             .expect("upsert row");
 
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
-        table.finalize(tx(9)).await.expect("stale finalize no-op");
+        table.finalize(&tx(9)).await.expect("stale finalize no-op");
 
         assert_eq!(table.finalized().unwrap(), Some(tx(10)));
         assert!(
@@ -471,7 +485,7 @@ async fn cannot_write_after_commit_or_finalize_table() {
 
         assert_eq!(row.as_slice(), &[1_u64.into(), "a".into()]);
 
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
         assert_eq!(
             table
                 .upsert_row(
@@ -546,7 +560,7 @@ async fn pending_is_visible_only_to_its_txn_table() {
         );
 
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
         let row = timeout(
             Duration::from_secs(1),
@@ -598,7 +612,7 @@ async fn committed_is_visible_in_txn_order_table() {
             "committed row should be visible at commit txn"
         );
 
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
         for stale in [tx(9), tx(10)] {
             let error = table.read_row(stale, &[1_u64.into()]).await.unwrap_err();
             assert_eq!(error.message(), txn_lock::Error::Outdated.to_string());
@@ -709,7 +723,7 @@ async fn read_resolves_delta_stack_table() {
             .expect("insert original");
 
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
         table
             .upsert_row(
@@ -818,7 +832,7 @@ async fn count_matches_streamed_fold_table() {
         }
 
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
         for i in (1..=10u64).step_by(2) {
             table
@@ -853,7 +867,7 @@ async fn contains_all_key_range_table() {
         }
 
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
         assert!(
             table
@@ -894,7 +908,7 @@ async fn empty_table_semantics_across_lifecycle_table() {
         );
 
         table.commit(tx(95)).await.expect("commit");
-        table.finalize(tx(95)).await.expect("finalize");
+        table.finalize(&tx(95)).await.expect("finalize");
 
         assert!(table.is_empty(tx(96)).await.unwrap());
         assert_eq!(table.count(tx(96)).await.unwrap(), 0);
@@ -989,7 +1003,7 @@ async fn composite_key_upsert_and_read() {
         );
 
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
         let mut streamed = Vec::new();
         table
@@ -1029,7 +1043,7 @@ async fn table_with_auxiliary_index() {
         }
 
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
         assert!(
             table
@@ -1079,7 +1093,7 @@ async fn large_scan_completes_under_timeout_table() {
         }
 
         table.commit(tx(20)).await.expect("commit");
-        table.finalize(tx(20)).await.expect("finalize");
+        table.finalize(&tx(20)).await.expect("finalize");
 
         let mut seen = 0_u64;
         timeout(Duration::from_secs(10), async {
@@ -1116,8 +1130,11 @@ async fn repeated_rollback_and_finalize_are_idempotent_table() {
             .await
             .expect("insert key for rollback");
 
-        table.rollback(tx(92)).expect("rollback");
-        table.rollback(tx(92)).expect("second rollback no-op");
+        table.rollback(&tx(92)).await.expect("rollback");
+        table
+            .rollback(&tx(92))
+            .await
+            .expect("second rollback no-op");
 
         table
             .upsert_row(
@@ -1130,8 +1147,11 @@ async fn repeated_rollback_and_finalize_are_idempotent_table() {
 
         table.commit(tx(93)).await.expect("commit");
 
-        table.finalize(tx(93)).await.expect("finalize");
-        table.finalize(tx(93)).await.expect("second finalize no-op");
+        table.finalize(&tx(93)).await.expect("finalize");
+        table
+            .finalize(&tx(93))
+            .await
+            .expect("second finalize no-op");
 
         assert_eq!(table.finalized().unwrap(), Some(tx(93)));
         assert!(
@@ -1199,6 +1219,69 @@ fn id(name: &str) -> tc_ir::Id {
     name.parse().expect("Id")
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn late_older_mutations_cannot_diverge_primary_and_secondary_reads() {
+    Box::pin(async {
+        let root = init_root("indexed-write-order");
+        let (persistent, txn) = load_roots(&root);
+        let schema = TableSchema::new(
+            vec![Column {
+                name: id("id"),
+                dtype: ValueType::Number(tc_value::NumberType::Number),
+            }],
+            vec![Column {
+                name: id("label"),
+                dtype: ValueType::String,
+            }],
+            vec![("by_label".into(), vec![id("label")])],
+            StorageConfig::default(),
+        )
+        .unwrap();
+        let table = PersistentTable::try_new(persistent, schema.clone())
+            .await
+            .unwrap();
+        let key = || vec![Value::from(1u64)];
+        table
+            .upsert_row(&txn.with_id(tx(10)), key(), vec!["original".into()])
+            .await
+            .unwrap();
+        table.commit(tx(10)).await.unwrap();
+        table
+            .upsert_row(&txn.with_id(tx(12)), key(), vec!["latest".into()])
+            .await
+            .unwrap();
+        table.commit(tx(12)).await.unwrap();
+        let older = txn.with_id(tx(11));
+        let error = table
+            .upsert_row(&older, key(), vec!["late".into()])
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tc_error::ErrorKind::Conflict);
+        drop(table);
+
+        let (persistent, _) = load_roots(&root);
+        let table = PersistentTable::<TestTxn>::load(persistent, schema)
+            .await
+            .unwrap();
+        let error = table
+            .upsert_row(&older, vec![2u64.into()], vec!["late".into()])
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tc_error::ErrorKind::Conflict);
+
+        let primary = table.read_row(tx(13), &key()).await.unwrap().unwrap();
+        assert_eq!(
+            primary.as_ref(),
+            &[Value::from(1u64), Value::from("latest")]
+        );
+        for (label, count) in [("original", 0), ("late", 0), ("latest", 1)] {
+            let range = range_eq("label", label.into());
+            assert_eq!(table.count_in(tx(13), range).await.unwrap(), count);
+        }
+    })
+    .await;
+}
+
 fn range_in(col: &str, start: Value, end: Value) -> Range<tc_ir::Id, Value> {
     let mut map = HashMap::new();
     map.insert(
@@ -1250,7 +1333,7 @@ async fn slice_returns_in_range_rows_table() {
         }
 
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
         let slice = table.slice(
             range_in("id", Value::from(2_u64), Value::from(5_u64)),
@@ -1287,7 +1370,7 @@ async fn select_projects_columns_table() {
             let payload = String::from("owned projection payload");
             let pointer = payload.as_ptr();
             let row: b_table::Row<Value> = vec![Value::from(1_u64), Value::from(payload)].into();
-            let rows = Rows::local(Box::pin(futures::stream::iter([Ok(row)])));
+            let rows = test_rows(Box::pin(futures::stream::iter([Ok(row)])));
             let columns: Vec<_> = names.iter().map(|name| id(name)).collect();
             let mut rows = rows.select(&simple_schema(), &columns);
             let projected = rows.try_next().await.unwrap().unwrap();
@@ -1341,7 +1424,7 @@ async fn select_projects_columns_table() {
             .expect("insert");
 
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
         let selection = table
             .select(&[id("id"), id("label")])
@@ -1390,7 +1473,7 @@ async fn limit_caps_row_stream_table() {
         }
 
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
         let limited = table.limit(3);
         assert_eq!(
@@ -1461,7 +1544,7 @@ async fn order_by_uses_supporting_index_table() {
         }
 
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
         let ordered = table.order_by(&[id("ref_id")], false);
         let rows = ordered.rows(tx(11)).await.expect("ordered rows");
@@ -1525,7 +1608,7 @@ async fn reverse_flips_order_table() {
         }
 
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
         let forward = table.slice(Range::default(), &[], false);
         let rows = forward.rows(tx(11)).await.expect("forward rows");
@@ -1588,7 +1671,7 @@ async fn unsupported_range_fails_closed_table() {
             .expect("insert");
 
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
         // A range on a non-existent column cannot be supported by any index
         // and must fail closed.
@@ -1616,7 +1699,8 @@ async fn unsupported_range_fails_closed_table() {
 
         assert!(table.truncate(&txn.with_id(tx(11)), range).await.is_err());
         table
-            .rollback(tx(11))
+            .rollback(&tx(11))
+            .await
             .expect("release rejected mutation reservations");
 
         let supported = range_in("id", Value::from(0_u64), Value::from(3_u64));
@@ -1665,7 +1749,7 @@ async fn truncate_use_scratch_not_buffer_table() {
         }
 
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
         // Truncate rows with id in [2, 4)
         table
@@ -1729,7 +1813,7 @@ async fn truncate_use_scratch_not_buffer_table() {
 
         // Commit and finalize the truncate
         table.commit(tx(11)).await.expect("commit");
-        table.finalize(tx(11)).await.expect("finalize");
+        table.finalize(&tx(11)).await.expect("finalize");
 
         assert_eq!(
             table.count(tx(12)).await.unwrap(),
@@ -1761,7 +1845,7 @@ async fn view_composition_is_lazy_table() {
         }
 
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
         // Compose: slice [3, 7) -> limit 2 -> select the key and label.
         let slice = table.slice(
@@ -1772,7 +1856,7 @@ async fn view_composition_is_lazy_table() {
 
         let limited = slice.limit(2);
         let selection = limited
-            .select(vec![id("id"), id("label")])
+            .select(&[id("id"), id("label")])
             .expect("valid selection");
 
         let rows = selection.rows(tx(11)).await.expect("composed view rows");
@@ -1791,11 +1875,66 @@ async fn view_composition_is_lazy_table() {
             "second row should be id 4"
         );
 
+        // Projection commutes through limits, and repeated caps cannot widen a view.
+        let projected = slice.select(&[id("id"), id("label")]).unwrap();
+        let repeated = projected
+            .limit(5)
+            .limit(2)
+            .limit(20)
+            .select(&[id("id"), id("label")])
+            .unwrap();
+
+        assert_eq!(
+            collect_rows(repeated.rows(tx(11)).await.unwrap()).await,
+            collected
+        );
+
+        assert!(repeated.slice(Range::default(), &[], false).is_err());
+        assert!(repeated.order_by(&[id("id")], false).is_err());
+        assert!(projected.select(&[id("id"), id("ref_id")]).is_err());
+        assert!(
+            projected
+                .slice(range_eq("ref_id", 30_u64.into()), &[], false)
+                .is_err()
+        );
+
+        assert!(projected.order_by(&[id("ref_id")], false).is_err());
+        let narrowed = projected
+            .slice(range_eq("id", 4_u64.into()), &[], false)
+            .unwrap();
+
+        assert_eq!(
+            collect_rows(narrowed.rows(tx(11)).await.unwrap()).await,
+            vec![vec![4_u64.into(), "item4".into()]]
+        );
+
+        let ordered = projected.order_by(&[id("id")], true).unwrap();
+
+        assert_eq!(
+            ordered.schema().columns().cloned().collect::<Vec<_>>(),
+            vec![id("id"), id("label")]
+        );
+
+        let reversed = collect_rows(ordered.rows(tx(11)).await.unwrap()).await;
+        assert_eq!(
+            reversed.first().unwrap(),
+            &vec![6_u64.into(), "item6".into()]
+        );
+
+        assert!(projected.read_row(tx(11), &[4_u64.into()]).await.is_err());
+        assert!(repeated.read_row(tx(11), &[4_u64.into()]).await.is_err());
+
         assert_eq!(selection.count(tx(11)).await.unwrap(), 2);
         assert!(!selection.is_empty(tx(11)).await.unwrap());
         let mut visited = Vec::new();
         selection
-            .for_each_row_in_order(tx(11), |row| visited.push(row.into_vec()))
+            .rows(tx(11))
+            .await
+            .unwrap()
+            .try_for_each(|row| {
+                visited.push(row.into_vec());
+                futures::future::ready(Ok(()))
+            })
             .await
             .unwrap();
 
@@ -1805,11 +1944,11 @@ async fn view_composition_is_lazy_table() {
             let limited = slice.limit(limit);
             assert!(
                 limited
-                    .select(vec![id("id"), id("label"), id("label")])
+                    .select(&[id("id"), id("label"), id("label")])
                     .is_err()
             );
 
-            let selected = limited.select(vec![id("id"), id("label")]).unwrap();
+            let selected = limited.select(&[id("id"), id("label")]).unwrap();
 
             let expected = collect_rows(selected.rows(tx(11)).await.unwrap()).await;
             assert_eq!(expected.len(), (limit as usize).min(4));
@@ -1821,7 +1960,13 @@ async fn view_composition_is_lazy_table() {
 
             let mut visited = Vec::new();
             selected
-                .for_each_row_in_order(tx(11), |row| visited.push(row.into_vec()))
+                .rows(tx(11))
+                .await
+                .unwrap()
+                .try_for_each(|row| {
+                    visited.push(row.into_vec());
+                    futures::future::ready(Ok(()))
+                })
                 .await
                 .unwrap();
 
@@ -1830,24 +1975,14 @@ async fn view_composition_is_lazy_table() {
 
         for limit in [0, 2] {
             let limited = table.limit(limit);
-            let selected = limited.select(vec![id("id"), id("label")]).unwrap();
+            let selected = limited.select(&[id("id"), id("label")]).unwrap();
             assert!(limited.count(tx(10)).await.is_err());
             assert!(limited.is_empty(tx(10)).await.is_err());
-            assert!(
-                limited
-                    .for_each_row_in_order(tx(10), |_| panic!("outdated callback"))
-                    .await
-                    .is_err()
-            );
+            assert!(limited.rows(tx(10)).await.is_err());
 
             assert!(selected.count(tx(10)).await.is_err());
             assert!(selected.is_empty(tx(10)).await.is_err());
-            assert!(
-                selected
-                    .for_each_row_in_order(tx(10), |_| panic!("outdated callback"))
-                    .await
-                    .is_err()
-            );
+            assert!(selected.rows(tx(10)).await.is_err());
         }
 
         // Also verify count on composed view
@@ -1888,9 +2023,9 @@ async fn lifecycle_noop_paths_release_reservations_table() {
         table.commit(tx(10)).await.expect("commit");
 
         // Finalize tx(10), then duplicate finalize (stale no-op).
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
         assert_eq!(table.finalized().unwrap(), Some(tx(10)));
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
         assert_eq!(table.finalized().unwrap(), Some(tx(10)));
 
         // After all no-op paths, a later read should not be blocked.
@@ -1951,7 +2086,7 @@ async fn overlapping_read_blocks_until_earlier_finalize_table() {
 
         // Commit + finalize the earlier txn
         table.commit(tx(10)).await.expect("commit");
-        table.finalize(tx(10)).await.expect("finalize");
+        table.finalize(&tx(10)).await.expect("finalize");
 
         // Now the later read should complete
         let row = timeout(
@@ -1995,7 +2130,7 @@ async fn concurrent_read_write_finalize_table() {
         }
 
         table.commit(tx(1)).await.expect("commit");
-        table.finalize(tx(1)).await.expect("finalize");
+        table.finalize(&tx(1)).await.expect("finalize");
 
         let t_read = table.clone();
         let t_write = table.clone();
@@ -2022,7 +2157,7 @@ async fn concurrent_read_write_finalize_table() {
             });
 
             let finalize_task = tokio::spawn(async move {
-                t_finalize.finalize(tx(1)).await.expect("finalize");
+                t_finalize.finalize(&tx(1)).await.expect("finalize");
             });
 
             let (read, write, finalize) = tokio::join!(read_task, write_task, finalize_task);
@@ -2062,7 +2197,7 @@ async fn lock_order_no_deadlock_table() {
         }
 
         table.commit(tx(1)).await.expect("commit");
-        table.finalize(tx(1)).await.expect("finalize");
+        table.finalize(&tx(1)).await.expect("finalize");
 
         // Concurrent mutations precede caller-sequenced lifecycle decisions.
         let result = timeout(Duration::from_secs(3), async {
@@ -2095,9 +2230,9 @@ async fn lock_order_no_deadlock_table() {
             w1.expect("w1 task");
             w2.expect("w2 task");
             table.commit(tx(10)).await.expect("commit 10");
-            table.finalize(tx(10)).await.expect("finalize 10");
+            table.finalize(&tx(10)).await.expect("finalize 10");
             table.commit(tx(20)).await.expect("commit 20");
-            table.finalize(tx(20)).await.expect("finalize 20");
+            table.finalize(&tx(20)).await.expect("finalize 20");
         })
         .await;
 
@@ -2146,7 +2281,7 @@ async fn finalize_sync_drops_guard_first_table() {
         table.commit(tx(11)).await.expect("commit");
 
         // Finalize should merge both committed deltas without deadlock
-        let result = timeout(Duration::from_secs(2), table.finalize(tx(11))).await;
+        let result = timeout(Duration::from_secs(2), table.finalize(&tx(11))).await;
         assert!(result.is_ok(), "finalize should complete without deadlock");
         result.unwrap().expect("finalize should succeed");
 
@@ -2227,7 +2362,7 @@ async fn blocked_reader_cancellation_does_not_poison_lock_state_table() {
         assert!(aborted.is_err(), "blocked reader should abort cleanly");
 
         // Simulate timeout cleanup using rollback and verify no lock poisoning remains.
-        table.rollback(tx(60)).expect("rollback 60");
+        table.rollback(&tx(60)).await.expect("rollback 60");
 
         let visible = timeout(
             Duration::from_secs(1),
@@ -2457,7 +2592,7 @@ async fn empty_commit_then_finalize_allows_future_writes_table() {
 
         // Commit and finalize an empty transaction.
         table.commit(tx(10)).await.expect("empty commit");
-        table.finalize(tx(10)).await.expect("empty finalize");
+        table.finalize(&tx(10)).await.expect("empty finalize");
 
         // Future writes should still work.
         table
@@ -2470,7 +2605,7 @@ async fn empty_commit_then_finalize_allows_future_writes_table() {
             .expect("write after empty finalize");
 
         table.commit(tx(11)).await.expect("commit 11");
-        table.finalize(tx(11)).await.expect("finalize 11");
+        table.finalize(&tx(11)).await.expect("finalize 11");
 
         assert!(
             table
@@ -2483,7 +2618,7 @@ async fn empty_commit_then_finalize_allows_future_writes_table() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn finalize_conflicts_with_future_read_table() {
+async fn finalization_preserves_future_read_snapshots() {
     Box::pin(async {
         let root = init_root("finalize-future-read-conflict-table");
         let (persistent, txn) = load_roots(&root);
@@ -2501,7 +2636,7 @@ async fn finalize_conflicts_with_future_read_table() {
             .expect("insert seed key");
 
         table.commit(tx(9)).await.expect("commit 9");
-        table.finalize(tx(9)).await.expect("finalize 9");
+        table.finalize(&tx(9)).await.expect("finalize 9");
 
         // Register an overlapping future read at txn 11.
         assert!(
@@ -2516,7 +2651,7 @@ async fn finalize_conflicts_with_future_read_table() {
         // it merges already-committed data into canon. Future reads are
         // protected by their own permits and by the DirLock on persistent storage.
         table
-            .finalize(tx(10))
+            .finalize(&tx(10))
             .await
             .expect("finalize should succeed with future read");
 
@@ -2540,18 +2675,17 @@ async fn finalize_conflicts_with_future_read_table() {
                 .await
                 .unwrap();
 
-            let mut finalize = Box::pin(table.finalize(tx(n)));
-            assert!(futures::poll!(&mut finalize).is_pending());
+            let id = tx(n);
+            timeout(Duration::from_secs(2), table.finalize(&id))
+                .await
+                .unwrap()
+                .unwrap();
+
             if consume {
                 assert!(!stream.try_collect::<Vec<_>>().await.unwrap().is_empty());
             } else {
                 drop(stream);
             }
-
-            timeout(Duration::from_secs(2), finalize)
-                .await
-                .unwrap()
-                .unwrap();
 
             assert!(
                 table
@@ -2613,7 +2747,7 @@ async fn many_later_readers_unblock_after_commit_table() {
         );
 
         table.commit(tx(50)).await.expect("commit 50");
-        table.finalize(tx(50)).await.expect("finalize 50");
+        table.finalize(&tx(50)).await.expect("finalize 50");
 
         let results = timeout(Duration::from_secs(2), async { join_all(readers).await })
             .await
@@ -2676,7 +2810,7 @@ async fn multi_column_partial_overlap_blocking_behavior_table() {
         );
 
         assert_eq!(
-            table.rollback(tx(80)).unwrap_err().code(),
+            table.rollback(&tx(80)).await.unwrap_err().code(),
             tc_error::ErrorKind::Conflict
         );
 
@@ -2748,11 +2882,6 @@ async fn restart_drops_uncommitted_pending_table() {
                 .unwrap();
 
             table
-                .sync_all()
-                .await
-                .expect("publish initial canonical table");
-
-            table
                 .upsert_row(
                     &txn.with_id(tx(10)),
                     vec![Value::from(1_u64)],
@@ -2804,11 +2933,9 @@ async fn restart_reconstructs_committed_state_table() {
 
             table.commit(tx(10)).await.expect("commit 10");
             table
-                .finalize(tx(10))
+                .finalize(&tx(10))
                 .await
                 .expect("finalize 10 — merges into canon");
-
-            table.sync().await.expect("sync canon to disk");
         }
 
         // Reload from the same dirs — canon should have the finalized rows.
@@ -2857,7 +2984,7 @@ async fn schema_mismatch_merge_fails_closed_table() {
                 .expect("insert row with schema A");
 
             table_a.commit(tx(10)).await.expect("commit 10");
-            table_a.finalize(tx(10)).await.expect("finalize 10");
+            table_a.finalize(&tx(10)).await.expect("finalize 10");
         }
 
         // Attempt to load with a mismatched schema (different value column type).
@@ -2909,7 +3036,7 @@ async fn snapshot_scan_is_coherent_under_concurrent_commits_table() {
         }
 
         table.commit(tx(30)).await.expect("commit 30");
-        table.finalize(tx(30)).await.expect("finalize 30");
+        table.finalize(&tx(30)).await.expect("finalize 30");
 
         let (captured, snapshot_ready) = oneshot::channel();
         let (committed, commit_ready) = oneshot::channel();
@@ -2962,7 +3089,7 @@ async fn snapshot_scan_is_coherent_under_concurrent_commits_table() {
 
         let saw_future_key = scan.expect("scan task join");
         writer.expect("writer task join");
-        table.finalize(tx(32)).await.expect("finalize after scan");
+        table.finalize(&tx(32)).await.expect("finalize after scan");
 
         assert!(
             !saw_future_key,
@@ -3002,15 +3129,8 @@ async fn materialization_delegates_view_representability_and_retains_independent
 
         let reversed = table.order_by(&["id".parse().unwrap()], true);
         let limited = reversed.limit(1);
-        let selected = limited.select(vec!["id".parse().unwrap()]).unwrap();
-        for (i, view) in [
-            super::Table::from(reversed),
-            limited.into(),
-            selected.into(),
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        let selected = limited.select(&["id".parse().unwrap()]).unwrap();
+        for (i, view) in [reversed, limited, selected].into_iter().enumerate() {
             let dir = workspace
                 .write()
                 .await
@@ -3070,7 +3190,18 @@ async fn creation_and_storage_failures_are_errors() {
             .is_err()
     );
 
-    let primary = dir.read().await.get_dir("primary").cloned().unwrap();
+    let primary = dir
+        .read()
+        .await
+        .get_dir("base")
+        .cloned()
+        .unwrap()
+        .read()
+        .await
+        .get_dir("primary")
+        .cloned()
+        .unwrap();
+
     let root_name = primary.read().await.iter().next().unwrap().0.clone();
     assert!(primary.write().await.delete(&root_name).await);
     let key = vec![Value::from(1_u64)];
@@ -3107,7 +3238,7 @@ async fn rows_release_sources_and_permits_at_termination() {
     ]))])
     .boxed();
 
-    let mut selected = Rows::local(source).select(
+    let mut selected = test_rows(source).select(
         &simple_schema(),
         &[
             "label".parse().unwrap(),
@@ -3261,7 +3392,7 @@ async fn indexed_queries_resolve_primary_identity_before_predicates() {
         }
 
         table.commit(tx(10)).await.unwrap();
-        table.finalize(tx(10)).await.unwrap();
+        table.finalize(&tx(10)).await.unwrap();
         let current = txn.with_id(tx(11));
         for (key, score, label) in [(4_u64, 10_u64, "d"), (1, 30, "a-new"), (3, 10, "c-new")] {
             table
@@ -3392,7 +3523,7 @@ async fn indexed_queries_resolve_primary_identity_before_predicates() {
             .unwrap();
 
         table.commit(tx(12)).await.unwrap();
-        table.finalize(tx(11)).await.unwrap();
+        table.finalize(&tx(11)).await.unwrap();
         let expected: Vec<Row<Value>> = vec![
             vec![3_u64.into(), 10_u64.into(), "bulk".into()].into(),
             vec![4_u64.into(), 10_u64.into(), "bulk".into()].into(),
@@ -3408,8 +3539,7 @@ async fn indexed_queries_resolve_primary_identity_before_predicates() {
             .unwrap();
 
         assert_eq!(rows, expected);
-        table.finalize(tx(12)).await.unwrap();
-        table.sync_all().await.unwrap();
+        table.finalize(&tx(12)).await.unwrap();
         drop(table);
         drop(persistent);
         let cache =
@@ -3471,7 +3601,7 @@ async fn layered_queries_follow_the_complete_supporting_index_order() {
         }
 
         table.commit(tx(10)).await.unwrap();
-        table.finalize(tx(10)).await.unwrap();
+        table.finalize(&tx(10)).await.unwrap();
         for (key, label) in [(3_u64, "a"), (4, "m"), (1, "c")] {
             table
                 .upsert_row(
@@ -3545,7 +3675,7 @@ async fn layered_queries_follow_the_complete_supporting_index_order() {
 
         assert!(first.try_next().await.unwrap().is_none());
         drop(first);
-        table.finalize(tx(12)).await.unwrap();
+        table.finalize(&tx(12)).await.unwrap();
         assert_eq!(table.count(tx(13)).await.unwrap(), 4);
     })
     .await;
@@ -3570,11 +3700,9 @@ async fn nested_slices_intersect_and_reject_disjoint_constraints() {
 
         let first = table.slice(range_in("id", 1_u64.into(), 4_u64.into()), &[], true);
         let wider = first
-            .slice(range_in("id", 0_u64.into(), 6_u64.into()))
+            .slice(range_in("id", 0_u64.into(), 6_u64.into()), &[], false)
             .unwrap();
 
-        assert!(wider.reverse());
-        assert_eq!(wider.order(), first.order());
         let rows = collect_rows(wider.rows(tx(10)).await.unwrap()).await;
         assert_eq!(
             rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>(),
@@ -3590,20 +3718,30 @@ async fn nested_slices_intersect_and_reject_disjoint_constraints() {
         .collect();
 
         assert_eq!(
-            first.slice(at_edge).unwrap().count(tx(10)).await.unwrap(),
+            first
+                .slice(at_edge, &[], false)
+                .unwrap()
+                .count(tx(10))
+                .await
+                .unwrap(),
             1
         );
 
         assert!(
             first
-                .slice(range_in("id", 4_u64.into(), 6_u64.into()))
+                .slice(range_in("id", 4_u64.into(), 6_u64.into()), &[], false)
                 .is_err()
         );
 
-        assert!(first.slice(range_eq("id", 0_u64.into())).is_err());
         assert!(
             first
-                .slice(range_in("id", 2_u64.into(), 2_u64.into()))
+                .slice(range_eq("id", 0_u64.into()), &[], false)
+                .is_err()
+        );
+
+        assert!(
+            first
+                .slice(range_in("id", 2_u64.into(), 2_u64.into()), &[], false)
                 .is_err()
         );
 
@@ -3642,12 +3780,11 @@ async fn selection_metadata_matches_requested_value_order() {
         for (reverse, limit) in [(false, None), (true, Some(1)), (false, Some(0))] {
             let source = table.slice(Range::default(), &[], reverse);
             let selection = match limit {
-                Some(limit) => source.limit(limit).select(columns.clone()),
-                None => source.select(columns.clone()),
+                Some(limit) => source.limit(limit).select(&columns),
+                None => source.select(&columns),
             }
             .unwrap();
 
-            assert_eq!(selection.columns(), columns);
             assert_eq!(
                 selection.schema().columns().cloned().collect::<Vec<_>>(),
                 columns
@@ -3683,14 +3820,20 @@ async fn selection_metadata_matches_requested_value_order() {
 
             let mut visited = Vec::new();
             selection
-                .for_each_row_in_order(tx(10), |row| visited.push(row.into_vec()))
+                .rows(tx(10))
+                .await
+                .unwrap()
+                .try_for_each(|row| {
+                    visited.push(row.into_vec());
+                    futures::future::ready(Ok(()))
+                })
                 .await
                 .unwrap();
 
             assert_eq!(visited, expected);
 
             for binary in [false, true] {
-                let view = crate::Collection::from(super::Table::from(selection.clone()))
+                let view = crate::Collection::from(selection.clone())
                     .into_view(txn.clone())
                     .await
                     .unwrap();
@@ -3699,7 +3842,7 @@ async fn selection_metadata_matches_requested_value_order() {
                     panic!("Table view")
                 };
 
-                let decoded: super::DecodedTablePayload<TestTxn> = if binary {
+                let decoded: super::Table<TestTxn> = if binary {
                     tbon::de::try_decode(txn.clone(), tbon::en::encode(view).unwrap())
                         .await
                         .unwrap()
@@ -3714,10 +3857,9 @@ async fn selection_metadata_matches_requested_value_order() {
                     .unwrap()
                 };
 
-                assert_eq!(decoded.table.schema(), selection.schema());
+                assert_eq!(decoded.schema(), selection.schema());
                 let rows: Vec<_> = decoded
-                    .table
-                    .row_stream(tx(10))
+                    .rows(tx(10))
                     .await
                     .unwrap()
                     .map_ok(|row| row.into_vec())
@@ -3741,7 +3883,7 @@ async fn selection_metadata_matches_requested_value_order() {
         ] {
             let names: Vec<_> = names.into_iter().map(id).collect();
             assert!(table.select(&names).is_err());
-            assert!(table.limit(1).select(names).is_err());
+            assert!(table.limit(1).select(&names).is_err());
         }
 
         assert_eq!(table.count(tx(10)).await.unwrap(), 2);

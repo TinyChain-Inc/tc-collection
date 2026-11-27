@@ -1,6 +1,6 @@
 //! Transactional row ownership over native indexed Tables.
 //!
-//! `KeyOwner` decides visibility and lifecycle; native b-table owners maintain
+//! `Versions` decides visibility and lifecycle; native b-table owners maintain
 //! indexes in canonical storage and each delta. Deletes retain the baseline row
 //! so scans through any index can suppress its old entry before adding the new
 //! row. See TRANSACTIONAL_COLLECTION_CONTRACT.md for caller obligations.
@@ -11,21 +11,24 @@ use std::sync::Arc;
 
 use b_table::{IndexSchema, Range, Row, TableLock};
 use freqfs::DirLock;
-use futures::TryStreamExt;
 use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use tc_error::{TCError, TCResult};
 use tc_ir::{Id, Transact, TxnId};
 use tc_value::{Value, ValueCollator};
 
+use super::Table;
 use super::schema::{TableIndexSchema, TableSchema};
 use super::stream::Rows;
-use super::view::{Limited, Selection, TableSlice};
-use crate::persistence::{CollectionOwner, KeyOwner, PersistentDelta, PointRead, VisibleSnapshot};
+use super::view::TableSlice;
+use crate::persistence::Versions;
+use crate::persistence::storage::{Allocation, Store};
+use crate::stream::ReadSnapshot;
 
 type RowsResult = std::io::Result<BoxStream<'static, Result<Row<Value>, std::io::Error>>>;
-pub(crate) type TableFile<F> = TableLock<TableSchema, TableIndexSchema, ValueCollator, F>;
+type TableFile<F> = TableLock<TableSchema, TableIndexSchema, ValueCollator, F>;
 
-pub(crate) async fn row_stream<F: crate::CollectionFile>(
+async fn row_stream<F: crate::CollectionFile>(
     table: &TableFile<F>,
     range: Range<Id, Value>,
     order: &[Id],
@@ -37,7 +40,7 @@ pub(crate) async fn row_stream<F: crate::CollectionFile>(
     Box::pin(view.select(range, order, reverse, table.schema().primary().columns())).await
 }
 
-pub(crate) async fn upsert<F: crate::CollectionFile>(
+async fn upsert<F: crate::CollectionFile>(
     table: &TableFile<F>,
     key: Vec<Value>,
     values: Vec<Value>,
@@ -57,7 +60,7 @@ pub(crate) async fn upsert<F: crate::CollectionFile>(
         })
 }
 
-pub(crate) async fn delete_row<F: crate::CollectionFile>(
+async fn delete_row<F: crate::CollectionFile>(
     table: &TableFile<F>,
     key: &[Value],
 ) -> std::io::Result<()> {
@@ -65,6 +68,7 @@ pub(crate) async fn delete_row<F: crate::CollectionFile>(
 }
 
 struct Delta<F: crate::CollectionFile> {
+    storage: Arc<Allocation<F>>,
     // A lookup distinguishes untouched (None), deleted (Some(None)), and replaced
     // (Some(Some(row))). Inserts take precedence when both tables contain a key.
     inserts: TableFile<F>,
@@ -72,6 +76,44 @@ struct Delta<F: crate::CollectionFile> {
 }
 
 impl<F: crate::CollectionFile> Delta<F> {
+    async fn load(schema: TableSchema, storage: Arc<Allocation<F>>) -> TCResult<Arc<Self>> {
+        let (inserts, deletes) = {
+            let dir = storage.dir().read().await;
+            (
+                dir.get_dir("inserts")
+                    .cloned()
+                    .ok_or_else(|| freqfs::IntegrityError::invalid_data("missing inserts"))?,
+                dir.get_dir("deletes")
+                    .cloned()
+                    .ok_or_else(|| freqfs::IntegrityError::invalid_data("missing deletes"))?,
+            )
+        };
+
+        let inserts = TableLock::load(schema.clone(), ValueCollator::default(), inserts)?;
+        let deletes = TableLock::load(schema, ValueCollator::default(), deletes)?;
+        inserts.validate().await?;
+        deletes.validate().await?;
+        Ok(Arc::new(Self {
+            storage,
+            inserts,
+            deletes,
+        }))
+    }
+
+    async fn units(&self) -> std::io::Result<u64> {
+        let mut units = 0u64;
+        for table in [&self.inserts, &self.deletes] {
+            let mut rows = row_stream(table, Range::default(), &[], false).await?;
+            while rows.try_next().await?.is_some() {
+                units = units
+                    .checked_add(1)
+                    .ok_or_else(|| std::io::Error::other("native version size overflow"))?;
+            }
+        }
+
+        Ok(units)
+    }
+
     async fn lookup(&self, key: &[Value]) -> std::io::Result<Option<Option<Row<Value>>>> {
         if let Some(row) = self.inserts.get_row(key).await? {
             return Ok(Some(Some(row)));
@@ -85,12 +127,23 @@ impl<F: crate::CollectionFile> Delta<F> {
     }
 
     /// Start an ordinary delta with empty insert and delete storage.
-    async fn create(schema: TableSchema, dir: DirLock<F>) -> std::io::Result<Arc<Self>> {
-        let (inserts, deletes) = crate::persistence::create_delta_dirs(&dir).await?;
+    async fn create(
+        schema: TableSchema,
+        storage: Arc<Allocation<F>>,
+    ) -> std::io::Result<Arc<Self>> {
+        let (inserts, deletes) = {
+            let mut dir = storage.dir().write().await;
+            (
+                dir.get_or_create_dir("inserts".to_owned())?,
+                dir.get_or_create_dir("deletes".to_owned())?,
+            )
+        };
+
         Ok(Arc::new(Self {
-            inserts: TableLock::create(schema.clone(), crate::persistence::value_order(), inserts)
+            storage,
+            inserts: TableLock::create(schema.clone(), tc_value::ValueCollator::default(), inserts)
                 .await?,
-            deletes: TableLock::create(schema, crate::persistence::value_order(), deletes).await?,
+            deletes: TableLock::create(schema, tc_value::ValueCollator::default(), deletes).await?,
         }))
     }
 
@@ -141,39 +194,25 @@ impl<F: crate::CollectionFile> Delta<F> {
     }
 }
 
-impl<F: crate::CollectionFile> PersistentDelta for Delta<F> {
-    type Native = TableFile<F>;
-
-    async fn apply_to(&self, persistent: &TableFile<F>) -> std::io::Result<()> {
-        let key_len = persistent.schema().key().len();
-        let mut deletes = row_stream(&self.deletes, Range::default(), &[], false).await?;
-        while let Some(row) = deletes.try_next().await? {
-            delete_row(persistent, &row[..key_len]).await?;
-        }
-
-        drop(deletes);
-        let mut inserts = row_stream(&self.inserts, Range::default(), &[], false).await?;
-        while let Some(row) = inserts.try_next().await? {
-            let mut key = row.into_vec();
-            let values = key.split_off(key_len);
-            upsert(persistent, key, values).await?;
-        }
-
-        Ok(())
-    }
-}
-
 pub struct PersistentTable<Txn: crate::StorageContext> {
-    owner: Arc<KeyOwner<Delta<Txn::File>>>,
-    schema: TableSchema,
+    canonical: Arc<TableFile<Txn::File>>,
+    store: Arc<Store<Txn::File>>,
+    versions: Versions<Delta<Txn::File>>,
+    semaphore: txn_lock::semaphore::Semaphore<
+        TxnId,
+        b_tree::RangeCollator<ValueCollator>,
+        txn_lock::set::Range<Vec<Value>>,
+    >,
     txn: PhantomData<fn() -> Txn>,
 }
 
 impl<Txn: crate::StorageContext> Clone for PersistentTable<Txn> {
     fn clone(&self) -> Self {
         Self {
-            owner: self.owner.clone(),
-            schema: self.schema.clone(),
+            canonical: self.canonical.clone(),
+            store: self.store.clone(),
+            versions: self.versions.clone(),
+            semaphore: self.semaphore.clone(),
             txn: PhantomData,
         }
     }
@@ -181,103 +220,160 @@ impl<Txn: crate::StorageContext> Clone for PersistentTable<Txn> {
 
 impl<Txn: crate::StorageContext> fmt::Debug for PersistentTable<Txn> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state = self.owner.read_state();
-
         f.debug_struct("PersistentTable")
-            .field("committed_len", &state.committed.len())
-            .field("pending_len", &state.pending.len())
-            .field("finalized", &state.finalized)
+            .field("schema", &self.schema())
             .finish()
     }
 }
 
 impl<Txn: crate::StorageContext> PersistentTable<Txn> {
+    /// Acquire ordering capacity and capture visibility in one admission operation.
+    async fn read_snapshot(
+        &self,
+        id: TxnId,
+        range: txn_lock::set::Range<Vec<Value>>,
+    ) -> TCResult<ReadSnapshot<Delta<Txn::File>>> {
+        self.versions.check_readable(id)?;
+        let permit = self.semaphore.read(id, range).await?;
+        let snapshot = self.versions.visible_snapshot(id)?;
+        Ok((permit, snapshot))
+    }
+
+    fn try_read_snapshot(
+        &self,
+        id: TxnId,
+        range: txn_lock::set::Range<Vec<Value>>,
+    ) -> TCResult<ReadSnapshot<Delta<Txn::File>>> {
+        self.versions.check_readable(id)?;
+        let permit = self.semaphore.try_read(id, range)?;
+        let snapshot = self.versions.visible_snapshot(id)?;
+        Ok((permit, snapshot))
+    }
+
+    fn try_acquire_write_permit(
+        &self,
+        id: TxnId,
+        range: txn_lock::set::Range<Vec<Value>>,
+    ) -> TCResult<txn_lock::semaphore::PermitWrite<txn_lock::set::Range<Vec<Value>>>> {
+        self.versions
+            .reserve_ordered_write(id, || self.semaphore.try_write(id, range))
+    }
+
     /// Create in empty caller-delegated storage.
     pub async fn try_new(
         persistent_dir: DirLock<Txn::File>,
         schema: TableSchema,
     ) -> std::io::Result<Self> {
+        let owner = Self::unpublished(persistent_dir, schema).await?;
+        owner.finish_creation().await?;
+        Ok(owner)
+    }
+
+    pub(super) async fn unpublished(
+        persistent_dir: DirLock<Txn::File>,
+        schema: TableSchema,
+    ) -> std::io::Result<Self> {
+        let store = Store::create(persistent_dir)
+            .await
+            .map_err(std::io::Error::other)?;
+
         let persistent = TableLock::create(
-            schema.clone(),
-            crate::persistence::value_order(),
-            persistent_dir,
+            schema,
+            tc_value::ValueCollator::default(),
+            store.base().clone(),
         )
         .await?;
 
-        Ok(Self::from_store(schema, persistent))
+        Ok(Self::from_store(persistent, store, Versions::new()))
     }
 
     pub async fn load(
         persistent_dir: DirLock<Txn::File>,
         schema: TableSchema,
     ) -> std::io::Result<Self> {
+        let store = Store::load(persistent_dir)
+            .await
+            .map_err(std::io::Error::other)?;
+
         let persistent = TableLock::load(
             schema.clone(),
-            crate::persistence::value_order(),
-            persistent_dir,
+            tc_value::ValueCollator::default(),
+            store.base().clone(),
         )?;
 
         persistent.validate().await?;
-        Ok(Self::from_store(schema, persistent))
+        let versions = Versions::load(&store, |storage| {
+            let schema = schema.clone();
+            async move {
+                let delta = Delta::load(schema, storage).await?;
+                let units = delta.units().await?;
+                Ok((delta, units))
+            }
+        })
+        .await
+        .map_err(std::io::Error::other)?;
+
+        Ok(Self::from_store(persistent, store, versions))
     }
 
-    fn from_store(schema: TableSchema, persistent: TableFile<Txn::File>) -> Self {
-        let ranges = *persistent.ordering().range_collator();
+    fn from_store(
+        persistent: TableFile<Txn::File>,
+        store: Arc<Store<Txn::File>>,
+        versions: Versions<Delta<Txn::File>>,
+    ) -> Self {
+        let ranges = *persistent.collator();
         Self {
-            owner: Arc::new(CollectionOwner::new(persistent, ranges)),
-            schema,
+            canonical: Arc::new(persistent),
+            store,
+            versions,
+            semaphore: txn_lock::semaphore::Semaphore::new(ranges),
             txn: PhantomData,
         }
     }
 
-    pub fn schema(&self) -> &TableSchema {
-        &self.schema
+    pub(super) async fn finish_creation(&self) -> std::io::Result<()> {
+        self.store.initialize().await.map_err(std::io::Error::other)
     }
 
-    pub(crate) async fn load_literal_row(&self, mut row: Vec<Value>) -> std::io::Result<()> {
-        if row.len() != self.schema.column_count() {
+    pub(super) async fn recover<Replay, Replayed>(&self, id: TxnId, replay: Replay) -> TCResult<()>
+    where
+        Replay: FnOnce() -> Replayed + Send,
+        Replayed: std::future::Future<Output = TCResult<()>> + Send,
+    {
+        self.versions
+            .recover(id, replay, || tc_ir::Transact::commit(self, id))
+            .await
+    }
+
+    pub fn schema(&self) -> &TableSchema {
+        self.canonical.schema()
+    }
+
+    pub(super) async fn load_literal_row(&self, mut row: Vec<Value>) -> std::io::Result<()> {
+        if row.len() != self.schema().column_count() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "invalid Table row",
             ));
         }
 
-        let values = row.split_off(self.schema.key().len());
-        let persistent = { self.owner.read_state().persistent.clone() };
-
-        upsert(&persistent, row, values).await
+        let values = row.split_off(self.schema().key().len());
+        upsert(&self.canonical, row, values).await
     }
 
     /// Inspect an unpublished copy target without registering transaction reads.
     pub(super) async fn contains_literal_key(&self, key: &[Value]) -> std::io::Result<bool> {
-        let persistent = self.owner.read_state().persistent.clone();
-        persistent.contains(key).await
+        self.canonical.contains(key).await
     }
 
     /// Sync the canonical (persistent) state to disk.
     ///
-    /// Buffered writeback does not acknowledge durability. Pending workspace
-    /// and committed workspace deltas are not included.
-    pub async fn sync(&self) -> std::io::Result<()> {
-        let persistent = self.owner.read_state().persistent.clone();
-        persistent.sync().await?;
-        Ok(())
-    }
-
-    /// Durably synchronize materialized canonical storage; pending deltas are excluded.
-    pub async fn sync_all(&self) -> std::io::Result<()> {
-        let persistent = self.owner.read_state().persistent.clone();
-        persistent.sync_all().await?;
-        Ok(())
-    }
-
     pub async fn upsert_row(&self, txn: &Txn, key: Vec<Value>, values: Vec<Value>) -> TCResult<()> {
         let txn_id = txn.id();
-        let key = b_table::Schema::validate_key(&self.schema, key)?;
-        let values = b_table::Schema::validate_values(&self.schema, values)?;
+        let key = b_table::Schema::validate_key(self.schema(), key)?;
+        let values = b_table::Schema::validate_values(self.schema(), values)?;
 
         let _permit = self
-            .owner
             .try_acquire_write_permit(txn_id, txn_lock::set::Range::One(Arc::new(key.clone())))?;
 
         let pending = self.pending_for_key(txn, &key).await?;
@@ -293,17 +389,13 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         values: Vec<Value>,
     ) -> tc_error::TCResult<()> {
         let txn_id = txn.id();
-        let key = b_table::Schema::validate_key(&self.schema, key)?;
-        let values = b_table::Schema::validate_values(&self.schema, values)?;
+        let key = b_table::Schema::validate_key(self.schema(), key)?;
+        let values = b_table::Schema::validate_values(self.schema(), values)?;
 
         let _permit = self
-            .owner
             .try_acquire_write_permit(txn_id, txn_lock::set::Range::One(Arc::new(key.clone())))?;
 
-        if Self::resolve_row(self.owner.point_read(txn_id)?, &key)
-            .await?
-            .is_some()
-        {
+        if self.resolve_row(txn_id, &key, true).await?.is_some() {
             return Err(tc_error::TCError::bad_request(format!(
                 "cannot insert Table row: key {key:?} already exists"
             )));
@@ -319,10 +411,9 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
 
     pub async fn delete_row(&self, txn: &Txn, key: Vec<Value>) -> TCResult<()> {
         let txn_id = txn.id();
-        let key = b_table::Schema::validate_key(&self.schema, key)?;
+        let key = b_table::Schema::validate_key(self.schema(), key)?;
 
         let _permit = self
-            .owner
             .try_acquire_write_permit(txn_id, txn_lock::set::Range::One(Arc::new(key.clone())))?;
 
         let pending = self.pending_for_key(txn, &key).await?;
@@ -332,12 +423,13 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
     }
 
     pub async fn read_row(&self, txn_id: TxnId, key: &[Value]) -> TCResult<Option<Row<Value>>> {
+        self.versions.check_readable(txn_id)?;
         let _permit = self
-            .owner
-            .acquire_read_permit(txn_id, txn_lock::set::Range::One(Arc::new(key.to_vec())))
+            .semaphore
+            .read(txn_id, txn_lock::set::Range::One(Arc::new(key.to_vec())))
             .await?;
 
-        Self::resolve_row(self.owner.point_read(txn_id)?, key).await
+        self.resolve_row(txn_id, key, true).await
     }
 
     pub async fn contains_row(&self, txn_id: TxnId, key: &[Value]) -> TCResult<bool> {
@@ -401,12 +493,10 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         order: Vec<Id>,
         reverse: bool,
     ) -> TCResult<Rows> {
-        let permit = self
-            .owner
-            .acquire_read_permit(txn_id, txn_lock::set::Range::All)
+        let (permit, snapshot) = self
+            .read_snapshot(txn_id, txn_lock::set::Range::All)
             .await?;
 
-        let snapshot = self.owner.visible_snapshot(txn_id)?;
         let stream = self.visible_rows(snapshot, range, &order, reverse).await?;
 
         Ok(Rows::new(stream, permit))
@@ -416,26 +506,30 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
     ///
     /// The view is structural — it holds no row data. Row streaming, count,
     /// and containment checks delegate to this table with the view's bounds.
-    pub fn slice(&self, range: Range<Id, Value>, order: &[Id], reverse: bool) -> TableSlice<Txn> {
-        TableSlice::new(self.clone(), range, order.to_vec(), reverse)
+    pub fn slice(&self, range: Range<Id, Value>, order: &[Id], reverse: bool) -> Table<Txn> {
+        Table::Slice(TableSlice::new(
+            self.clone(),
+            range,
+            order.to_vec(),
+            reverse,
+        ))
     }
 
     /// Create an ordered view over this table using the given `columns`.
     ///
     /// Equivalent to `slice(Range::default(), columns, reverse)`.
-    pub fn order_by(&self, columns: &[Id], reverse: bool) -> TableSlice<Txn> {
+    pub fn order_by(&self, columns: &[Id], reverse: bool) -> Table<Txn> {
         self.slice(Range::default(), columns, reverse)
     }
 
     /// Create a row-cap view that yields at most `n` rows.
-    pub fn limit(&self, n: u64) -> Limited<Txn> {
+    pub fn limit(&self, n: u64) -> Table<Txn> {
         self.slice(Range::default(), &[], false).limit(n)
     }
 
     /// Create a column-projection view that yields only `columns`.
-    pub fn select(&self, columns: &[Id]) -> tc_error::TCResult<Selection<Txn>> {
-        self.slice(Range::default(), &[], false)
-            .select(columns.to_vec())
+    pub fn select(&self, columns: &[Id]) -> tc_error::TCResult<Table<Txn>> {
+        self.slice(Range::default(), &[], false).select(columns)
     }
 
     /// Update all visible rows in `range` at `txn_id` with the given column
@@ -452,15 +546,15 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
         values: tc_ir::Map<Value>,
     ) -> TCResult<()> {
         let txn_id = txn.id();
-        let value_columns = self.schema.values();
+        let value_columns = self.schema().values();
         for (name, value) in &values {
             let position = value_columns
                 .iter()
                 .position(|column| column == name)
                 .ok_or_else(|| TCError::bad_request(format!("cannot update key column {name}")))?;
 
-            let expected = &b_table::Schema::primary(&self.schema).column_types()
-                [self.schema.key().len() + position];
+            let expected = &b_table::Schema::primary(self.schema()).column_types()
+                [self.schema().key().len() + position];
 
             if !expected.accepts(&value.class()) {
                 return Err(TCError::bad_request(format!(
@@ -469,16 +563,14 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
             }
         }
 
-        let key_len = self.schema.key().len();
+        let key_len = self.schema().key().len();
 
-        let _permit = self
-            .owner
-            .try_acquire_write_permit(txn_id, txn_lock::set::Range::All)?;
+        let _permit = self.try_acquire_write_permit(txn_id, txn_lock::set::Range::All)?;
 
-        let snapshot = self.owner.visible_snapshot(txn_id)?;
+        let snapshot = self.versions.visible_snapshot(txn_id)?;
         let staged = Box::pin(Delta::create(
-            self.schema.clone(),
-            txn.subcontext_unique().context().await?,
+            self.schema().clone(),
+            self.store.allocate().await?,
         ))
         .await?;
 
@@ -517,16 +609,14 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
     /// in memory.
     pub async fn truncate(&self, txn: &Txn, range: Range<Id, Value>) -> TCResult<()> {
         let txn_id = txn.id();
-        let key_len = self.schema.key().len();
+        let key_len = self.schema().key().len();
 
-        let _permit = self
-            .owner
-            .try_acquire_write_permit(txn_id, txn_lock::set::Range::All)?;
+        let _permit = self.try_acquire_write_permit(txn_id, txn_lock::set::Range::All)?;
 
-        let snapshot = self.owner.visible_snapshot(txn_id)?;
+        let snapshot = self.versions.visible_snapshot(txn_id)?;
         let staged = Box::pin(Delta::create(
-            self.schema.clone(),
-            txn.subcontext_unique().context().await?,
+            self.schema().clone(),
+            self.store.allocate().await?,
         ))
         .await?;
 
@@ -547,13 +637,13 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
 
     async fn visible_rows(
         &self,
-        snapshot: VisibleSnapshot<Delta<Txn::File>>,
+        snapshot: Vec<Arc<Delta<Txn::File>>>,
         range: Range<Id, Value>,
         order: &[Id],
         reverse: bool,
     ) -> RowsResult {
         let (base, collator) = {
-            let native = snapshot.persistent.read().await;
+            let native = self.canonical.read().await;
             Box::pin(native.rows(range.clone(), order, reverse)).await?
         };
 
@@ -561,30 +651,21 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
             *current = incoming;
         });
 
-        // Oldest committed layer first, then this transaction's pending layer:
-        // delete its indexed baseline entries before merging replacement rows.
-        // Check retirement on both sides of I/O because finalization can move a
-        // layer into canonical storage while native streams are being opened.
-        for (id, delta) in snapshot.deltas {
-            if snapshot.visibility.retired(id) {
-                continue;
-            }
-
-            let sources = async {
-                let deletes = row_stream(&delta.deletes, range.clone(), order, reverse).await?;
-                let inserts = row_stream(&delta.inserts, range.clone(), order, reverse).await?;
-                Ok::<_, std::io::Error>((deletes, inserts))
-            }
-            .await;
-
-            if !snapshot.visibility.retired(id) {
-                let (deletes, inserts) = sources?;
-                visible.difference(deletes);
-                visible.merge(inserts);
-            }
+        // Immutable layers are pinned until native streams have been dropped.
+        for delta in &snapshot {
+            let deletes = row_stream(&delta.deletes, range.clone(), order, reverse).await?;
+            let inserts = row_stream(&delta.inserts, range.clone(), order, reverse).await?;
+            visible.difference(deletes);
+            visible.merge(inserts);
         }
 
-        Ok(visible.into_stream())
+        Ok(visible
+            .into_stream()
+            .map(move |item| {
+                let _ = &snapshot;
+                item
+            })
+            .boxed())
     }
 
     /// Preserve the pre-transaction row once, using the ordinary visibility owner.
@@ -597,10 +678,8 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
 
         // Preserve the original indexed row only on the first change. Later
         // upserts/deletes edit pending inserts while keeping this baseline marker.
-        if let Some(mut row) =
-            Self::resolve_row(self.owner.point_read(txn.id())?.committed(), key).await?
-        {
-            let values = row.drain(self.schema.key().len()..).collect();
+        if let Some(mut row) = self.resolve_row(txn.id(), key, false).await? {
+            let values = row.drain(self.schema().key().len()..).collect();
             pending.add_to_deletes(row.into_vec(), values).await?;
         }
 
@@ -608,77 +687,83 @@ impl<Txn: crate::StorageContext> PersistentTable<Txn> {
     }
 
     async fn resolve_row(
-        mut read: PointRead<Delta<Txn::File>>,
+        &self,
+        txn_id: TxnId,
         key: &[Value],
+        include_pending: bool,
     ) -> TCResult<Option<Row<Value>>> {
-        if let Some(row) = read
-            .resolve(|delta| async move { delta.lookup(key).await })
+        if let Some(row) = self
+            .versions
+            .lookup(txn_id, include_pending, |delta| async move {
+                delta.lookup(key).await
+            })
             .await?
         {
             return Ok(row);
         }
 
-        Ok(read.canonical()?.get_row(key).await?)
+        Ok(self.canonical.get_row(key).await?)
     }
 
     async fn pending_delta_for_txn(&self, txn: &Txn) -> TCResult<Arc<Delta<Txn::File>>> {
-        self.owner
-            .pending(txn.id(), |native| {
-                let schema = native.schema().clone();
+        self.versions
+            .pending(txn.id(), || {
+                let schema = self.canonical.schema().clone();
                 async move {
-                    let dir = txn.subcontext_unique().context().await?;
-                    Ok(Delta::create(schema, dir).await?)
+                    let storage = self.store.allocate().await?;
+                    Ok(Delta::create(schema, storage).await?)
                 }
             })
             .await
     }
 }
 
-impl<Txn: crate::StorageContext> PersistentTable<Txn> {
-    /// Commit the pending delta at `txn_id`.
-    ///
-    /// The caller must finish this transaction's mutations first. Immutable result
-    /// streams may retain their snapshots across visibility publication.
-    /// Returns `Outdated` at or before the finalized frontier.
-    pub async fn commit(&self, txn_id: TxnId) -> TCResult<()> {
-        self.owner.commit(txn_id)
-    }
-
-    pub fn rollback(&self, txn_id: TxnId) -> TCResult<()> {
-        self.owner.rollback(txn_id)
-    }
-
-    /// Finalize all committed deltas up to `txn_id` into persistent state.
-    ///
-    /// Finalize is monotonic. A stale finalize (≤ frontier) is a no-op.
-    ///
-    /// The caller serializes lifecycle decisions and finishes operations through the
-    /// cutoff first. Later transactions may retain read permits; merging uses native
-    /// storage locks without acquiring a new semaphore write reservation.
-    pub async fn finalize(&self, txn_id: TxnId) -> TCResult<()> {
-        self.owner.finalize(txn_id).await
-    }
-}
-
 impl<Txn: crate::StorageContext> Transact for PersistentTable<Txn> {
-    async fn commit(&self, txn_id: TxnId) -> tc_error::TCResult<()> {
-        PersistentTable::commit(self, txn_id).await
+    async fn commit(&self, txn_id: TxnId) -> TCResult<()> {
+        // Persist the native delta and receipt before publishing visibility and
+        // releasing this transaction's reservations.
+        self.versions
+            .commit_durable(
+                &self.store,
+                txn_id,
+                |delta| async move { Ok((delta.storage.clone(), delta.units().await?)) },
+                || self.semaphore.finalize(&txn_id, false).map_err(Into::into),
+            )
+            .await
     }
 
-    fn rollback(
-        &self,
-        txn_id: &TxnId,
-    ) -> impl std::future::Future<Output = tc_error::TCResult<()>> + Send {
-        let txn_id = *txn_id;
-        async move { PersistentTable::rollback(self, txn_id) }
+    async fn rollback(&self, txn_id: &TxnId) -> TCResult<()> {
+        let discarded = self.versions.rollback(*txn_id, || {
+            self.semaphore.finalize(txn_id, false).map_err(Into::into)
+        })?;
+
+        if let Some(delta) = discarded {
+            let allocation = delta.storage.id().clone();
+            drop(delta);
+            self.store.discard(&allocation).await?;
+        }
+
+        Ok(())
     }
 
-    fn finalize(
-        &self,
-        txn_id: &TxnId,
-    ) -> impl std::future::Future<Output = tc_error::TCResult<()>> + Send {
-        let txn_id = *txn_id;
-        async move { PersistentTable::finalize(self, txn_id).await }
+    async fn finalize(&self, txn_id: &TxnId) -> TCResult<()> {
+        // The caller serializes cutoffs. Merge immutable native deltas before
+        // atomically publishing the new frontier and releasing old reservations.
+        self.versions
+            .finalize_durable(
+                &self.store,
+                *txn_id,
+                |older, newer, _complete_prefix| async move {
+                    let storage = self.store.allocate().await?;
+                    let output = Delta::create(self.schema().clone(), storage.clone()).await?;
+                    older.apply_to_pending(&output).await?;
+                    newer.apply_to_pending(&output).await?;
+                    let units = output.units().await?;
+                    Ok((output, Some((storage, units))))
+                },
+                || self.semaphore.finalize(txn_id, true).map_err(Into::into),
+            )
+            .await
     }
 }
 
@@ -688,40 +773,36 @@ impl<Txn: crate::StorageContext> crate::Restore for PersistentTable<Txn> {
     /// Restore through a staged indexed-row delta; see [`crate::Restore`].
     async fn restore(&self, txn: &Txn, source: &Self) -> tc_error::TCResult<()> {
         let id = txn.id();
-        self.owner.read_state().assert_writable(id)?;
-        if Arc::ptr_eq(&self.owner, &source.owner) {
+        self.versions.check_writable(id)?;
+        if Arc::ptr_eq(&self.canonical, &source.canonical) {
             return Ok(());
         }
 
-        if !self.schema.same_semantics(&source.schema) {
+        if !self.schema().same_semantics(source.schema()) {
             return Err(tc_error::TCError::bad_request(
                 "Table restoration schema mismatch",
             ));
         }
 
-        let _permit = self
-            .owner
-            .try_acquire_write_permit(id, txn_lock::set::Range::All)?;
+        let _permit = self.try_acquire_write_permit(id, txn_lock::set::Range::All)?;
 
-        let base = self.owner.committed_snapshot(id)?;
+        let base = self.versions.committed_snapshot(id)?;
 
         // Build a complete replacement relative to committed state. Excluding
         // the old pending delta lets publication replace it instead of composing
         // the restored rows with earlier writes in this transaction.
 
-        let source_permit = source
-            .owner
-            .try_acquire_read_permit(id, txn_lock::set::Range::All)?;
+        let (source_permit, source_snapshot) =
+            source.try_read_snapshot(id, txn_lock::set::Range::All)?;
 
-        let source_snapshot = source.owner.visible_snapshot(id)?;
         let stream = source
             .visible_rows(source_snapshot, Range::default(), &[], false)
             .await?;
 
         let mut rows = Rows::new(stream, source_permit);
-        let workspace = txn.subcontext_unique().context().await?;
-        let delta = Delta::create(self.schema.clone(), workspace).await?;
-        let key_len = self.schema.key().len();
+        let storage = self.store.allocate().await?;
+        let delta = Delta::create(self.schema().clone(), storage).await?;
+        let key_len = self.schema().key().len();
         let mut baseline = self
             .visible_rows(base, Range::default(), &[], false)
             .await?;
@@ -743,10 +824,7 @@ impl<Txn: crate::StorageContext> crate::Restore for PersistentTable<Txn> {
         drop(rows);
         // Publish only after both input streams have released their native guards.
         // A decision made during staging must still reject this replacement.
-        let mut state = self.owner.write_state();
-        state.assert_writable(id)?;
-        state.pending.insert(id, delta);
-        Ok(())
+        self.versions.replace_pending(id, delta, |_| Ok(()))
     }
 }
 

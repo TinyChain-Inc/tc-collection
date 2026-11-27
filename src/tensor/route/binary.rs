@@ -1,8 +1,8 @@
-//! Binary Tensor terminal handlers.
+//! Binary Tensor handlers accept either a scalar or a Tensor as their right operand.
 
+use crate::{CollectionState, StorageContext};
 use super::super::Tensor;
 use super::{no_parameters, parameter, state};
-use crate::{CollectionState, StorageContext};
 
 macro_rules! binary_handler {
     ($($handler:ident => $method:ident, $scalar:ident);* $(;)?) => {

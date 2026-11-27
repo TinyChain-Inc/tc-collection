@@ -76,7 +76,7 @@ pub(super) async fn run() {
                 .await
                 .unwrap();
 
-                let geometry = native.storage_geometry();
+                let geometry = native.storage_geometry().clone();
                 native.sync_all().await.unwrap();
                 drop(native);
                 let tensor = Tensor::<Txn>::load(dir, schema).boxed().await.unwrap();

@@ -2,15 +2,81 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use fensor::TensorSource;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use tc_ir::{Transact, Transaction};
 
-use super::{TOUCHED_PAGE_ENTRIES, observation};
-use crate::tensor::Data;
+use super::BlockSource::{Canonical, Zero};
+use super::{Delta, ZERO_BATCH_SIZE, observation};
+use crate::tensor::Tensor;
 use crate::tensor::tests::{create, setup};
+use crate::{Restore, StorageContext};
 
-// Synthetic layers use real shared visibility state; injected completion models
-// canonical application before the finalized frontier is advanced.
+impl<F: crate::CollectionFile, T: fensor::TensorElement> super::Delta<F, T> {
+    fn zeros(&self) -> &super::Zeros<F> {
+        self.zeros.as_ref().expect("partial delta fixture")
+    }
+}
+
+impl<Txn: crate::StorageContext, T: fensor::TensorElement> super::TensorBase<Txn, T>
+where
+    Txn::File: fensor::TensorFileEntry<T>,
+{
+    pub(in crate::tensor) fn canonical(&self) -> &fensor::Tensor<Txn::File, T> {
+        &self.canonical
+    }
+}
+
+pub(in crate::tensor) async fn corrupt_block(
+    owner: &super::TensorBase<crate::test::TestTxn, f64>,
+    id: tc_ir::TxnId,
+    coord: &[u64],
+) {
+    let block = owner.geometry().block_position(coord).unwrap().0;
+    let snapshot = owner.versions.visible_snapshot(id).unwrap();
+    let delta = snapshot.last().unwrap();
+    let name = if delta.is_whole() {
+        "replacement"
+    } else {
+        "payload"
+    };
+    let payload = delta
+        .storage
+        .dir()
+        .read()
+        .await
+        .get_dir(name)
+        .cloned()
+        .unwrap();
+
+    let values = payload.read().await.get_dir("values").cloned().unwrap();
+    let primary = values.read().await.get_dir("primary").cloned().unwrap();
+    let files: Vec<_> = primary.read().await.files().cloned().collect();
+    let mut corrupted = false;
+    for file in files {
+        let mut node = file.write::<crate::TensorSparseNode<f64>>().await.unwrap();
+        let b_tree::Node::Leaf(rows) = &mut *node else {
+            continue;
+        };
+
+        if let Some(row) = rows
+            .iter_mut()
+            .find(|row| row[0] == fensor::SparseCell::Key(block))
+        {
+            row[1] = fensor::SparseCell::Key(99);
+            corrupted = true;
+        }
+    }
+
+    assert!(corrupted);
+}
+
+// Standalone delta fixtures are never published into a collection's store.
+fn allocation(
+    dir: freqfs::DirLock<crate::PersistentFile>,
+) -> Arc<crate::persistence::storage::Allocation<crate::PersistentFile>> {
+    Arc::new(crate::persistence::storage::Allocation::fixture(dir))
+}
+
 fn test_snapshot<T: fensor::TensorElement>(
     canonical: fensor::Tensor<crate::PersistentFile, T>,
     deltas: Vec<Arc<super::Delta<crate::PersistentFile, T>>>,
@@ -18,16 +84,11 @@ fn test_snapshot<T: fensor::TensorElement>(
 where
     crate::PersistentFile: fensor::TensorFileEntry<T>,
 {
-    let owner = super::Owner::<crate::test::TestTxn, T>::new(canonical);
-    for (index, delta) in deltas.into_iter().enumerate() {
-        owner
-            .core
-            .write_state()
-            .committed
-            .insert(crate::test::tx(index as u16 + 1), Some(delta));
+    super::Snapshot {
+        canonical: Arc::new(canonical),
+        deltas: deltas.into(),
+        _permit: None,
     }
-
-    owner.snapshot(crate::test::tx(u16::MAX), None).unwrap()
 }
 
 fn assert_length_integrity(error: fensor::Error) {
@@ -43,12 +104,72 @@ fn assert_length_integrity(error: fensor::Error) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn batched_reads_select_sources_and_preserve_materialization_handoff() {
+async fn reopen_rejects_overlapping_payload_and_zero_override() {
+    Box::pin(async {
+        let (_, txn) = setup().await;
+        let (tensor, dir) = create(&txn, vec![4].into(), true, 2).await;
+        let schema = tensor.schema().unwrap();
+        tensor.write_value(&txn, &[1], 7.0.into()).await.unwrap();
+        tensor.commit(txn.id()).await.unwrap();
+
+        let Tensor::F64(value) = &tensor else {
+            unreachable!()
+        };
+
+        let owner = value.base().unwrap();
+        let versions = owner.versions.visible_snapshot(txn.id()).unwrap();
+        let delta = versions.last().unwrap();
+        assert!(delta.zeros().write().await.insert(vec![1]).await.unwrap());
+        delta.zeros().sync().await.unwrap();
+
+        let path = dir.read().await.path().to_owned();
+        let cache = freqfs::Cache::<crate::PersistentFile>::new(
+            128 * 1024,
+            None,
+            0,
+            std::time::Duration::from_secs(3),
+        );
+        let reopened =
+            Tensor::<crate::test::TestTxn>::load(cache.load(path).unwrap(), schema).await;
+        assert!(reopened.err().unwrap().requires_recovery());
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn immutable_access_does_not_wait_for_transaction_state() {
+    let (_root, txn) = setup().await;
+    let (tensor, _) = create(&txn, vec![4].into(), true, 2).await;
+    let Tensor::F64(value) = &tensor else {
+        unreachable!()
+    };
+
+    let owner = value.base().unwrap();
+    let alias = owner.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let (worker, result) = {
+        let _state = owner.versions.hold_state_for_test();
+        let worker = tokio::spawn(async move {
+            assert_eq!(alias.geometry().schema().shape().as_slice(), &[4]);
+            alias.canonical().sync().await.unwrap();
+            alias.canonical().sync_all().await.unwrap();
+            sender.send(()).unwrap();
+        });
+
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(3));
+        (worker, result)
+    };
+
+    worker.await.unwrap();
+    assert!(result.is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn batched_reads_select_sources_and_preserve_errors() {
     use fensor::{Layout, StorageGeometry, TensorRead, TensorSchema, TensorTransform, TensorView};
     use futures::{FutureExt, TryStreamExt};
 
     use crate::StorageContext;
-    use crate::persistence::PersistentDelta;
 
     const ROOT: &str = "00000000-0000-0000-0000-000000000000";
 
@@ -122,10 +243,9 @@ async fn batched_reads_select_sources_and_preserve_materialization_handoff() {
                     }
                 }
 
-                let first = super::Delta::create(
-                    txn.subcontext_unique().context().await.unwrap(),
-                    geometry.clone(),
-                )
+                let first = super::Delta::create(allocation(txn.subcontext_unique().context().await.unwrap()),
+                    geometry.clone(), false,
+                    )
                 .await
                 .unwrap();
 
@@ -133,22 +253,24 @@ async fn batched_reads_select_sources_and_preserve_materialization_handoff() {
                     let mut block = vec![0.; geometry.block_len(id).unwrap()];
                     block.fill(value);
 
-                    first.write(id, block).await.unwrap();
+                    first.write(id, Some(block)).await.unwrap();
                 }
 
-                let second = super::Delta::create(
-                    txn.subcontext_unique().context().await.unwrap(),
-                    geometry.clone(),
-                )
+                let second = super::Delta::create(allocation(txn.subcontext_unique().context().await.unwrap()),
+                    geometry.clone(), false,
+                    )
                 .await
                 .unwrap();
 
-                second.write(0, vec![0.; 4]).await.unwrap();
+                second.write(0, Some(vec![0.; 4])).await.unwrap();
                 let mut replacement = vec![0.; geometry.block_len(1).unwrap()];
                 replacement[0] = 21.;
-                second.write(1, replacement).await.unwrap();
+                second.write(1, Some(replacement)).await.unwrap();
                 let last = geometry.block_count() - 1;
-                second.write(last, vec![24.; geometry.block_len(last).unwrap()]).await.unwrap();
+                second
+                    .write(last, Some(vec![24.; geometry.block_len(last).unwrap()]))
+                    .await
+                    .unwrap();
                 let snapshot = test_snapshot(canonical.clone(), vec![first.clone(), second.clone()]);
 
                 let view = TensorView::new(snapshot.clone());
@@ -176,13 +298,13 @@ async fn batched_reads_select_sources_and_preserve_materialization_handoff() {
                 let blocks: Vec<_> = repeated.read_blocks().unwrap().try_collect().await.unwrap();
                 assert_eq!(blocks.concat(), [expected[14], expected[10], expected[14], expected[4], expected[0], expected[4], expected[14], expected[10], expected[14]]);
 
-                let payload = second._workspace.read().await.get_dir("payload").cloned().unwrap();
+                let payload = second.storage.dir().read().await.get_dir("payload").cloned().unwrap();
                 let values = payload.read().await.get_dir("values").cloned().unwrap();
                 let primary = values.read().await.get_dir("primary").cloned().unwrap();
                 let root = primary.read().await.get_file(ROOT).cloned().unwrap();
                 for extra in [1., f64::NAN, f64::INFINITY] {
                     let saved = {
-                        let mut node = root.write::<fensor::SparseNode<f64>>().await.unwrap();
+                        let mut node = root.write::<crate::TensorSparseNode<f64>>().await.unwrap();
                         let saved = node.clone();
                         let b_tree::Node::Leaf(rows) = &mut *node else { panic!("small fixture leaf") };
                         let row = rows.iter_mut().find(|row| row[0] == fensor::SparseCell::Key(1)).unwrap();
@@ -194,55 +316,19 @@ async fn batched_reads_select_sources_and_preserve_materialization_handoff() {
                     assert_length_integrity(view.read_value(&[0, 4]).await.unwrap_err());
                     assert_length_integrity(view.read_blocks().unwrap().try_concat().await.unwrap_err());
                     assert_length_integrity(snapshot.read_logical_block(1).await.unwrap_err());
-                    *root.write::<fensor::SparseNode<f64>>().await.unwrap() = saved;
+                    *root.write::<crate::TensorSparseNode<f64>>().await.unwrap() = saved;
                 }
 
-                // A numerical read paused in payload I/O must reject obsolete data
-                // and errors after successful materialization publishes its handoff.
-                let payload = second
-                    ._workspace
-                    .read()
-                    .await
-                    .get_dir("payload")
-                    .cloned()
-                    .unwrap();
-
-                let values = payload.read().await.get_dir("values").cloned().unwrap();
-                let primary = values.read().await.get_dir("primary").cloned().unwrap();
-                let root = primary.read().await.get_file(ROOT).cloned().unwrap();
-                let guard = root.write::<fensor::SparseNode<f64>>().await.unwrap();
-                let mut read = Box::pin(view.read_value(&[0, 4]));
-                futures::future::poll_fn(|cx| {
-                    assert!(std::future::Future::poll(read.as_mut(), cx).is_pending());
-                    std::task::Poll::Ready(())
-                })
-                .await;
-
-                drop(guard);
-                first.apply_to(&canonical).await.unwrap();
-                let (value, applied) = futures::join!(read, second.apply_to(&canonical));
-                applied.unwrap();
-                snapshot.visibility.0.write().unwrap().finalized = Some(crate::test::tx(2));
-                assert_eq!(value.unwrap(), 21.);
-                *root.write::<fensor::SparseNode<f64>>().await.unwrap() = b_tree::Node::Leaf(vec![
-                    vec![fensor::SparseCell::Key(1), fensor::SparseCell::Key(99)],
-                ]);
-
-                let blocks: Vec<_> = view.read_blocks().unwrap().try_collect().await.unwrap();
-                assert_eq!(blocks.concat(), expected);
-
-                // Source selection finishes before native payload reads. An invalid
-                // later membership row wins over an earlier malformed payload.
-                let bad = super::Delta::create(
-                    txn.subcontext_unique().context().await.unwrap(),
-                    geometry.clone(),
-                )
+                // The zero index is scanned before the payload tree in a run.
+                let bad = super::Delta::create(allocation(txn.subcontext_unique().context().await.unwrap()),
+                    geometry.clone(), false,
+                    )
                 .await
                 .unwrap();
 
-                bad.write(0, vec![1.; 4]).await.unwrap();
+                bad.write(0, Some(vec![1.; 4])).await.unwrap();
                 let payload = bad
-                    ._workspace
+                    .storage.dir()
                     .read()
                     .await
                     .get_dir("payload")
@@ -252,19 +338,19 @@ async fn batched_reads_select_sources_and_preserve_materialization_handoff() {
                 let values = payload.read().await.get_dir("values").cloned().unwrap();
                 let primary = values.read().await.get_dir("primary").cloned().unwrap();
                 let root = primary.read().await.get_file(ROOT).cloned().unwrap();
-                *root.write::<fensor::SparseNode<f64>>().await.unwrap() = b_tree::Node::Leaf(vec![
+                *root.write::<crate::TensorSparseNode<f64>>().await.unwrap() = b_tree::Node::Leaf(vec![
                     vec![fensor::SparseCell::Key(0), fensor::SparseCell::Key(99)],
                 ]);
 
-                let touched = bad
-                    ._workspace
+                let zeros = bad
+                    .storage.dir()
                     .read()
                     .await
-                    .get_dir("touched")
+                    .get_dir("zeros")
                     .cloned()
                     .unwrap();
 
-                let root = touched.read().await.get_file(ROOT).cloned().unwrap();
+                let root = zeros.read().await.get_file(ROOT).cloned().unwrap();
                 *root.write::<crate::TensorIndexNode>().await.unwrap() =
                     b_tree::Node::Leaf(vec![vec![0], vec![4, 4]]);
 
@@ -286,10 +372,10 @@ async fn batched_reads_select_sources_and_preserve_materialization_handoff() {
                 );
 
                 assert!(matches!(&error, fensor::Error::Io(error) if freqfs::IntegrityError::is_marked(error)));
-                // Native scans validate every row in the containing page. Restore
-                // membership so the independent malformed-payload assertion is reached.
+                // Native scans validate every row in the containing node. Restore
+                // the zero index so the malformed payload can be read.
                 *root.write::<crate::TensorIndexNode>().await.unwrap() =
-                    b_tree::Node::Leaf(vec![vec![0], vec![4]]);
+                    b_tree::Node::Leaf(Vec::new());
 
                 let error = view.read_value(&[0, 0]).await.unwrap_err();
                 assert!(
@@ -309,22 +395,25 @@ async fn owned_occupied_scan_retains_layers_and_releases_leases() {
         use futures::{StreamExt, TryStreamExt};
 
         let (_, txn) = setup().await;
-        let len = TOUCHED_PAGE_ENTRIES + 1;
+        let len = ZERO_BATCH_SIZE + 1;
         let (tensor, _) = create(&txn, vec![len as u64].into(), true, 4096).await;
-        let Data::F64(value) = &tensor.data else {
+        let Tensor::F64(value) = &tensor else {
             panic!("dtype")
         };
 
-        let owner = value.owner().unwrap();
-        let delta = owner.stage(&txn).await.unwrap();
+        let owner = value.base().unwrap();
+        let delta = owner.stage(&txn, false).await.unwrap();
         observation::watch(&delta.generation);
         for block in 0..owner.geometry().block_count() {
             let mut values = vec![0.; owner.geometry().block_len(block).unwrap()];
             values.fill(1.);
-            delta.write(block, values).await.unwrap();
+            delta.write(block, Some(values)).await.unwrap();
         }
 
-        owner.publish(&txn, delta.clone()).await.unwrap();
+        owner
+            .publish(&txn, delta.clone(), |_| Ok(()))
+            .await
+            .unwrap();
         {
             let snapshot = owner
                 .try_snapshot(txn.id(), 0..owner.geometry().block_count())
@@ -333,14 +422,14 @@ async fn owned_occupied_scan_retains_layers_and_releases_leases() {
             let lease = Arc::downgrade(snapshot._permit.as_ref().unwrap());
             let mut scan = snapshot.occupied_blocks(0..len as u64);
             drop(snapshot);
-            let page: Vec<_> = scan
+            let ids: Vec<_> = scan
                 .by_ref()
-                .take(TOUCHED_PAGE_ENTRIES)
+                .take(ZERO_BATCH_SIZE)
                 .try_collect()
                 .await
                 .unwrap();
 
-            assert_eq!(page.len(), TOUCHED_PAGE_ENTRIES);
+            assert_eq!(ids.len(), ZERO_BATCH_SIZE);
             assert!(lease.upgrade().is_some());
             assert_eq!(scan.try_next().await.unwrap().unwrap(), len as u64 - 1);
             assert!(scan.try_next().await.unwrap().is_none());
@@ -372,20 +461,18 @@ async fn owned_occupied_scan_retains_layers_and_releases_leases() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn overlay_suppresses_blocks_and_discards_prefetched_workspace_keys() {
+async fn overlay_suppresses_zero_replacements_without_membership_reprobes() {
     Box::pin(observation::scope(async {
-        use futures::{StreamExt, TryStreamExt};
-
-        use crate::persistence::PersistentDelta;
+        use futures::TryStreamExt;
 
         let (_, txn) = setup().await;
         let (tensor, _) = create(&txn, vec![600].into(), true, 2).await;
-        let Data::F64(value) = &tensor.data else {
+        let Tensor::F64(value) = &tensor else {
             unreachable!()
         };
 
-        let owner = value.owner().unwrap();
-        let canonical = owner.canonical().unwrap();
+        let owner = value.base().unwrap();
+        let canonical = owner.canonical().clone();
         for id in 0..owner.geometry().block_count() {
             canonical
                 .replace_logical_block(id, vec![1.; owner.geometry().block_len(id).unwrap()])
@@ -393,86 +480,72 @@ async fn overlay_suppresses_blocks_and_discards_prefetched_workspace_keys() {
                 .unwrap();
         }
 
-        let first = owner.stage(&txn).await.unwrap();
+        let first = owner.stage(&txn, false).await.unwrap();
         observation::watch(&first.generation);
         first
-            .write(0, vec![0.; owner.geometry().block_len(0).unwrap()])
+            .write(0, Some(vec![0.; owner.geometry().block_len(0).unwrap()]))
             .await
             .unwrap();
 
         first
-            .write(1, vec![2.; owner.geometry().block_len(1).unwrap()])
+            .write(1, Some(vec![2.; owner.geometry().block_len(1).unwrap()]))
             .await
             .unwrap();
 
-        let second = owner.stage(&txn).await.unwrap();
+        let second = owner.stage(&txn, false).await.unwrap();
         second
-            .write(1, vec![0.; owner.geometry().block_len(1).unwrap()])
+            .write(1, Some(vec![0.; owner.geometry().block_len(1).unwrap()]))
             .await
             .unwrap();
 
-        let lower = canonical.occupied_blocks(0..600);
-        let snapshot = test_snapshot(canonical.clone(), vec![first.clone(), second.clone()]);
-        let mut stream = super::overlay_keys(
-            lower,
-            snapshot.deltas.iter().cloned(),
-            snapshot.visibility.clone(),
-            canonical.clone(),
-            0..600,
-        );
-
-        let key = stream.try_next().await.unwrap().unwrap();
-        assert!(key >= 2);
-        first.apply_to(&canonical).await.unwrap();
-        snapshot.visibility.0.write().unwrap().finalized = Some(crate::test::tx(1));
-        first
-            ._workspace
-            .write()
-            .await
-            .truncate_and_sync()
-            .await
-            .unwrap();
-
-        second.apply_to(&canonical).await.unwrap();
-        snapshot.visibility.0.write().unwrap().finalized = Some(crate::test::tx(2));
-        second
-            ._workspace
-            .write()
-            .await
-            .truncate_and_sync()
-            .await
-            .unwrap();
-
-        let rest: Vec<_> = stream.try_collect().await.unwrap();
-        let expected: Vec<_> = canonical
-            .occupied_blocks(key + 1..600)
+        let snapshot = test_snapshot(canonical.clone(), vec![first, second.clone()]);
+        let keys: Vec<_> = snapshot
+            .occupied_blocks(0..600)
             .try_collect()
             .await
             .unwrap();
-
-        assert_eq!(rest, expected);
-        assert!(observation::counts().touched_lookups > 0);
-        // Payload keys need no touched or occupied-membership reprobe.
-        let own = owner.stage(&txn).await.unwrap();
-        observation::watch(&own.generation);
-        own.write(0, vec![3.; owner.geometry().block_len(0).unwrap()])
+        let expected: Vec<_> = canonical
+            .occupied_blocks(2..600)
+            .try_collect()
             .await
             .unwrap();
+        assert_eq!(keys, expected);
+        assert_eq!(observation::counts().zero_lookups, 0);
 
-        let snapshot = test_snapshot(canonical.clone(), vec![own.clone()]);
-        let keys: Vec<_> = super::overlay_keys(
-            futures::stream::empty().boxed(),
-            snapshot.deltas.iter().cloned(),
-            snapshot.visibility,
-            canonical,
-            0..600,
+        // The shared overlay checks zero streams even when there is no older key.
+        let zeros = second
+            .storage
+            .dir()
+            .read()
+            .await
+            .get_dir("zeros")
+            .unwrap()
+            .clone();
+        let root = zeros
+            .read()
+            .await
+            .get_file("00000000-0000-0000-0000-000000000000")
+            .unwrap()
+            .clone();
+
+        *root.write::<crate::TensorIndexNode>().await.unwrap() =
+            b_tree::Node::Leaf(vec![vec![1, 2]]);
+
+        let empty_base = fensor::Tensor::<_, f64>::create_with_geometry(
+            txn.subcontext_unique().context().await.unwrap(),
+            second.payload.geometry().clone(),
         )
-        .try_collect()
         .await
         .unwrap();
 
-        assert!(!keys.is_empty());
-        assert_eq!(observation::counts().touched_lookups, 0);
+        let error = test_snapshot(empty_base, vec![second])
+            .occupied_blocks(0..600)
+            .try_next()
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, fensor::Error::Io(error)
+            if freqfs::IntegrityError::is_marked(&error)));
     }))
     .await;
 }
@@ -488,12 +561,12 @@ async fn later_snapshots_survive_finalized_workspace_cleanup() {
             let (_, txn) = setup().await;
             let (tensor, _) = create(&txn, vec![4].into(), sparse, 2).await;
             {
-                let Data::F64(value) = &tensor.data else {
+                let Tensor::F64(value) = &tensor else {
                     unreachable!()
                 };
 
                 fensor::TensorWrite::write_value(
-                    &value.owner().unwrap().canonical().unwrap(),
+                    &value.base().unwrap().canonical().clone(),
                     &[1],
                     9.0,
                 )
@@ -501,22 +574,22 @@ async fn later_snapshots_survive_finalized_workspace_cleanup() {
                 .unwrap();
             }
 
-            tensor.write_value(&txn, &[0], 2.0.into()).await.unwrap();
-            tensor.write_value(&txn, &[1], 0.0.into()).await.unwrap();
-            tensor.write_value(&txn, &[3], 4.0.into()).await.unwrap();
+            let writes = txn.subcontext_unique();
+            tensor.write_value(&writes, &[0], 2.0.into()).await.unwrap();
+            tensor.write_value(&writes, &[1], 0.0.into()).await.unwrap();
+            tensor.write_value(&writes, &[3], 4.0.into()).await.unwrap();
             tensor.commit(txn.id()).await.unwrap();
             let later = TxnId::from_parts(NetworkTime::from_nanos(1), 11);
             let expression = tensor.mul_scalar(later, 2.0.into()).await.unwrap();
-            let Data::F64(value) = &tensor.data else {
+            let Tensor::F64(value) = &tensor else {
                 unreachable!()
             };
 
-            let owner = value.owner().unwrap();
+            let owner = value.base().unwrap();
             let snapshot = owner
                 .try_snapshot(later, 0..owner.geometry().block_count())
                 .unwrap();
 
-            let delta = snapshot.deltas[0].1.clone();
             let entries = if sparse {
                 Some(tensor.sparse_elements(later).await.unwrap())
             } else {
@@ -527,8 +600,10 @@ async fn later_snapshots_survive_finalized_workspace_cleanup() {
             // The caller removes an expired workspace after recursive
             // finalization even though a later expression is still live.
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                delta
-                    ._workspace
+                writes
+                    .context()
+                    .await
+                    .unwrap()
                     .write()
                     .await
                     .truncate_and_sync()
@@ -558,7 +633,7 @@ async fn later_snapshots_survive_finalized_workspace_cleanup() {
                     let last = owner.geometry().block_position(&[3]).unwrap().0;
                     let keys: Vec<_> = snapshot
                         .occupied_blocks(0..owner.geometry().block_count())
-                        .take(TOUCHED_PAGE_ENTRIES)
+                        .take(ZERO_BATCH_SIZE)
                         .try_collect()
                         .await
                         .unwrap();
@@ -566,19 +641,11 @@ async fn later_snapshots_survive_finalized_workspace_cleanup() {
                     assert_eq!(keys, [first, last]);
                     // Each delta cursor resumes on native storage after
                     // the handoff, preserving unvisited occupied keys.
-                    let keys: Vec<_> = super::overlay_keys(
-                        owner
-                            .canonical()
-                            .unwrap()
-                            .occupied_blocks(first + 1..owner.geometry().block_count()),
-                        [(txn.id(), delta.clone())],
-                        snapshot.visibility.clone(),
-                        owner.canonical().unwrap(),
-                        first + 1..owner.geometry().block_count(),
-                    )
-                    .try_collect()
-                    .await
-                    .unwrap();
+                    let keys: Vec<_> = snapshot
+                        .occupied_blocks(first + 1..owner.geometry().block_count())
+                        .try_collect()
+                        .await
+                        .unwrap();
 
                     assert_eq!(keys, [last]);
                 }
@@ -591,7 +658,7 @@ async fn later_snapshots_survive_finalized_workspace_cleanup() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn replacement_pages_reuse_keys_and_validate_entries() {
+async fn replacement_batches_reuse_keys_and_validate_entries() {
     Box::pin(observation::scope(async {
         use fensor::{Layout, StorageGeometry, TensorSchema};
         use futures::TryStreamExt;
@@ -631,8 +698,9 @@ async fn replacement_pages_reuse_keys_and_validate_entries() {
             .unwrap();
 
             let patch = Delta::<_, f64>::create(
-                txn.subcontext_unique().context().await.unwrap(),
+                allocation(txn.subcontext_unique().context().await.unwrap()),
                 geometry.clone(),
+                false,
             )
             .await
             .unwrap();
@@ -645,14 +713,14 @@ async fn replacement_pages_reuse_keys_and_validate_entries() {
             };
 
             let invalid_length = patch
-                .write(1, vec![1.; geometry.block_capacity() - 1])
+                .write(1, Some(vec![1.; geometry.block_capacity() - 1]))
                 .await
                 .unwrap_err();
 
             assert!(!freqfs::IntegrityError::is_marked(&invalid_length));
             assert!(!tc_error::TCError::from(invalid_length).requires_recovery());
-            // Invalid IDs reject before waiting for the touched-index guard.
-            let touched = patch.touched.write().await;
+            // Invalid IDs reject before waiting for the zeros-index guard.
+            let zeros = patch.zeros().write().await;
             let invalid_read = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 patch.read(geometry.block_count()),
@@ -667,11 +735,8 @@ async fn replacement_pages_reuse_keys_and_validate_entries() {
                     .contains("logical block out of bounds")
             );
 
-            drop(touched);
-            let invalid_id = patch
-                .write(geometry.block_count(), Vec::new())
-                .await
-                .unwrap_err();
+            drop(zeros);
+            let invalid_id = patch.write(geometry.block_count(), None).await.unwrap_err();
 
             assert_eq!(invalid_id.kind(), std::io::ErrorKind::InvalidData);
             assert!(
@@ -686,66 +751,124 @@ async fn replacement_pages_reuse_keys_and_validate_entries() {
                 geometry.block_len(1).unwrap() - 1,
                 geometry.block_len(1).unwrap() + 1,
             ] {
-                let error = patch.write(1, vec![1.; len]).await.unwrap_err();
+                let error = patch.write(1, Some(vec![1.; len])).await.unwrap_err();
                 assert!(!freqfs::IntegrityError::is_marked(&error));
                 assert!(!tc_error::TCError::from(error).requires_recovery());
             }
 
             assert_eq!(patch.generation.load(Ordering::Acquire), 0);
-            assert!(patch.touched_page(None).await.unwrap().is_empty());
+            assert!(
+                patch
+                    .zero_ids(0..geometry.block_count())
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             assert!(occupied().await.unwrap().is_empty());
 
             let mut values = vec![0.; geometry.block_len(1).unwrap()];
             values[0] = 7.;
-            patch.write(1, values.clone()).await.unwrap();
-            assert_eq!(patch.touched_page(None).await.unwrap(), [1]);
+            patch.write(1, Some(values.clone())).await.unwrap();
+            assert!(
+                patch
+                    .zero_ids(0..geometry.block_count())
+                    .try_next()
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(occupied().await.unwrap(), [1]);
             assert_eq!(patch.read(1).await.unwrap(), Some(values));
             for id in [0, 2, geometry.block_count() - 1] {
                 assert!(patch.read(id).await.unwrap().is_none());
             }
 
-            // No zero-valued sibling is allocated, and deleting the one
-            // row retains explicit-zero replacement membership.
+            // Deleting the payload leaves an explicit zero override.
             let zeros = vec![0.; geometry.block_len(1).unwrap()];
-            patch.write(1, zeros.clone()).await.unwrap();
-            assert_eq!(patch.touched_page(None).await.unwrap(), [1]);
+            patch.write(1, None).await.unwrap();
+            assert_eq!(
+                patch
+                    .zero_ids(0..geometry.block_count())
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap(),
+                [1]
+            );
             assert!(occupied().await.unwrap().is_empty());
             assert_eq!(patch.read(1).await.unwrap(), Some(zeros));
+
+            patch
+                .write(1, Some(vec![-0.; geometry.block_len(1).unwrap()]))
+                .await
+                .unwrap();
+            let block = patch.read(1).await.unwrap().unwrap();
+            if matches!(geometry.layout(), Layout::Dense) {
+                assert!(block.iter().all(|value| value.is_sign_negative()));
+                assert!(
+                    patch
+                        .zero_ids(0..geometry.block_count())
+                        .try_next()
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(occupied().await.unwrap(), [1]);
+            } else {
+                assert!(block.iter().all(|value| value.is_sign_positive()));
+                assert_eq!(
+                    patch
+                        .zero_ids(0..geometry.block_count())
+                        .try_next()
+                        .await
+                        .unwrap(),
+                    Some(1)
+                );
+                assert!(occupied().await.unwrap().is_empty());
+            }
         }
 
         for sparse in [false, true] {
             let (_, txn) = setup().await;
             let (tensor, _) = create(&txn, vec![6].into(), sparse, 2).await;
-            let Data::F64(value) = &tensor.data else {
+            let Tensor::F64(value) = &tensor else {
                 unreachable!()
             };
 
-            let owner = value.owner().unwrap();
-            let patch = owner.stage(&txn).await.unwrap();
+            let owner = value.base().unwrap();
+            let patch = owner.stage(&txn, false).await.unwrap();
             observation::watch(&patch.generation);
             assert!(patch.read(0).await.unwrap().is_none());
             observation::watch(&patch.generation);
             for id in 0..owner.geometry().block_count() {
                 patch
-                    .write(id, vec![id as f64; owner.geometry().block_len(id).unwrap()])
+                    .write(
+                        id,
+                        Some(vec![id as f64; owner.geometry().block_len(id).unwrap()]),
+                    )
                     .await
                     .unwrap();
             }
 
-            // Repeated membership survives both zero/nonzero transitions.
+            // Repeated writes reconcile both directions of the transition.
             for value in [0., 2.] {
                 patch
-                    .write(1, vec![value; owner.geometry().block_len(1).unwrap()])
+                    .write(1, Some(vec![value; owner.geometry().block_len(1).unwrap()]))
                     .await
                     .unwrap();
             }
 
-            assert!(!patch.touched.write().await.insert(vec![1]).await.unwrap());
-
+            assert_eq!(
+                patch
+                    .zero_ids(0..owner.geometry().block_count())
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap(),
+                [0]
+            );
             assert!(
                 patch
-                    .touched
+                    .zeros()
                     .write()
                     .await
                     .insert(vec![0, 1])
@@ -755,15 +878,23 @@ async fn replacement_pages_reuse_keys_and_validate_entries() {
 
             let rows: Vec<_> = patch.replacements().try_collect().await.unwrap();
             assert_eq!(rows.len(), owner.geometry().block_count() as usize);
-            assert_eq!(observation::counts().touched_lookups, 0);
-            assert_eq!(rows[0].1, vec![0.; owner.geometry().block_len(0).unwrap()]);
-            assert_eq!(rows[1].1, vec![2.; owner.geometry().block_len(1).unwrap()]);
-            assert_eq!(patch.read(0).await.unwrap(), Some(rows[0].1.clone()));
-            assert_eq!(observation::counts().touched_lookups, 1);
+            assert_eq!(observation::counts().zero_lookups, 0);
+            assert_eq!(rows[0].1, None);
+            assert_eq!(
+                rows[1].1,
+                Some(vec![2.; owner.geometry().block_len(1).unwrap()])
+            );
+            assert_eq!(
+                patch.read(0).await.unwrap(),
+                Some(vec![0.; owner.geometry().block_len(0).unwrap()])
+            );
+            assert_eq!(observation::counts().zero_lookups, 1);
+            assert_eq!(observation::counts().payload_reads, rows.len() - 1);
 
             // Membership cannot hide malformed native replacement storage.
             let payload = patch
-                ._workspace
+                .storage
+                .dir()
                 .read()
                 .await
                 .get_dir("payload")
@@ -774,7 +905,7 @@ async fn replacement_pages_reuse_keys_and_validate_entries() {
             let primary = values.read().await.get_dir("primary").cloned().unwrap();
             let root = primary.read().await.get_file(ROOT).cloned().unwrap();
             {
-                let mut node = root.write::<fensor::SparseNode<f64>>().await.unwrap();
+                let mut node = root.write::<crate::TensorSparseNode<f64>>().await.unwrap();
                 let b_tree::Node::Leaf(rows) = &mut *node else {
                     unreachable!()
                 };
@@ -792,56 +923,43 @@ async fn replacement_pages_reuse_keys_and_validate_entries() {
 
             // A selected malformed key must error, never masquerade as an
             // absent replacement and expose an older block.
-            let touched = patch
-                ._workspace
+            let zeros = patch
+                .storage
+                .dir()
                 .read()
                 .await
-                .get_dir("touched")
+                .get_dir("zeros")
                 .cloned()
                 .unwrap();
 
-            let root = touched.read().await.get_file(ROOT).cloned().unwrap();
+            let root = zeros.read().await.get_file(ROOT).cloned().unwrap();
             *root.write::<crate::TensorIndexNode>().await.unwrap() =
                 b_tree::Node::Leaf(vec![vec![0, 0, 0]]);
 
             assert!(patch.read(0).await.is_err());
-            assert!(patch.touches(0).await.is_err());
             assert!(patch.replacements().try_collect::<Vec<_>>().await.is_err());
             *root.write::<crate::TensorIndexNode>().await.unwrap() =
                 b_tree::Node::Leaf(vec![vec![owner.geometry().block_count()]]);
 
-            let error = patch
-                .replacements()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap_err();
-
+            let error = patch.zeros().validate().await.unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
             assert!(freqfs::IntegrityError::is_marked(&error));
-            let cause = error.get_ref().unwrap().source().unwrap();
-            let cause = cause.downcast_ref::<std::io::Error>().unwrap();
-
-            assert!(matches!(
-                cause.get_ref().unwrap().downcast_ref::<fensor::Error>(),
-                Some(fensor::Error::InvalidCoord(_))
-            ));
-
             assert!(tc_error::TCError::from(error).requires_recovery());
-            drop(patch.touched.try_write().unwrap());
+            drop(patch.zeros().try_write().unwrap());
         }
     }))
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn touched_pages_are_bounded_and_reload_single_column_nodes() {
+async fn zero_batches_are_bounded_and_reload_single_column_nodes() {
     Box::pin(async {
         use futures::TryStreamExt;
 
-        use super::{Delta, TouchedSchema};
+        use super::ZeroSchema;
         use crate::StorageContext;
 
-        let len = TOUCHED_PAGE_ENTRIES as u64 + 1;
+        let len = ZERO_BATCH_SIZE as u64 + 1;
         for layout in [
             fensor::Layout::Dense,
             fensor::Layout::Sparse { axis: Some(0) },
@@ -858,30 +976,34 @@ async fn touched_pages_are_bounded_and_reload_single_column_nodes() {
             )
             .unwrap();
 
-            let mut patch =
-                Delta::<_, f64>::create(txn.subcontext_unique().context().await.unwrap(), geometry)
-                    .await
-                    .unwrap();
+            let mut patch = Delta::<_, f64>::create(
+                allocation(txn.subcontext_unique().context().await.unwrap()),
+                geometry,
+                false,
+            )
+            .await
+            .unwrap();
 
             // Missing native payloads are valid explicit-zero replacements.
             patch
-                .touched
+                .zeros()
                 .write()
                 .await
                 .insert_sorted(futures::stream::iter((0..len).map(|id| Ok(vec![id]))))
                 .await
                 .unwrap();
 
-            patch.touched.sync().await.unwrap();
-            let touched = patch
-                ._workspace
+            patch.zeros().sync().await.unwrap();
+            let zeros = patch
+                .storage
+                .dir()
                 .read()
                 .await
-                .get_dir("touched")
+                .get_dir("zeros")
                 .cloned()
                 .unwrap();
 
-            let path = touched.read().await.path().to_owned();
+            let path = zeros.read().await.path().to_owned();
             let cache = freqfs::Cache::<crate::PersistentFile>::new(
                 32 * 1024,
                 None,
@@ -889,25 +1011,46 @@ async fn touched_pages_are_bounded_and_reload_single_column_nodes() {
                 std::time::Duration::from_secs(3),
             );
 
-            Arc::get_mut(&mut patch).unwrap().touched = b_tree::BTreeLock::load(
-                TouchedSchema,
-                b_tree::IndexOrder::new(b_tree::collate::Collator::default()),
-                cache.load(path).unwrap(),
-            )
+            Arc::get_mut(&mut patch).unwrap().zeros = Some(
+                b_tree::BTreeLock::load(
+                    ZeroSchema(len),
+                    b_tree::collate::Collator::default(),
+                    cache.load(path).unwrap(),
+                )
+                .unwrap(),
+            );
+
+            patch.zeros().validate().await.unwrap();
+            let first = Delta::<_, f64>::zero_batch(patch.zeros(), 0..len)
+                .await
+                .unwrap();
+            assert_eq!(first, (0..len - 1).collect::<Vec<_>>());
+            let mut visited = 0;
+            Delta::<_, f64>::visit_zeros(&patch.zeros().read().await, 0..len, |id| {
+                assert_eq!(id, visited);
+                visited += 1;
+                std::ops::ControlFlow::Continue(())
+            })
+            .await
             .unwrap();
 
-            patch.touched.validate().await.unwrap();
-            let first = patch.touched_page(None).await.unwrap();
-            assert_eq!(first, (0..len - 1).collect::<Vec<_>>());
+            assert_eq!(visited, len);
             assert_eq!(
-                patch.touched_page(first.last().copied()).await.unwrap(),
+                Delta::<_, f64>::zero_batch(patch.zeros(), len - 1..len)
+                    .await
+                    .unwrap(),
                 [len - 1]
             );
 
-            assert!(patch.touched_page(Some(len - 1)).await.unwrap().is_empty());
-            // A returned page retains no native index guard.
+            assert!(
+                Delta::<_, f64>::zero_batch(patch.zeros(), len..len)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            // Returning a batch releases the index guard.
             drop(
-                tokio::time::timeout(std::time::Duration::from_secs(2), patch.touched.write())
+                tokio::time::timeout(std::time::Duration::from_secs(2), patch.zeros().write())
                     .await
                     .unwrap(),
             );
@@ -916,7 +1059,7 @@ async fn touched_pages_are_bounded_and_reload_single_column_nodes() {
             let mut expected = 0;
             while let Some((id, values)) = replacements.try_next().await.unwrap() {
                 assert_eq!(id, expected);
-                assert_eq!(values, [0.]);
+                assert!(values.is_none());
                 expected += 1;
             }
 
@@ -932,12 +1075,12 @@ async fn vacant_publication_adopts_staged_ownership_without_replaying_blocks() {
         for checked in [false, true] {
             let (_, txn) = setup().await;
             let (tensor, _) = create(&txn, vec![4].into(), true, 2).await;
-            let Data::F64(value) = &tensor.data else {
+            let Tensor::F64(value) = &tensor else {
                 unreachable!()
             };
 
-            let owner = value.owner().unwrap();
-            let patch = owner.stage(&txn).await.unwrap();
+            let owner = value.base().unwrap();
+            let patch = owner.stage(&txn, false).await.unwrap();
             assert_eq!(std::mem::size_of_val(&patch), std::mem::size_of::<usize>());
             let copy = patch.clone();
             assert!(Arc::ptr_eq(&copy, &patch));
@@ -947,7 +1090,7 @@ async fn vacant_publication_adopts_staged_ownership_without_replaying_blocks() {
             assert_eq!(Arc::strong_count(&patch), 1);
             assert!(owner.snapshot(txn.id(), None).unwrap()._permit.is_none());
             patch
-                .write(0, vec![7.; owner.geometry().block_len(0).unwrap()])
+                .write(0, Some(vec![7.; owner.geometry().block_len(0).unwrap()]))
                 .await
                 .unwrap();
 
@@ -955,24 +1098,24 @@ async fn vacant_publication_adopts_staged_ownership_without_replaying_blocks() {
             if checked {
                 owner.publish_if_unchanged(&txn, patch, None).await.unwrap();
             } else {
-                owner.publish(&txn, patch).await.unwrap();
+                owner.publish(&txn, patch, |_| Ok(())).await.unwrap();
             }
 
-            let pending = owner.core.state.read().unwrap().pending[&txn.id()].clone();
+            let pending = owner.versions.pending_for_test(txn.id());
             assert!(Arc::ptr_eq(&generation, &pending.generation));
             assert_eq!(pending.read(0).await.unwrap().unwrap()[0], 7.);
-            let patch = owner.stage(&txn).await.unwrap();
+            let patch = owner.stage(&txn, false).await.unwrap();
             patch
-                .write(1, vec![0.; owner.geometry().block_len(1).unwrap()])
+                .write(1, Some(vec![0.; owner.geometry().block_len(1).unwrap()]))
                 .await
                 .unwrap();
 
-            owner.publish(&txn, patch).await.unwrap();
+            owner.publish(&txn, patch, |_| Ok(())).await.unwrap();
             assert_eq!(pending.read(0).await.unwrap().unwrap()[0], 7.);
             assert_eq!(pending.read(1).await.unwrap().unwrap()[0], 0.);
 
             // Retaining a generation stamp does not retain an unpublished workspace owner.
-            let unpublished = owner.stage(&txn).await.unwrap();
+            let unpublished = owner.stage(&txn, false).await.unwrap();
             let released = Arc::downgrade(&unpublished);
             let stamp = unpublished.generation.clone();
             drop(unpublished);
@@ -986,46 +1129,120 @@ async fn vacant_publication_adopts_staged_ownership_without_replaying_blocks() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn sparse_restoration_errors_and_cancellation_preserve_pending_data() {
+    Box::pin(async {
+        let (_root, txn) = setup().await;
+        let (source, _) = create(&txn, vec![4].into(), true, 2).await;
+        let (target, _) = create(&txn, vec![4].into(), true, 2).await;
+        source.write_value(&txn, &[0], 3.0.into()).await.unwrap();
+        source.write_value(&txn, &[3], 5.0.into()).await.unwrap();
+        target.write_value(&txn, &[1], 7.0.into()).await.unwrap();
+        let (Tensor::F64(source_access), Tensor::F64(target_access)) = (&source, &target) else {
+            unreachable!()
+        };
+        let source_base = source_access.base().unwrap();
+        let target_base = target_access.base().unwrap();
+        let deltas = source_base.versions.visible_snapshot(txn.id()).unwrap();
+        {
+            // Stall reads after admission while both collection reservations
+            // are held. A reciprocal restore must reject the conflict immediately.
+            let _membership = deltas[0].zeros().write().await;
+            let mut restoring = Box::pin(target.restore(&txn, &source));
+            assert!(
+                tokio::task::unconstrained(restoring.as_mut())
+                    .now_or_never()
+                    .is_none()
+            );
+            assert!(
+                source
+                    .restore(&txn, &target)
+                    .now_or_never()
+                    .expect("reciprocal restore returns without waiting")
+                    .is_err()
+            );
+        }
+
+        assert_eq!(target.read_value(txn.id(), &[1]).await.unwrap(), 7.0.into());
+        for owner in [source_base, target_base] {
+            assert!(owner.try_acquire_write_permit(txn.id(), 0..4).is_ok());
+        }
+
+        corrupt_block(source_base, txn.id(), &[3]).await;
+        let error = target.restore(&txn, &source).await.unwrap_err();
+        assert!(error.requires_recovery());
+        assert_eq!(target.read_value(txn.id(), &[0]).await.unwrap(), 0.0.into());
+        assert_eq!(target.read_value(txn.id(), &[1]).await.unwrap(), 7.0.into());
+        for owner in [source_base, target_base] {
+            assert!(owner.try_acquire_write_permit(txn.id(), 0..4).is_ok());
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn staged_publication_cancellation_rolls_back_and_stale_generations_conflict() {
     Box::pin(async {
             let (_, txn) = setup().await;
-            let (tensor, _) = create(&txn, vec![4].into(), true, 2).await;
+            let (tensor, _) = create(&txn, vec![2].into(), true, 1).await;
             tensor.write_value(&txn, &[0], 1.0.into()).await.unwrap();
-            let Data::F64(value) = &tensor.data else {
+            let Tensor::F64(value) = &tensor else {
                 unreachable!()
             };
 
-            let owner = value.owner().unwrap();
-            let stamp = owner.pending_stamp(txn.id()).unwrap();
-            let patch = owner.stage(&txn).await.unwrap();
-            patch
-                .write(0, vec![3.0; owner.geometry().block_len(0).unwrap()])
-                .await
-                .unwrap();
+            let owner = value.base().unwrap();
+            for complete in [false, true] {
+                let stamp = owner.pending_stamp(txn.id()).unwrap();
+                let patch = owner.stage(&txn, complete).await.unwrap();
+                patch
+                    .write(0, Some(vec![3.0; owner.geometry().block_len(0).unwrap()]))
+                    .await
+                    .unwrap();
 
-            tensor.write_value(&txn, &[0], 2.0.into()).await.unwrap();
-            assert!(
-                owner
+                tensor.write_value(&txn, &[0], 2.0.into()).await.unwrap();
+                let error = owner
                     .publish_if_unchanged(&txn, patch, stamp)
                     .await
-                    .is_err()
-            );
+                    .unwrap_err();
+                assert_eq!(error.code(), tc_error::ErrorKind::Conflict);
+                assert_eq!(tensor.read_value(txn.id(), &[0]).await.unwrap(), 2.0.into());
+            }
 
+            tensor.write_value(&txn, &[0], 1.0.into()).await.unwrap();
+            tensor.write_value(&txn, &[1], 2.0.into()).await.unwrap();
+            let stamp = owner.pending_stamp(txn.id()).unwrap();
+            let left = owner.stage(&txn, false).await.unwrap();
+            left.write(0, Some(vec![2.0])).await.unwrap();
+            let right = owner.stage(&txn, false).await.unwrap();
+            right.write(1, Some(vec![1.0])).await.unwrap();
+            {
+                let _left_write = owner.try_acquire_write_permit(txn.id(), 0..1).unwrap();
+                let _right_write = owner.try_acquire_write_permit(txn.id(), 1..2).unwrap();
+                let staged_index = left.zeros().write().await;
+                let mut first =
+                    Box::pin(owner.publish_if_unchanged(&txn, left.clone(), stamp.clone()));
+                assert!(tokio::task::unconstrained(first.as_mut()).now_or_never().is_none());
+                let error = owner.publish_if_unchanged(&txn, right, stamp).await.unwrap_err();
+                assert_eq!(error.code(), tc_error::ErrorKind::Conflict);
+                drop(staged_index);
+                first.await.unwrap();
+            }
             assert_eq!(tensor.read_value(txn.id(), &[0]).await.unwrap(), 2.0.into());
-            let delta = owner.core.state.read().unwrap().pending[&txn.id()].clone();
-            let patch = owner.stage(&txn).await.unwrap();
+            assert_eq!(tensor.read_value(txn.id(), &[1]).await.unwrap(), 2.0.into());
+
+            let delta = owner.versions.pending_for_test(txn.id());
+            let patch = owner.stage(&txn, false).await.unwrap();
             patch
-                .write(0, vec![9.0; owner.geometry().block_len(0).unwrap()])
+                .write(0, Some(vec![9.0; owner.geometry().block_len(0).unwrap()]))
                 .await
                 .unwrap();
 
-            let occupied = delta.touched.write().await;
-            let mut publication = Box::pin(owner.publish(&txn, patch));
+            let occupied = delta.zeros().write().await;
+            let mut publication = Box::pin(owner.publish(&txn, patch, |_| Ok(())));
             tokio::select! {
                 result = &mut publication => panic!("publication should wait for the occupied index: {result:?}"),
                 result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
                     loop {
-                        if delta.payload.read(0).await.unwrap()[0] == 9.0 { break; }
+                        if delta.payload.read(0).await.unwrap().unwrap()[0] == 9.0 { break; }
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     }
                 }) => result.unwrap(),
@@ -1056,11 +1273,13 @@ async fn aliased_sources_reserve_one_combined_interval() {
             .slice(vec![AxisRange::In(4, 6, 1)].into())
             .unwrap();
 
-        let (Data::F64(left), Data::F64(right)) = (&left.data, &right.data) else {
+        let (Tensor::F64(left), Tensor::F64(right)) = (&left, &right) else {
             unreachable!()
         };
 
-        let [left, right] = crate::tensor::Typed::expressions([left, right], txn.id()).unwrap();
+        let [left, right] =
+            crate::tensor::TensorAccess::expressions([left, right], txn.id()).unwrap();
+
         assert!(tensor.write_value(&txn, &[3], 1.0.into()).await.is_err());
         tensor.write_value(&txn, &[7], 2.0.into()).await.unwrap();
         drop(left);
@@ -1076,30 +1295,24 @@ async fn cancellation_after_payload_mutation_requires_rollback() {
             let (_, txn) = setup().await;
             let (tensor, _) = create(&txn, vec![4].into(), true, 2).await;
             tensor.write_value(&txn, &[0], 1.0.into()).await.unwrap();
-            let Data::F64(value) = &tensor.data else {
+            let Tensor::F64(value) = &tensor else {
                 unreachable!()
             };
 
             let delta = value
-                .owner()
+                .base()
                 .unwrap()
-                .core
-                .state
-                .read()
-                .unwrap()
-                .pending
-                .get(&txn.id())
-                .cloned()
-                .unwrap();
+                .versions.pending_for_test(txn.id());
 
-            let touched = delta.touched.write().await;
-            let mut mutation = Box::pin(delta.write(0, vec![2.; delta.geometry.block_len(0).unwrap()]));
+            let zeros = delta.zeros().write().await;
+            let len = delta.payload.geometry().block_len(0).unwrap();
+            let mut mutation = Box::pin(delta.write(0, Some(vec![2.; len])));
             tokio::time::timeout(std::time::Duration::from_secs(5),async {
                 tokio::select! {
-                    result=&mut mutation => panic!("publication should wait for touched index: {result:?}"),
+                    result=&mut mutation => panic!("publication should wait for zeros index: {result:?}"),
                     _=async {
                         loop {
-                            if delta.payload.read(0).await.unwrap()[0]==2. {break;}
+                            if delta.payload.read(0).await.unwrap().unwrap()[0] == 2. { break; }
                             tokio::task::yield_now().await;
                         }
                     } => {}
@@ -1107,7 +1320,7 @@ async fn cancellation_after_payload_mutation_requires_rollback() {
             }).await.unwrap();
 
             drop(mutation);
-            drop(touched);
+            drop(zeros);
             tensor.rollback(&txn.id()).await.unwrap();
             assert_eq!(
                 tensor.read_value(txn.id(), &[0]).await.unwrap(),
@@ -1126,35 +1339,37 @@ async fn deep_overlay_polling_and_cancellation_use_normal_worker_stacks() {
         for occupied in [false, true] {
             let (_temp, txn) = setup().await;
             let (tensor, directory) = create(&txn, vec![1].into(), true, 1).await;
-            let Data::F64(value) = &tensor.data else {
+            let Tensor::F64(value) = &tensor else {
                 unreachable!()
             };
 
-            let owner = value.owner().unwrap();
-            let delta = owner.stage(&txn).await.unwrap();
-            delta
-                .write(0, vec![if occupied { 1. } else { 0. }])
-                .await
-                .unwrap();
+            let owner = value.base().unwrap();
+            let delta = owner.stage(&txn, false).await.unwrap();
+            delta.write(0, occupied.then(|| vec![1.])).await.unwrap();
 
             // Share the native fixture to isolate traversal depth from storage setup.
             for pending in [false, true] {
                 let mut snapshot =
-                    test_snapshot(owner.canonical().unwrap(), vec![delta.clone(); 1024]);
+                    test_snapshot(owner.canonical().clone(), vec![delta.clone(); 1024]);
 
-                snapshot._permit = Some(Arc::new(
-                    owner
-                        .core
-                        .acquire_read_permit(txn.id(), 0..1)
-                        .await
-                        .unwrap(),
-                ));
+                snapshot._permit = owner.read_snapshot(txn.id(), 0..1).await.unwrap()._permit;
 
                 let lease = Arc::downgrade(snapshot._permit.as_ref().unwrap());
                 let mut scan = snapshot.occupied_blocks(0..1);
                 drop(snapshot);
                 if pending {
-                    let values = directory.read().await.get_dir("values").cloned().unwrap();
+                    let values = directory
+                        .read()
+                        .await
+                        .get_dir("base")
+                        .cloned()
+                        .unwrap()
+                        .read()
+                        .await
+                        .get_dir("values")
+                        .cloned()
+                        .unwrap();
+
                     let primary = values.read().await.get_dir("primary").cloned().unwrap();
                     let root = primary
                         .read()
@@ -1163,7 +1378,7 @@ async fn deep_overlay_polling_and_cancellation_use_normal_worker_stacks() {
                         .cloned()
                         .unwrap();
 
-                    let guard = root.write::<fensor::SparseNode<f64>>().await.unwrap();
+                    let guard = root.write::<crate::TensorSparseNode<f64>>().await.unwrap();
                     assert!(
                         tokio::time::timeout(std::time::Duration::from_millis(20), scan.try_next())
                             .await
@@ -1175,7 +1390,7 @@ async fn deep_overlay_polling_and_cancellation_use_normal_worker_stacks() {
                     drop(guard);
                     owner
                         .canonical()
-                        .unwrap()
+                        .clone()
                         .replace_logical_block(0, vec![0.])
                         .await
                         .unwrap();
@@ -1205,7 +1420,7 @@ async fn deep_overlay_polling_and_cancellation_use_normal_worker_stacks() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn batched_materialization_discards_partial_output_and_obsolete_errors() {
+async fn batched_payload_errors_preserve_provenance_and_release_guards() {
     use fensor::{Layout, StorageGeometry, TensorRead, TensorSchema, TensorView};
     use futures::TryStreamExt;
     use tokio::sync::oneshot;
@@ -1214,7 +1429,7 @@ async fn batched_materialization_discards_partial_output_and_obsolete_errors() {
 
     Box::pin(observation::scope(async {
         for layout in [Layout::Dense, Layout::Sparse { axis: Some(0) }] {
-            for (publish, marked) in [(false, false), (false, true), (true, false), (true, true)] {
+            for marked in [false, true] {
                 let (_temp, txn) = setup().await;
                 let geometry = StorageGeometry::new(
                     TensorSchema::new(
@@ -1235,8 +1450,9 @@ async fn batched_materialization_discards_partial_output_and_obsolete_errors() {
                 .unwrap();
 
                 let delta = super::Delta::create(
-                    txn.subcontext_unique().context().await.unwrap(),
+                    allocation(txn.subcontext_unique().context().await.unwrap()),
                     geometry.clone(),
+                    false,
                 )
                 .await
                 .unwrap();
@@ -1245,23 +1461,13 @@ async fn batched_materialization_discards_partial_output_and_obsolete_errors() {
                     let mut values = vec![0.; geometry.block_len(id).unwrap()];
                     values.fill(7.);
 
-                    delta.write(id, values).await.unwrap();
+                    delta.write(id, Some(values)).await.unwrap();
                 }
 
                 let snapshot = test_snapshot(canonical, vec![delta.clone()]);
                 let view = TensorView::new(snapshot.clone());
-                let materialized = snapshot.visibility.clone();
-                let cutoff = snapshot.deltas[0].0;
                 let (observed, mut receipt) = oneshot::channel();
                 observation::on_scatter(&delta.generation, move || {
-                    // Model canonical application completed before publication,
-                    // with the obsolete workspace still holding nonzero payloads.
-                    // Sparse canonical absence cannot overwrite partial output:
-                    // the handoff must explicitly reset the scattered positions.
-                    if publish {
-                        materialized.0.write().unwrap().finalized = Some(cutoff);
-                    }
-
                     observed.send(()).unwrap();
                     let error = std::io::Error::other("obsolete payload read");
                     Err(if marked {
@@ -1274,9 +1480,7 @@ async fn batched_materialization_discards_partial_output_and_obsolete_errors() {
 
                 let values = view.read_blocks().unwrap().try_concat().await;
                 receipt.try_recv().unwrap();
-                if publish {
-                    assert_eq!(values.unwrap(), vec![0.; 6]);
-                } else {
+                {
                     let fensor::Error::Io(error) = values.unwrap_err() else {
                         panic!("expected original payload I/O error")
                     };
@@ -1288,11 +1492,7 @@ async fn batched_materialization_discards_partial_output_and_obsolete_errors() {
 
                 // The failed visitor releases its BTree/file guards before either
                 // returning the error or re-entering canonical storage.
-                delta
-                    .payload
-                    .replace(0, vec![0.; geometry.block_len(0).unwrap()])
-                    .await
-                    .unwrap();
+                delta.payload.replace(0, None).await.unwrap();
             }
         }
     }))
@@ -1300,7 +1500,7 @@ async fn batched_materialization_discards_partial_output_and_obsolete_errors() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn batched_membership_preserves_unresolved_runs_and_handoff() {
+async fn batched_membership_groups_unresolved_runs_and_cancels_cleanly() {
     use fensor::{Layout, StorageGeometry, TensorSchema};
     use tokio::sync::oneshot;
 
@@ -1331,27 +1531,31 @@ async fn batched_membership_preserves_unresolved_runs_and_handoff() {
             .unwrap();
 
             let older = super::Delta::create(
-                txn.subcontext_unique().context().await.unwrap(),
+                allocation(txn.subcontext_unique().context().await.unwrap()),
                 geometry.clone(),
+                false,
             )
             .await
             .unwrap();
 
             older
-                .touched
+                .zeros()
                 .write()
                 .await
                 .insert_sorted(futures::stream::iter((0..640).map(|id| Ok(vec![id]))))
                 .await
                 .unwrap();
 
-            let newer =
-                super::Delta::create(txn.subcontext_unique().context().await.unwrap(), geometry)
-                    .await
-                    .unwrap();
+            let newer = super::Delta::create(
+                allocation(txn.subcontext_unique().context().await.unwrap()),
+                geometry,
+                false,
+            )
+            .await
+            .unwrap();
 
             newer
-                .touched
+                .zeros()
                 .write()
                 .await
                 .insert_sorted(futures::stream::iter(
@@ -1365,28 +1569,21 @@ async fn batched_membership_preserves_unresolved_runs_and_handoff() {
             // One run spans native leaves; newer selections split only the
             // older scan. Missing payload rows still select explicit zeros.
             let ids: Vec<_> = (0..768).collect();
-            let mut sources = vec![None; ids.len()];
+            let mut sources = vec![Canonical; ids.len()];
             for (delta, scans) in [(&newer, 1), (&older, 3)] {
                 observation::watch(&delta.generation);
                 snapshot.resolve_sources(&ids, &mut sources).await.unwrap();
                 assert_eq!(observation::counts().membership_scans, scans);
-                assert_eq!(observation::counts().touched_lookups, 0);
-                drop(delta.touched.try_write().unwrap());
+                assert_eq!(observation::counts().zero_lookups, 0);
+                drop(delta.zeros().try_write().unwrap());
                 for (&id, &source) in ids.iter().zip(&sources) {
-                    let expected = if [129, 130, 258].contains(&id) {
-                        Some(1)
-                    } else if id < 640 {
-                        Some(0)
-                    } else {
-                        None
-                    };
-
+                    let expected = if id < 640 { Zero } else { Canonical };
                     assert_eq!(source, expected, "block {id}");
                 }
             }
 
             let ids = [0, 1, 2, 129, 130, 131, 257, 258, 259, 700, 767];
-            let mut sources = [None; 11];
+            let mut sources = [Canonical; 11];
             for (delta, scans) in [(&newer, 5), (&older, 6)] {
                 observation::watch(&delta.generation);
                 snapshot.resolve_sources(&ids, &mut sources).await.unwrap();
@@ -1394,23 +1591,13 @@ async fn batched_membership_preserves_unresolved_runs_and_handoff() {
                 assert_eq!(
                     sources,
                     [
-                        Some(0),
-                        Some(0),
-                        Some(0),
-                        Some(1),
-                        Some(1),
-                        Some(0),
-                        Some(0),
-                        Some(1),
-                        Some(0),
-                        None,
-                        None
+                        Zero, Zero, Zero, Zero, Zero, Zero, Zero, Zero, Zero, Canonical, Canonical
                     ],
                 );
             }
 
             observation::watch(&older.generation);
-            let mut sources = [None; 2];
+            let mut sources = [Canonical; 2];
             fn send<T: Send>(value: T) -> T {
                 value
             }
@@ -1419,32 +1606,33 @@ async fn batched_membership_preserves_unresolved_runs_and_handoff() {
                 .await
                 .unwrap();
 
-            assert_eq!(sources, [Some(1), Some(1)]);
+            assert_eq!(sources, [Zero, Zero]);
             assert_eq!(observation::counts().membership_scans, 0);
 
             for delta in [&newer, &older] {
                 observation::watch(&delta.generation);
-                let mut source = [None];
+                let mut source = [Canonical];
                 snapshot.resolve_sources(&[700], &mut source).await.unwrap();
-                assert_eq!(source, [None]);
+                assert_eq!(source, [Canonical]);
                 assert_eq!(observation::counts().membership_scans, 1);
             }
 
-            let touched = older
-                ._workspace
+            let zeros = older
+                .storage
+                .dir()
                 .read()
                 .await
-                .get_dir("touched")
+                .get_dir("zeros")
                 .cloned()
                 .unwrap();
 
-            let root = touched.read().await.get_file(ROOT).cloned().unwrap();
+            let root = zeros.read().await.get_file(ROOT).cloned().unwrap();
             let last = match &*root.read::<crate::TensorIndexNode>().await.unwrap() {
                 b_tree::Node::Index(_, children) => *children.last().unwrap(),
                 b_tree::Node::Leaf(_) => panic!("fixture must span native leaves"),
             };
 
-            let last = touched
+            let last = zeros
                 .read()
                 .await
                 .get_file(&last.to_string())
@@ -1453,15 +1641,15 @@ async fn batched_membership_preserves_unresolved_runs_and_handoff() {
 
             // The first older run assigns block 0 before a later leaf blocks.
             // Cancellation must release every retained index/file read guard.
-            for publish in [false, true] {
-                let mut held = last.write::<crate::TensorIndexNode>().await.unwrap();
+            {
+                let held = last.write::<crate::TensorIndexNode>().await.unwrap();
                 let (completed, receipt) = oneshot::channel();
                 observation::on_membership(&older.generation, 1, move || {
                     completed.send(()).unwrap();
                     Ok(())
                 });
 
-                let mut sources = [None; 3];
+                let mut sources = [Canonical; 3];
                 let mut read = Box::pin(tokio::task::unconstrained(
                     snapshot.resolve_sources(&[0, 129, 639], &mut sources),
                 ));
@@ -1474,21 +1662,11 @@ async fn batched_membership_preserves_unresolved_runs_and_handoff() {
 
                 assert_eq!(observation::counts().membership_scans, 2);
 
-                if publish {
-                    // Completed canonical application makes both the earlier
-                    // assignment and this malformed later workspace obsolete.
-                    snapshot.visibility.0.write().unwrap().finalized = Some(snapshot.deltas[0].0);
-                    *held = b_tree::Node::Leaf(vec![vec![639, 639]]);
-                    drop(held);
-                    read.await.unwrap();
-                    assert_eq!(sources, [None, Some(1), None]);
-                } else {
-                    drop(read);
-                    drop(held);
-                    assert_eq!(sources, [Some(0), Some(1), None]);
-                }
+                drop(read);
+                drop(held);
+                assert_eq!(sources, [Zero, Zero, Canonical]);
 
-                drop(older.touched.try_write().unwrap());
+                drop(older.zeros().try_write().unwrap());
                 drop(last.try_write::<crate::TensorIndexNode>().unwrap());
             }
         })),
@@ -1528,22 +1706,21 @@ async fn batched_membership_reports_newest_errors_and_releases_sources() {
         let mut deltas = Vec::new();
         let mut roots = Vec::new();
         for keys in [vec![vec![0, 0]], vec![vec![3], vec![3]]] {
-            let delta = super::Delta::create(
-                txn.subcontext_unique().context().await.unwrap(),
-                geometry.clone(),
-            )
+            let delta = super::Delta::create(allocation(txn.subcontext_unique().context().await.unwrap()),
+                geometry.clone(), false,
+                )
             .await
             .unwrap();
 
-            let touched = delta
-                ._workspace
+            let zeros = delta
+                .storage.dir()
                 .read()
                 .await
-                .get_dir("touched")
+                .get_dir("zeros")
                 .cloned()
                 .unwrap();
 
-            let root = touched.read().await.get_file(ROOT).cloned().unwrap();
+            let root = zeros.read().await.get_file(ROOT).cloned().unwrap();
             *root.write::<crate::TensorIndexNode>().await.unwrap() = b_tree::Node::Leaf(keys);
             roots.push(root);
             deltas.push(delta);
@@ -1553,17 +1730,17 @@ async fn batched_membership_reports_newest_errors_and_releases_sources() {
 
         // The newer layer's later block is visited before the older layer's
         // earlier block. Strict ordering includes duplicate membership rows.
-        let mut sources = [None; 2];
+        observation::watch(&snapshot.deltas[0].generation);
+        let mut sources = [Canonical; 2];
         let error = snapshot
             .resolve_sources(&[0, 3], &mut sources)
             .await
             .unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("invalid Tensor touched-block order")
-        );
+        assert!(matches!(error, fensor::Error::Io(error)
+            if error.kind() == std::io::ErrorKind::InvalidData
+                && freqfs::IntegrityError::is_marked(&error)));
+        assert_eq!(observation::counts().membership_scans, 0);
 
         *roots[1].write::<crate::TensorIndexNode>().await.unwrap() = b_tree::Node::Leaf(Vec::new());
         let error = snapshot
@@ -1577,40 +1754,240 @@ async fn batched_membership_reports_newest_errors_and_releases_sources() {
             if error.kind() == std::io::ErrorKind::InvalidData
                 && freqfs::IntegrityError::is_marked(&error)));
 
-        drop(snapshot.deltas[0].1.touched.try_write().unwrap());
-        drop(snapshot.deltas[1].1.touched.try_write().unwrap());
+        drop(snapshot.deltas[0].zeros().try_write().unwrap());
+        drop(snapshot.deltas[1].zeros().try_write().unwrap());
 
-        // Materialization after a completed earlier run discards all of this
-        // layer's assignments, including when the later completion returns an
-        // error. Without publication the same error must remain observable.
-        for publish in [false, true] {
-            *roots[0].write::<crate::TensorIndexNode>().await.unwrap() =
-                b_tree::Node::Leaf(vec![vec![0], vec![3]]);
+        // A failed membership visitor preserves its native cause and releases guards.
+        *roots[0].write::<crate::TensorIndexNode>().await.unwrap() =
+            b_tree::Node::Leaf(vec![vec![0], vec![3]]);
 
-            let delta = &snapshot.deltas[0].1;
-            let materialized = snapshot.visibility.clone();
-            let cutoff = snapshot.deltas[0].0;
-            observation::on_membership(&delta.generation, 2, move || {
-                if publish {
-                    materialized.0.write().unwrap().finalized = Some(cutoff);
+        let delta = &snapshot.deltas[0];
+        observation::on_membership(&delta.generation, 2, || {
+            Err(std::io::Error::other("membership completion failed").into())
+        });
+
+        let error = snapshot.resolve_sources(&[0, 3], &mut sources).await.unwrap_err();
+        assert!(matches!(error, fensor::Error::Io(error) if error.to_string() == "membership completion failed"));
+        drop(delta.zeros().try_write().unwrap());
+        drop(roots[0].try_write::<crate::TensorIndexNode>().unwrap());
+    }))
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn whole_replacement_retains_coverage_through_patches_and_compaction() {
+    use futures::TryStreamExt;
+
+    use crate::test::tensor::{id, values};
+
+    Box::pin(async {
+        let (_, txn) = setup().await;
+        let (tensor, dir) = create(&txn, vec![3].into(), true, 1).await;
+        tensor.fill(&txn, 0.0.into()).await.unwrap();
+        tensor.write_value(&txn, &[0], 1.0.into()).await.unwrap();
+        let range = vec![fensor::AxisRange::In(1, 3, 1)].into();
+        tensor.fill_range(&txn, range, 2.0.into()).await.unwrap();
+        assert_eq!(values(&tensor, txn.id()).await, [1., 2., 2.]);
+
+        let Tensor::F64(access) = &tensor else {
+            unreachable!()
+        };
+        let owner = access.base().unwrap();
+        let pending = owner.versions.pending_for_test(txn.id());
+        {
+            let dir = pending.storage.dir().read().await;
+            assert_eq!(dir.len(), 1);
+            assert!(dir.get_dir("replacement").is_some());
+        }
+        drop(pending);
+        tensor.commit(txn.id()).await.unwrap();
+
+        let next = txn.at(11);
+        for (i, value) in [0., 5., 0.].into_iter().enumerate() {
+            tensor
+                .write_value(&next, &[i as u64], value.into())
+                .await
+                .unwrap();
+        }
+        tensor.commit(next.id()).await.unwrap();
+        assert_eq!(tensor.read_value(id(12), &[1]).await.unwrap(), 5.0.into());
+
+        let snapshot = owner.snapshot(id(12), None).unwrap();
+        let mut keys = snapshot.occupied_blocks(0..3);
+        drop(snapshot);
+        tensor.finalize(&next.id()).await.unwrap();
+        assert_eq!(keys.try_next().await.unwrap(), Some(1));
+        assert_eq!(keys.try_next().await.unwrap(), None);
+
+        let schema = tensor.schema().unwrap();
+        let path = dir.read().await.path().to_owned();
+        drop(tensor);
+        let cache = freqfs::Cache::<crate::PersistentFile>::new(
+            128 * 1024,
+            None,
+            0,
+            std::time::Duration::from_secs(3),
+        );
+        let reopened = Tensor::load(cache.load(path).unwrap(), schema)
+            .await
+            .unwrap();
+        assert_eq!(values(&reopened, id(12)).await, [0., 5., 0.]);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn cutoff_reuses_whole_allocation_and_preserves_snapshots() {
+    use crate::test::tensor::{id, values};
+
+    Box::pin(async {
+        for fill in [0., 2.] {
+            let (_, txn) = setup().await;
+            let (tensor, dir) = create(&txn, vec![4].into(), true, 1).await;
+            let schema = tensor.schema().unwrap();
+            let Tensor::F64(access) = &tensor else {
+                unreachable!()
+            };
+            let owner = access.base().unwrap();
+            tensor.write_value(&txn, &[0], 7.0.into()).await.unwrap();
+            tensor.commit(txn.id()).await.unwrap();
+            let old = owner.snapshot(txn.id(), None).unwrap();
+            let replacement = txn.at(11);
+            tensor.fill(&replacement, fill.into()).await.unwrap();
+            tensor.commit(replacement.id()).await.unwrap();
+
+            let expected = owner.snapshot(replacement.id(), None).unwrap().deltas[0]
+                .storage
+                .id()
+                .clone();
+
+            tensor.finalize(&replacement.id()).await.unwrap();
+            assert_eq!(old.read_logical_block(0).await.unwrap(), [7.]);
+            drop(old);
+            let path = dir.read().await.path().to_owned();
+            drop(tensor);
+
+            let cache = freqfs::Cache::<crate::PersistentFile>::new(
+                128 * 1024,
+                None,
+                0,
+                std::time::Duration::from_secs(3),
+            );
+            let reopened = Tensor::load(cache.load(path).unwrap(), schema)
+                .await
+                .unwrap();
+            let Tensor::F64(access) = &reopened else {
+                unreachable!()
+            };
+            let snapshot = access.base().unwrap().snapshot(id(12), None).unwrap();
+            assert_eq!(snapshot.deltas.len(), 1);
+            assert_eq!(snapshot.deltas[0].storage.id(), &expected);
+            assert_eq!(values(&reopened, id(12)).await, [fill; 4]);
+            reopened
+                .write_value(&txn.at(12), &[1], 9.0.into())
+                .await
+                .unwrap();
+            reopened.commit(id(12)).await.unwrap();
+            reopened.finalize(&id(12)).await.unwrap();
+            assert_eq!(values(&reopened, id(13)).await, [fill, 9., fill, fill]);
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn reopen_classifies_invalid_delta_directories_as_recovery_required() {
+    Box::pin(async {
+        for (whole, parent, remove, add) in [
+            (false, [].as_slice(), Some("zeros"), None),
+            (false, [].as_slice(), Some("zeros"), Some("touched")),
+            (true, [].as_slice(), None, Some("zeros")),
+            (true, [].as_slice(), Some("replacement"), None),
+            (
+                false,
+                ["payload", "values"].as_slice(),
+                Some("primary"),
+                None,
+            ),
+        ] {
+            let (_, txn) = setup().await;
+            let (tensor, dir) = create(&txn, vec![4].into(), true, 1).await;
+            let schema = tensor.schema().unwrap();
+            if whole {
+                tensor.fill(&txn, 0.0.into()).await.unwrap();
+            } else {
+                tensor.write_value(&txn, &[1], 7.0.into()).await.unwrap();
+            }
+            tensor.commit(txn.id()).await.unwrap();
+
+            let Tensor::F64(access) = &tensor else {
+                unreachable!()
+            };
+            let versions = access
+                .base()
+                .unwrap()
+                .versions
+                .visible_snapshot(txn.id())
+                .unwrap();
+            {
+                let mut target = versions.last().unwrap().storage.dir().clone();
+                for child in parent {
+                    let next = target.read().await.get_dir(child).cloned().unwrap();
+                    target = next;
                 }
 
-                Err(std::io::Error::other("membership completion failed").into())
-            });
-
-            let result = snapshot.resolve_sources(&[0, 3], &mut sources).await;
-            assert_eq!(observation::counts().membership_scans, 2);
-            if publish {
-                result.unwrap();
-                assert_eq!(sources, [None, None]);
-            } else {
-                assert!(matches!(result, Err(fensor::Error::Io(error))
-                    if error.to_string() == "membership completion failed"));
+                let mut version = target.write().await;
+                if let Some(name) = remove {
+                    version.delete(name).await;
+                }
+                if let Some(name) = add {
+                    version.create_dir(name.into()).unwrap();
+                }
+                version.sync_all().await.unwrap();
             }
 
-            drop(delta.touched.try_write().unwrap());
-            drop(roots[0].try_write::<crate::TensorIndexNode>().unwrap());
+            let path = dir.read().await.path().to_owned();
+            let cache = freqfs::Cache::<crate::PersistentFile>::new(
+                128 * 1024,
+                None,
+                0,
+                std::time::Duration::from_secs(3),
+            );
+            let result =
+                Tensor::<crate::test::TestTxn>::load(cache.load(path).unwrap(), schema).await;
+            assert!(result.unwrap_err().requires_recovery());
         }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn full_sparse_assignment_visits_occupied_blocks_and_replaces_pending() {
+    observation::scope(Box::pin(async {
+        let (_, txn) = setup().await;
+        let size = 3 * fensor::MAX_BATCH_ELEMENTS as u64;
+        let (source, _) = create(&txn, vec![size].into(), true, 2).await;
+        let (target, _) = create(&txn, vec![size].into(), true, 2).await;
+        source
+            .write_value(&txn, &[size - 1], 7.0.into())
+            .await
+            .unwrap();
+        target.write_value(&txn, &[0], 9.0.into()).await.unwrap();
+
+        let Tensor::F64(value) = &source else {
+            panic!("f64 owner")
+        };
+        let pending = value.base().unwrap().versions.pending_for_test(txn.id());
+        observation::watch(&pending.generation);
+        let doubled = source.mul_scalar(txn.id(), 2.0.into()).await.unwrap();
+        target.write_tensor(&txn, doubled).await.unwrap();
+
+        assert!(observation::counts().membership_scans <= 1);
+        assert_eq!(target.read_value(txn.id(), &[0]).await.unwrap(), 0.0.into());
+        assert_eq!(
+            target.read_value(txn.id(), &[size - 1]).await.unwrap(),
+            14.0.into()
+        );
     }))
     .await;
 }
@@ -1618,7 +1995,6 @@ async fn batched_membership_reports_newest_errors_and_releases_sources() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn full_fills_replace_compact_blocks_without_reading_old_payloads() {
     use crate::tensor::Tensor;
-    use crate::tensor::typed::Typed;
     use crate::test::tensor::{id, values};
 
     observation::scope(Box::pin(async {
@@ -1630,17 +2006,21 @@ async fn full_fills_replace_compact_blocks_without_reading_old_payloads() {
             tensor.finalize(&txn.id()).await.unwrap();
             let later = txn.at(11);
             tensor.write_value(&later, &[4], 9.0.into()).await.unwrap();
-            let Data::F64(Typed::Owner(owner)) = &tensor.data else {
+            let Tensor::F64(value) = &tensor else {
                 panic!("f64 owner")
             };
 
-            let previous = owner
-                .core
-                .read_state()
-                .pending
-                .get(&later.id())
-                .unwrap()
-                .clone();
+            let owner = value.base().unwrap();
+
+            let previous = owner.versions.pending_for_test(later.id());
+
+            if !sparse {
+                let snapshot = owner.snapshot(later.id(), None).unwrap();
+                assert!(matches!(
+                    snapshot.occupied_blocks(0..3).next().await,
+                    Some(Err(fensor::Error::InvalidLayout(_)))
+                ));
+            }
 
             assert_eq!(owner.geometry().block_len(2).unwrap(), 1);
             observation::watch(&previous.generation);
@@ -1652,13 +2032,41 @@ async fn full_fills_replace_compact_blocks_without_reading_old_payloads() {
             );
 
             assert_eq!(values(&tensor, later.id()).await, [3.; 5]);
+            if !sparse {
+                let snapshot = owner.snapshot(later.id(), None).unwrap();
+                assert!(matches!(
+                    snapshot.occupied_blocks(0..3).next().await,
+                    Some(Err(fensor::Error::InvalidLayout(_)))
+                ));
+            }
+
             tensor.rollback(&later.id()).await.unwrap();
             assert_eq!(values(&tensor, id(12)).await, [7., 0., 0., 0., 0.]);
 
             if !sparse {
-                let blocks = dir.read().await.get_dir("blocks").unwrap().clone();
+                let blocks = dir
+                    .read()
+                    .await
+                    .get_dir("base")
+                    .cloned()
+                    .unwrap()
+                    .read()
+                    .await
+                    .get_dir("blocks")
+                    .unwrap()
+                    .clone();
+
                 let file = blocks.read().await.get_file("0").unwrap().clone();
                 let held = file.write::<Vec<f64>>().await.unwrap();
+                let range = vec![fensor::AxisRange::In(0, 2, 1)].into();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    Box::pin(tensor.fill_range(&txn.at(12), range, 3.0.into())),
+                )
+                .await
+                .expect("an aligned partial fill does not read replaced payloads")
+                .unwrap();
+
                 tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     Box::pin(tensor.fill(&txn.at(12), 0.0.into())),
@@ -1674,7 +2082,6 @@ async fn full_fills_replace_compact_blocks_without_reading_old_payloads() {
 
             tensor.commit(id(12)).await.unwrap();
             tensor.finalize(&id(12)).await.unwrap();
-            tensor.sync_all().await.unwrap();
             let schema = tensor.schema().unwrap();
             let path = dir.read().await.path().to_owned();
             drop(previous);

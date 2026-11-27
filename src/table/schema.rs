@@ -95,7 +95,7 @@ impl b_tree::Schema for TableIndexSchema {
         Ok(())
     }
 
-    fn validate_key(&self, key: Vec<Value>) -> Result<Vec<Value>, Self::Error> {
+    fn validate_key(&self, key: &[Value]) -> Result<(), Self::Error> {
         if key.len() != self.column_names.len() {
             return Err(tc_error::bad_request!(
                 "key arity {} does not match index column count {}",
@@ -104,9 +104,7 @@ impl b_tree::Schema for TableIndexSchema {
             ));
         }
 
-        self.validate_prefix(&key)?;
-
-        Ok(key)
+        self.validate_prefix(key)
     }
 }
 
